@@ -287,7 +287,7 @@ Tailor these bullets for the target job. Return JSON only."""
         response = chat_completion(
             system=system_prompt,
             user_message=user_msg,
-            max_tokens=3000,
+            max_tokens=8192,
             task="generate",
         )
 
@@ -299,46 +299,38 @@ Tailor these bullets for the target job. Return JSON only."""
 
         result = json.loads(response)
 
-        # Validate structure
+        # Validate structure — lenient: fall back per-position instead of all-or-nothing
         exp_bullets = result.get("experience", [])
         proj_bullets = result.get("projects", [])
 
-        if len(exp_bullets) != len(positions):
-            print(
-                f"    Warning: LLM returned {len(exp_bullets)} positions, "
-                f"expected {len(positions)}. Using original bullets."
-            )
-            return None
-
-        for i, (pos, bullets) in enumerate(zip(positions, exp_bullets)):
+        # Fix experience bullets (per-position fallback)
+        validated_exp = []
+        for i, pos in enumerate(positions):
             expected = len(pos.get("highlights", []))
-            if len(bullets) != expected:
-                print(
-                    f"    Warning: Position {i + 1} has {len(bullets)} bullets, "
-                    f"expected {expected}. Using original bullets."
-                )
-                return None
+            if i < len(exp_bullets) and len(exp_bullets[i]) == expected:
+                validated_exp.append(exp_bullets[i])
+            else:
+                if i < len(exp_bullets):
+                    print(f"    Position {i + 1}: LLM returned {len(exp_bullets[i])} bullets (expected {expected}), using originals")
+                validated_exp.append(pos.get("highlights", []))
 
-        if len(proj_bullets) != len(projects):
-            print(
-                f"    Warning: LLM returned {len(proj_bullets)} projects, "
-                f"expected {len(projects)}. Using original bullets."
-            )
-            return None
-
-        for i, (proj, bullets) in enumerate(zip(projects, proj_bullets)):
+        # Fix project bullets (per-project fallback)
+        validated_proj = []
+        for i, proj in enumerate(projects):
             expected = len(proj.get("highlights", []))
-            if len(bullets) != expected:
-                print(
-                    f"    Warning: Project {i + 1} has {len(bullets)} bullets, "
-                    f"expected {expected}. Using original bullets."
-                )
-                return None
+            if i < len(proj_bullets) and len(proj_bullets[i]) == expected:
+                validated_proj.append(proj_bullets[i])
+            else:
+                if i < len(proj_bullets):
+                    print(f"    Project {i + 1}: LLM returned {len(proj_bullets[i])} bullets (expected {expected}), using originals")
+                validated_proj.append(proj.get("highlights", []))
 
-        return result
+        return {"experience": validated_exp, "projects": validated_proj}
 
     except json.JSONDecodeError as e:
-        print(f"    Bullet tailoring failed (invalid JSON): {e}. Using original bullets.")
+        print(f"    Bullet tailoring failed (invalid JSON): {e}")
+        print(f"    Response preview: {response[:200]}")
+        print(f"    Using original bullets.")
         return None
     except Exception as e:
         print(f"    Bullet tailoring failed: {e}. Using original bullets.")
@@ -596,7 +588,169 @@ def compile_tex_to_pdf(tex_path: str) -> bool:
         return False
 
 
+def _get_pdf_page_count(pdf_path: str) -> int:
+    """Return the number of pages in a PDF file."""
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(pdf_path)
+        return len(reader.pages)
+    except Exception:
+        return 1  # Assume 1 page if we can't read it
+
+
+def enforce_one_page(tex_path: str, profile: dict, tailored_bullets: dict | None) -> bool:
+    """Check if compiled PDF exceeds 1 page; if so, trim content and recompile.
+
+    Trimming strategy (applied in order until PDF fits on 1 page):
+      1. Trim the longest bullet in each position/project to ~100 chars
+      2. Remove the last project
+      3. Tighten LaTeX spacing
+
+    Returns True if the final PDF is 1 page (or pdflatex is unavailable).
+    """
+    pdf_path = tex_path.replace(".tex", ".pdf")
+    if not os.path.exists(pdf_path):
+        return False
+
+    pages = _get_pdf_page_count(pdf_path)
+    if pages <= 1:
+        return True
+
+    print(f"    Resume is {pages} pages — trimming to fit 1 page...")
+
+    positions = profile.get("experience", {}).get("positions", [])
+    projects = profile.get("projects", [])
+    exp_bullets = tailored_bullets.get("experience", []) if tailored_bullets else []
+    proj_bullets = tailored_bullets.get("projects", []) if tailored_bullets else []
+
+    # Build mutable bullet lists (copy originals if tailored not available)
+    mut_exp = []
+    for i, pos in enumerate(positions):
+        if i < len(exp_bullets):
+            mut_exp.append(list(exp_bullets[i]))
+        else:
+            mut_exp.append(list(pos.get("highlights", [])))
+
+    mut_proj = []
+    for i, proj in enumerate(projects):
+        if i < len(proj_bullets):
+            mut_proj.append(list(proj_bullets[i]))
+        else:
+            mut_proj.append(list(proj.get("highlights", [])))
+
+    trimmed_profile = dict(profile)
+
+    # Pass 1: Trim longest bullets to ~100 chars
+    for bullet_list in mut_exp + mut_proj:
+        for j, bullet in enumerate(bullet_list):
+            if len(bullet) > 100:
+                # Cut at last space before 100 chars
+                cut = bullet[:100].rfind(" ")
+                if cut > 60:
+                    bullet_list[j] = bullet[:cut]
+                else:
+                    bullet_list[j] = bullet[:100]
+
+    trimmed_tailored = {"experience": mut_exp, "projects": mut_proj}
+    tex_content = build_resume_tex(trimmed_profile, trimmed_tailored)
+    with open(tex_path, "w", encoding="utf-8") as f:
+        f.write(tex_content)
+    if compile_tex_to_pdf(tex_path) and _get_pdf_page_count(pdf_path) <= 1:
+        print("    Trimmed bullets to fit 1 page.")
+        return True
+
+    # Pass 2: Remove last project
+    if len(mut_proj) > 1:
+        mut_proj.pop()
+        # Also remove from profile copy so build_resume_tex skips it
+        trimmed_projects = list(projects[:-1])
+        trimmed_profile = dict(profile)
+        trimmed_profile["projects"] = trimmed_projects
+        trimmed_tailored = {"experience": mut_exp, "projects": mut_proj}
+        tex_content = build_resume_tex(trimmed_profile, trimmed_tailored)
+        with open(tex_path, "w", encoding="utf-8") as f:
+            f.write(tex_content)
+        if compile_tex_to_pdf(tex_path) and _get_pdf_page_count(pdf_path) <= 1:
+            print("    Removed last project to fit 1 page.")
+            return True
+
+    # Pass 3: Tighten spacing
+    tex_content = tex_content.replace(
+        r"\addtolength{\textheight}{1.0in}",
+        r"\addtolength{\textheight}{1.5in}",
+    ).replace(
+        r"\addtolength{\topmargin}{-.5in}",
+        r"\addtolength{\topmargin}{-.7in}",
+    ).replace(
+        r"\titlespacing*{\section}{0pt}{12pt}{10pt}",
+        r"\titlespacing*{\section}{0pt}{6pt}{4pt}",
+    )
+    with open(tex_path, "w", encoding="utf-8") as f:
+        f.write(tex_content)
+    if compile_tex_to_pdf(tex_path) and _get_pdf_page_count(pdf_path) <= 1:
+        print("    Tightened spacing to fit 1 page.")
+        return True
+
+    print("    Warning: Could not fit resume to 1 page after trimming.")
+    return False
+
+
 # == Cover Letter =========================================================
+
+# At 12pt Arial with 1" margins on letter paper, ~3,000 chars fills one page
+# (including ~200 chars of contact header added by create_cover_letter_docx)
+COVER_LETTER_MAX_CHARS = 2800
+
+
+def _trim_cover_letter(text: str) -> str:
+    """Trim cover letter text to fit on 1 page (~2,800 chars for body).
+
+    If over budget, trims the longest body paragraph (preserving opening/closing).
+    """
+    if len(text) <= COVER_LETTER_MAX_CHARS:
+        return text
+
+    lines = text.split("\n")
+    # Find paragraph boundaries (blank-line separated)
+    paragraphs = []
+    current = []
+    for line in lines:
+        if not line.strip():
+            if current:
+                paragraphs.append("\n".join(current))
+                current = []
+            paragraphs.append("")  # blank line
+        else:
+            current.append(line)
+    if current:
+        paragraphs.append("\n".join(current))
+
+    # Find the longest body paragraph (skip date, greeting, closing/signature)
+    body_indices = []
+    for i, p in enumerate(paragraphs):
+        stripped = p.strip()
+        if not stripped:
+            continue
+        # Skip date lines, greeting, sincerely, name (short lines)
+        if len(stripped) < 40 or stripped.startswith("Dear ") or stripped.startswith("Sincerely"):
+            continue
+        body_indices.append(i)
+
+    if not body_indices:
+        return text
+
+    # Trim the longest body paragraph by cutting sentences from the end
+    longest_idx = max(body_indices, key=lambda i: len(paragraphs[i]))
+    para = paragraphs[longest_idx]
+    sentences = re.split(r'(?<=[.!?])\s+', para)
+    while len("\n".join(paragraphs)) > COVER_LETTER_MAX_CHARS and len(sentences) > 2:
+        sentences.pop()
+        paragraphs[longest_idx] = " ".join(sentences)
+
+    result = "\n".join(paragraphs)
+    if len(result) > COVER_LETTER_MAX_CHARS:
+        print("    Note: cover letter may exceed 1 page")
+    return result
 
 
 def generate_cover_letter(job: dict, profile: dict, base_resume: str) -> str:
@@ -623,8 +777,9 @@ Include in this exact order:
 7. "Sincerely,"
 8. The candidate's full name
 
-Write enough content to fill a full page when printed at 12pt font with 1-inch margins.
-Each paragraph should be 4-6 sentences with specific details — not generic filler.
+The letter MUST fit on exactly 1 page when printed at 12pt font with 1-inch margins.
+Keep the total body text under 400 words (about 2,800 characters).
+Each paragraph should be 3-5 sentences with specific details — not generic filler.
 Be specific: reference actual skills, tools, and achievements from the candidate's resume.
 Do NOT fabricate achievements or skills the candidate does not have.
 Return ONLY the letter text."""
@@ -826,20 +981,22 @@ def generate_documents(
                 f.write(tex_content)
 
             if compile_tex_to_pdf(tex_path):
+                enforce_one_page(tex_path, profile, tailored)
                 print(f"  -> {os.path.join(job_dir, 'resume.pdf')}")
             else:
                 print(f"  -> {tex_path} (compile manually with pdflatex)")
         else:
             print("  Skipping resume (no profile). Set up with: uv run python tools/setup.py")
 
-        # Wait between resume + cover letter calls (12K TPM limit, ~2K tokens per call)
+        # Wait between LLM calls (Gemini: 10 RPM, Groq: 12K TPM)
         if has_profile:
-            time.sleep(5)
+            time.sleep(7)
 
         # -- Cover Letter (DOCX) --
         print("  Generating cover letter...")
         letter_text = generate_cover_letter(job, profile, base_resume)
         if letter_text:
+            letter_text = _trim_cover_letter(letter_text)
             letter_path = os.path.join(job_dir, "cover_letter.docx")
             create_cover_letter_docx(letter_text, profile, letter_path)
 
@@ -855,7 +1012,10 @@ def generate_documents(
             json.dump(details, f, indent=2, ensure_ascii=False)
 
         generated_count += 1
-        time.sleep(3)
+
+        # Wait before next job's LLM calls (Gemini: 10 RPM)
+        if i < len(qualifying) - 1:
+            time.sleep(7)
 
     print(f"\nGenerated {generated_count} applications -> {os.path.join(output_dir, 'applications')}")
     return generated_count

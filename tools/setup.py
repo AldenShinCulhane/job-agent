@@ -555,31 +555,38 @@ def collect_search_filters(existing: dict) -> dict:
     }
 
 
-def check_groq_setup() -> bool:
-    """Check if a Groq API key is configured.
+def check_llm_setup() -> bool:
+    """Check if an LLM API key is configured (Gemini preferred, Groq as fallback).
 
     Prompts the user to enter their key if not found in .env.
     Returns True if a valid key is configured.
     """
-    print("\n--- LLM (Groq) ---")
-    print("  LLM features use Groq (free, fast cloud inference).")
-    print("  Get a free API key at: https://console.groq.com")
+    print("\n--- LLM API Key ---")
 
-    existing_key = os.getenv("GROQ_API_KEY", "")
-    if existing_key:
-        masked = existing_key[:8] + "..." + existing_key[-4:]
-        print(f"  API key found: {masked}")
+    existing_gemini = os.getenv("GEMINI_API_KEY", "")
+    existing_groq = os.getenv("GROQ_API_KEY", "")
+
+    if existing_gemini:
+        masked = existing_gemini[:8] + "..." + existing_gemini[-4:]
+        print(f"  Gemini API key found: {masked}")
+        return True
+    if existing_groq:
+        masked = existing_groq[:8] + "..." + existing_groq[-4:]
+        print(f"  Groq API key found: {masked}")
         return True
 
-    print("  No GROQ_API_KEY found in .env")
-    key = input("  Enter your Groq API key (or press Enter to skip): ").strip()
+    print("  LLM features use Google Gemini (free, fast, generous limits).")
+    print("  Get a free API key at: https://aistudio.google.com/apikeys")
+    print("  (Alternative: Groq at https://console.groq.com)")
+
+    key = input("  Enter your Gemini API key (or press Enter to skip): ").strip()
     if key:
-        _save_env_var("GROQ_API_KEY", key)
-        print("  Saved GROQ_API_KEY to .env")
+        _save_env_var("GEMINI_API_KEY", key)
+        print("  Saved GEMINI_API_KEY to .env")
         return True
 
     print("  Skipping — the pipeline will still scrape, filter, score, and generate reports.")
-    print("  Add GROQ_API_KEY to .env later to enable tailored resume/cover letter generation.")
+    print("  Add GEMINI_API_KEY to .env later to enable tailored resume/cover letter generation.")
     return False
 
 
@@ -626,11 +633,11 @@ def write_filters(filters: dict):
 
 
 def write_env():
-    """Ensure .env exists. Groq key is saved inline by check_groq_setup()."""
+    """Ensure .env exists. API key is saved inline by check_llm_setup()."""
     if not ENV_PATH.exists():
         with open(ENV_PATH, "w", encoding="utf-8") as f:
-            f.write("# Get a free API key at https://console.groq.com\n")
-            f.write("# GROQ_API_KEY=gsk_...\n")
+            f.write("# Get a free API key at https://aistudio.google.com/apikeys\n")
+            f.write("# GEMINI_API_KEY=AIza...\n")
         print(f"  Created: {ENV_PATH}")
     else:
         print(f"  Exists: {ENV_PATH}")
@@ -654,7 +661,7 @@ def interactive_setup():
                 print("Keeping existing profile.")
                 # Still offer to update search filters and check Groq
                 filters = collect_search_filters(existing_filters)
-                groq_configured = check_groq_setup()
+                llm_configured = check_llm_setup()
                 write_filters(filters)
                 write_env()
                 print("\nSetup complete!")
@@ -667,7 +674,7 @@ def interactive_setup():
     education = collect_education(existing_profile)
     projects = collect_projects(existing_profile)
     filters = collect_search_filters(existing_filters)
-    groq_configured = check_groq_setup()
+    llm_configured = check_llm_setup()
 
     profile = {
         "personal": personal,
@@ -708,8 +715,8 @@ def interactive_setup():
         print(f"  [6] Projects:    {len(projects)} project(s)")
         search_locs = ', '.join(loc.get('formatted_address', '') for loc in filters.get('locations', []))
         print(f"  [7] Search:      \"{filters.get('search', {}).get('query', '')}\" in {search_locs}")
-        groq_display = "Groq (configured)" if groq_configured else "Groq (no API key)"
-        print(f"  [8] LLM:         {groq_display}")
+        llm_display = "Configured" if llm_configured else "No API key"
+        print(f"  [8] LLM:         {llm_display}")
 
         print(f"\n  Enter a number (1-8) to edit that section, or press Enter to save.")
         choice = input("  Edit section: ").strip()
@@ -741,7 +748,7 @@ def interactive_setup():
         elif choice == "7":
             filters = collect_search_filters(existing_filters)
         elif choice == "8":
-            groq_configured = check_groq_setup()
+            llm_configured = check_llm_setup()
         else:
             print("  Invalid choice. Enter 1-8 or press Enter to save.")
 

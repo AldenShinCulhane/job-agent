@@ -151,7 +151,7 @@ def analyze_jobs(input_path: str = None, output_path: str = None, batch_size: in
         with open(progress_path, "w", encoding="utf-8") as f:
             json.dump(analyzed, f, indent=2, ensure_ascii=False)
 
-        time.sleep(5)
+        time.sleep(7)
 
     # Save final output and clean up
     os.makedirs(os.path.dirname(output_path), exist_ok=True)

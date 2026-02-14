@@ -15,7 +15,7 @@ Scrapes job listings from [hiring.cafe](https://hiring.cafe), strictly filters t
 
 **Filtering vs. Scoring:** Your search filters (location, title, experience level, salary, etc.) are hard gates — only jobs matching ALL your criteria appear. The match% then ranks those jobs by how well your skills, experience, and education align with what each job requires.
 
-Steps 1-3 and 6 run without any external services. Step 5 uses [Groq](https://console.groq.com) (free, fast cloud LLM).
+Steps 1-3 and 6 run without any external services. Step 5 uses a free LLM API — [Gemini](https://aistudio.google.com/apikeys) (recommended) or [Groq](https://console.groq.com).
 
 ## Quick Start
 
@@ -87,15 +87,21 @@ cp config/search_filters.yaml.example config/search_filters.yaml
 
 > **Note:** `.env`, `config/user_profile.yaml`, and `config/search_filters.yaml` are gitignored to protect your personal information and API keys. Only the `.example` templates are tracked.
 
-## LLM (Groq — Free)
+## LLM (Gemini — Free)
 
-Step 5 uses [Groq](https://console.groq.com) for LLM-powered job analysis and tailored resume/cover letter generation. Groq is free, fast (cloud inference), and requires only an API key.
+Step 5 uses an LLM for job analysis and tailored resume/cover letter generation. The pipeline auto-detects which provider you have configured.
 
+**Recommended: Google Gemini** (250K tokens/min, 250 requests/day — generous free tier)
+1. Go to [aistudio.google.com/apikeys](https://aistudio.google.com/apikeys)
+2. Create an API key (just needs a Google account, no credit card)
+3. Add it to your `.env`: `GEMINI_API_KEY=AIza...`
+
+**Alternative: Groq** (12K tokens/min, 100K tokens/day — stricter limits)
 1. Sign up at [console.groq.com](https://console.groq.com)
 2. Create an API key
 3. Add it to your `.env`: `GROQ_API_KEY=gsk_...`
 
-The setup wizard handles this automatically. Without it, the pipeline still scrapes, filters, scores, and generates a summary report — you just won't get the auto-generated application documents.
+The setup wizard handles this automatically. Without an API key, the pipeline still scrapes, filters, scores, and generates a summary report — you just won't get the auto-generated application documents.
 
 ## Output
 
@@ -121,7 +127,7 @@ The setup wizard (`tools/setup.py`) creates these files for you:
 |------|-----------------|
 | `config/user_profile.yaml` | Your skills, experience, education, projects |
 | `config/search_filters.yaml` | Search query, locations, experience level, salary range |
-| `.env` | Groq API key |
+| `.env` | LLM API key (Gemini or Groq) |
 
 All three are gitignored. Committed `.example` templates show the expected format.
 
@@ -184,8 +190,8 @@ The API blocked you. Solutions:
 2. Wait 5-10 minutes and try again
 3. Reduce `pagination.max_pages` in search filters
 
-### "GROQ_API_KEY not set"
-Get a free API key at [console.groq.com](https://console.groq.com), then add it to `.env`: `GROQ_API_KEY=gsk_...`. Or skip LLM steps with `--skip-generate`.
+### "No LLM API key found"
+Get a free API key at [aistudio.google.com/apikeys](https://aistudio.google.com/apikeys) (Gemini, recommended) or [console.groq.com](https://console.groq.com) (Groq). Add it to `.env`. Or skip LLM steps with `--skip-generate`.
 
 ### "No jobs found" or all jobs filtered out
 - Check search filters — try broader terms or more locations
@@ -216,7 +222,7 @@ config/
 tools/
   setup.py                       # Interactive setup wizard
   run_pipeline.py                # Main entry point — runs all steps
-  llm_client.py                  # LLM client (Groq via OpenAI-compatible API)
+  llm_client.py                  # LLM client (Gemini/Groq via OpenAI-compatible API)
   scrape_jobs.py                 # Headless browser scraper for hiring.cafe
   parse_jobs.py                  # Normalizes, deduplicates, and filters raw API data
   analyze_jobs.py                # Optional LLM enrichment
@@ -231,7 +237,7 @@ tools/
 - [uv](https://docs.astral.sh/uv/) package manager
 - Chromium (installed via `uv run playwright install chromium`)
 - (Optional) [MiKTeX](https://miktex.org/download) or TeX Live for PDF resume compilation
-- (Optional) [Groq](https://console.groq.com) API key for LLM features (free)
+- (Optional) [Gemini](https://aistudio.google.com/apikeys) or [Groq](https://console.groq.com) API key for LLM features (free)
 
 ## Known Constraints
 
@@ -239,4 +245,7 @@ tools/
 - Job descriptions over 1,500 chars are truncated for LLM analysis
 - Playwright requires Chromium installed: `uv run playwright install chromium`
 - The API's text search is broad — the post-scrape filter enforces strict title/location matching
-- Groq free tier: 12K tokens/min and 100K tokens/day — the pipeline spaces calls to stay within limits
+- Resumes and cover letters are each limited to 1 page (auto-trimmed if needed)
+- Processing 5 jobs requires ~12 LLM calls (2 analysis + 5 resume + 5 cover letter). Selecting more jobs increases this linearly.
+- Gemini free tier: 10 requests/min, 250/day — comfortably handles ~20 pipeline runs per day
+- Groq free tier (if used instead): 12K tokens/min, 100K tokens/day — can hit token limits after 1-2 runs with 5+ jobs

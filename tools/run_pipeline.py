@@ -47,14 +47,16 @@ def validate_environment(args, has_profile: bool) -> list:
     if args.resume and not os.path.exists(args.resume):
         issues.append(f"Resume file not found: {args.resume}")
 
-    # Groq API key (required for LLM steps — analyze + generate)
+    # LLM API key (required for LLM steps — analyze + generate)
     needs_llm = not args.skip_generate
     if needs_llm:
         from llm_client import check_llm
         if not check_llm():
             issues.append(
-                "GROQ_API_KEY not set. LLM steps (analyze, generate) will fail.\n"
-                "    Get a free key at https://console.groq.com\n"
+                "No LLM API key found. LLM steps (analyze, generate) will fail.\n"
+                "    Option 1 (recommended): Get a free Gemini key at https://aistudio.google.com/apikeys\n"
+                "    Then add to .env: GEMINI_API_KEY=AIza...\n"
+                "    Option 2: Get a free Groq key at https://console.groq.com\n"
                 "    Then add to .env: GROQ_API_KEY=gsk_...\n"
                 "    Or skip LLM steps: --skip-generate"
             )
@@ -279,12 +281,13 @@ def run_pipeline(args):
             print(f"\n[5/6] Skipping LLM analysis (--skip-analyze). Generating from scored data...")
             analysis_input = selected_jobs_path
         else:
-            print(f"\n[5/6] Analyzing {num_selected} job(s) with Groq...")
+            from llm_client import get_provider_name
+            provider = get_provider_name()
+            print(f"\n[5/6] Analyzing {num_selected} job(s) with {provider}...")
             batch_size = args.batch_size
             est_analysis = (num_selected + batch_size - 1) // batch_size
             est_generate = num_selected * 2
             print(f"  LLM calls: ~{est_analysis} for analysis + ~{est_generate} for documents")
-            print(f"  Groq free tier: 12K tokens/min — calls are spaced to avoid rate limits")
 
             from analyze_jobs import analyze_jobs
             analyzed = analyze_jobs(selected_jobs_path, analyzed_jobs_path, batch_size)
