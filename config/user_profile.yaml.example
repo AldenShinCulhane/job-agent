@@ -1,0 +1,68 @@
+# ============================================
+# User Profile Configuration
+# ============================================
+# Fill in your professional background below.
+# This is used for job matching and document generation.
+
+personal:
+  name: "Your Full Name"
+  email: "your.email@example.com"
+  phone: "+1-555-123-4567"
+  location: "City, Province/State"
+  linkedin: "https://linkedin.com/in/yourprofile"
+  github: ""   # optional
+  website: ""  # optional
+
+summary: |
+  Brief professional summary (2-3 sentences) describing your
+  background, expertise, and career goals. This is used as the
+  basis for generating tailored resume summaries.
+
+skills:
+  programming_languages:
+    - Python
+    - JavaScript
+  frameworks:
+    - React
+    - Django
+  tools:
+    - Git
+    - Docker
+    - AWS
+  soft_skills:
+    - Communication
+    - Problem Solving
+
+experience:
+  total_years: 3
+  positions:
+    - title: "Software Engineer"
+      company: "Company Name"
+      start_date: "2022-01"
+      end_date: "present"
+      highlights:
+        - "Built and maintained microservices processing 1M+ requests/day"
+        - "Led migration from monolith to microservices architecture"
+    - title: "Junior Developer"
+      company: "Previous Company"
+      start_date: "2020-06"
+      end_date: "2021-12"
+      highlights:
+        - "Developed REST APIs using Django and PostgreSQL"
+        - "Implemented CI/CD pipeline reducing deployment time by 60%"
+
+education:
+  - degree: "Bachelor of Science"
+    field: "Computer Science"
+    institution: "University Name"
+    graduation_year: 2020
+    gpa: 3.5  # optional
+
+projects:
+  - name: "Project Name"
+    description: "Brief description of the project and your role"
+    technologies:
+      - Python
+      - React
+    url: ""  # optional
+

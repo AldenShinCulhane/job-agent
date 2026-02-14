@@ -1,17 +1,29 @@
+# Personal documents (resumes, cover letters, etc.)
+*.pdf
+*.docx
+
 # Environment and secrets
 .env
 credentials.json
 token.json
 
+# User-specific config (contains PII and personal search criteria)
+config/user_profile.yaml
+config/search_filters.yaml
+
+# Generated output (contains PII in resumes/cover letters)
+output/
+
 # Temporary/intermediate files
 .tmp/
 
-# Python
+# Python / uv
 __pycache__/
 *.pyc
 *.pyo
 venv/
 .venv/
+uv.lock
 
 # OS
 .DS_Store

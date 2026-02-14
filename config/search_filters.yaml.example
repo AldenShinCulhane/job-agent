@@ -1,0 +1,68 @@
+# ============================================
+# Job Search Filters Configuration
+# ============================================
+# These filters are translated into hiring.cafe's
+# searchState parameter for the API query.
+
+search:
+  # Primary search query
+  query: "software engineer"
+  # Technology keywords to filter for
+  technology_keywords: ""
+    # e.g., "python, react, node.js"
+
+locations:
+  # The API uses country-level coordinates for best results.
+  # Your city name in formatted_address is used for post-scrape filtering.
+  - formatted_address: "Toronto, Ontario"
+    types: ["country"]
+    geometry:
+      lat: "56.1304"
+      lon: "-106.3468"
+    id: "user_toronto_ontario"
+    country_code: "CA"
+  # Add more locations as needed:
+  # - formatted_address: "Vancouver, British Columbia"
+  #   types: ["country"]
+  #   geometry:
+  #     lat: "56.1304"
+  #     lon: "-106.3468"
+  #   id: "user_vancouver_bc"
+  #   country_code: "CA"
+
+workplace_types:
+  # Options: Remote, Hybrid, Onsite
+  - "Remote"
+
+experience_levels:
+  # Options: No Prior Experience Required, Entry Level, Mid Level,
+  #          Senior Level, Lead, Manager, Director, VP, C-Suite
+  - "Entry Level"
+  - "Mid Level"
+
+commitment_types:
+  # Options: Full Time, Part Time, Contract, Internship,
+  #          Temporary, Seasonal, Volunteer
+  - "Full Time"
+
+salary:
+  min_annual: null        # Minimum yearly salary (e.g., 60000). null = no filter
+  currency: "CAD"         # Currency code
+  only_transparent: false # Only show jobs with disclosed salaries
+
+company_filters:
+  size_ranges: []       # e.g., ["1-10", "11-50", "51-200"]
+  include_companies: [] # whitelist specific companies
+  exclude_companies: [] # blacklist specific companies
+
+date_filter:
+  # Only fetch jobs posted within the last N days
+  days: 30
+
+sorting:
+  # Options: default, date_fetched, relevance
+  sort_by: "default"
+
+pagination:
+  page_size: 40     # jobs per API page (hiring.cafe default is 40)
+  max_pages: 25     # safety limit (40 * 25 = 1000 jobs max)
