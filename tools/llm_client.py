@@ -1,43 +1,39 @@
 """
-LLM client — sends requests to a local Ollama instance via its
-OpenAI-compatible API.
+LLM client — sends requests to Groq's API via its OpenAI-compatible endpoint.
 
 Requires:
-  - Ollama installed and running: https://ollama.com
-  - A model pulled: ollama pull llama3.3
+  - A free Groq API key: https://console.groq.com
+  - Set GROQ_API_KEY in .env
+
+Groq free tier limits (llama-3.3-70b-versatile):
+  - 30 requests/min, 1,000 requests/day
+  - 12,000 tokens/min, 100,000 tokens/day
+  The TPM (tokens/min) limit is the usual bottleneck.
 """
 
 import os
 import time
 from pathlib import Path
 
-import requests
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
-OLLAMA_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-ANALYZE_MODEL = os.getenv("LLM_MODEL", "llama3.3")
-GENERATE_MODEL = os.getenv("LLM_MODEL", "llama3.3")
-MAX_RETRIES = 3
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+MODEL = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
+MAX_RETRIES = 6
 
 
 class LLMConfigError(Exception):
-    """Raised when Ollama is not running or misconfigured."""
+    """Raised when the LLM API is not reachable or misconfigured."""
     pass
 
 
-def check_ollama() -> bool:
-    """Check if Ollama is reachable. Returns True if running."""
-    try:
-        resp = requests.get(OLLAMA_HOST, timeout=3)
-        return resp.status_code == 200
-    except requests.ConnectionError:
-        return False
-    except Exception:
-        return False
+def check_llm() -> bool:
+    """Check if the Groq API key is configured. Returns True if set."""
+    return bool(GROQ_API_KEY)
 
 
 def chat_completion(
@@ -47,29 +43,34 @@ def chat_completion(
     task: str = "analyze",
 ) -> str:
     """
-    Send a chat completion request to Ollama.
+    Send a chat completion request to Groq.
 
     Args:
         system: System prompt
         user_message: User message
         max_tokens: Maximum tokens in the response
-        task: "analyze" or "generate" — selects model
+        task: "analyze" or "generate" (currently uses same model)
 
     Returns:
         The model's text response.
 
     Raises:
-        LLMConfigError: If Ollama is not running.
+        LLMConfigError: If API key is missing or API is unreachable.
     """
     from openai import OpenAI, RateLimitError, APIError, APIConnectionError
 
-    model = ANALYZE_MODEL if task == "analyze" else GENERATE_MODEL
-    client = OpenAI(base_url=OLLAMA_BASE_URL, api_key="ollama")
+    if not GROQ_API_KEY:
+        raise LLMConfigError(
+            "GROQ_API_KEY not set. Get a free key at https://console.groq.com\n"
+            "  Then add it to your .env file: GROQ_API_KEY=gsk_..."
+        )
+
+    client = OpenAI(base_url=GROQ_BASE_URL, api_key=GROQ_API_KEY)
 
     for attempt in range(MAX_RETRIES):
         try:
             response = client.chat.completions.create(
-                model=model,
+                model=MODEL,
                 max_tokens=max_tokens,
                 messages=[
                     {"role": "system", "content": system},
@@ -78,15 +79,23 @@ def chat_completion(
             )
             return response.choices[0].message.content.strip()
         except APIConnectionError:
-            raise LLMConfigError(
-                "Cannot connect to Ollama. Make sure it's running:\n"
-                "  1. Install: https://ollama.com\n"
-                "  2. Start Ollama\n"
-                "  3. Pull a model: ollama pull llama3.3"
-            )
-        except RateLimitError:
+            if attempt == MAX_RETRIES - 1:
+                raise LLMConfigError(
+                    "Cannot connect to Groq API. Check your internet connection\n"
+                    "  and verify your GROQ_API_KEY is valid."
+                )
             wait = 2 ** (attempt + 1)
-            print(f"    Rate limited, waiting {wait}s...")
+            print(f"    Connection failed, retrying in {wait}s...")
+            time.sleep(wait)
+        except RateLimitError as e:
+            if attempt == MAX_RETRIES - 1:
+                raise LLMConfigError("Groq API: max retries exceeded (rate limited).")
+            # Try to parse retry-after from response headers
+            wait = _get_retry_after(e)
+            if wait is None:
+                # Fallback: longer backoff since the bottleneck is TPM (token window)
+                wait = [15, 30, 60, 60, 60, 60][min(attempt, 5)]
+            print(f"    Rate limited, waiting {wait}s... (attempt {attempt + 1}/{MAX_RETRIES})")
             time.sleep(wait)
         except APIError as e:
             if attempt == MAX_RETRIES - 1:
@@ -94,4 +103,17 @@ def chat_completion(
             print(f"    API error: {e}, retrying...")
             time.sleep(2)
 
-    raise LLMConfigError("Ollama: max retries exceeded.")
+    raise LLMConfigError("Groq API: max retries exceeded.")
+
+
+def _get_retry_after(error) -> float | None:
+    """Extract retry-after seconds from a RateLimitError, if available."""
+    try:
+        # OpenAI SDK stores response headers on the error
+        headers = error.response.headers
+        retry_after = headers.get("retry-after")
+        if retry_after:
+            return float(retry_after) + 1  # +1s buffer
+    except (AttributeError, ValueError, TypeError):
+        pass
+    return None

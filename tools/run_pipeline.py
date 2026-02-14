@@ -10,10 +10,12 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -45,15 +47,16 @@ def validate_environment(args, has_profile: bool) -> list:
     if args.resume and not os.path.exists(args.resume):
         issues.append(f"Resume file not found: {args.resume}")
 
-    # Ollama (required for analyze and generate steps)
-    needs_llm = (not args.skip_analyze) or (not args.skip_generate)
+    # Groq API key (required for LLM steps — analyze + generate)
+    needs_llm = not args.skip_generate
     if needs_llm:
-        from llm_client import check_ollama
-        if not check_ollama():
+        from llm_client import check_llm
+        if not check_llm():
             issues.append(
-                "Ollama is not running. LLM steps (analyze, generate) will fail.\n"
-                "    Install: https://ollama.com  |  Pull model: ollama pull llama3.3\n"
-                "    Or skip LLM steps: --skip-analyze --skip-generate"
+                "GROQ_API_KEY not set. LLM steps (analyze, generate) will fail.\n"
+                "    Get a free key at https://console.groq.com\n"
+                "    Then add to .env: GROQ_API_KEY=gsk_...\n"
+                "    Or skip LLM steps: --skip-generate"
             )
 
     # Dependencies
@@ -74,12 +77,41 @@ def validate_environment(args, has_profile: bool) -> list:
     return issues
 
 
+def _is_cache_valid(raw_jobs_path: str, config_path: str, max_age_hours: int = 24) -> bool:
+    """Check if cached scrape results are still usable.
+
+    Returns True if raw_jobs.json exists, its metadata shows the same
+    search config hash, and the scrape is less than max_age_hours old.
+    """
+    metadata_path = str(Path(raw_jobs_path).parent / "scrape_metadata.json")
+    if not os.path.exists(raw_jobs_path) or not os.path.exists(metadata_path):
+        return False
+    try:
+        with open(metadata_path, "r", encoding="utf-8") as f:
+            metadata = json.load(f)
+        # Check config hash matches
+        with open(config_path, "rb") as f:
+            current_hash = hashlib.sha256(f.read()).hexdigest()
+        if metadata.get("config_hash") != current_hash:
+            return False
+        # Check age
+        scraped_at = datetime.fromisoformat(metadata["scraped_at"])
+        age = datetime.now(timezone.utc) - scraped_at
+        if age.total_seconds() > max_age_hours * 3600:
+            return False
+        hours_ago = age.total_seconds() / 3600
+        print(f"  Cache: {metadata.get('job_count', '?')} jobs scraped {hours_ago:.1f}h ago")
+        return True
+    except (json.JSONDecodeError, KeyError, ValueError):
+        return False
+
+
 def run_pipeline(args):
     """Execute the full pipeline."""
     start_time = time.time()
 
     print("=" * 60)
-    print("  WAT Job Search Automation Pipeline")
+    print("  Job Search Automation Pipeline")
     print("=" * 60)
 
     has_profile = os.path.exists(args.user_profile)
@@ -130,6 +162,9 @@ def run_pipeline(args):
             print("[1/6] ERROR: --skip-scrape but .tmp/raw_jobs.json doesn't exist.")
             print("  Run without --skip-scrape first to scrape jobs.")
             sys.exit(1)
+    elif not args.force_scrape and _is_cache_valid(raw_jobs_path, args.search_config):
+        print("[1/6] Using cached results (same search filters, less than 24h old).")
+        print("  Use --force-scrape to re-scrape.")
     else:
         print("[1/6] Scraping jobs from hiring.cafe...")
         print("  This may take 1-2 minutes (browser needs to bypass security check)...")
@@ -164,38 +199,12 @@ def run_pipeline(args):
         sys.exit(1)
     print(f"  Done: {len(parsed):,} jobs after filtering.")
 
-    # Step 3: Analyze (LLM)
-    analyzed_jobs_path = str(PROJECT_ROOT / ".tmp" / "analyzed_jobs.json")
-    if args.skip_analyze:
-        if os.path.exists(analyzed_jobs_path):
-            print("\n[3/6] SKIPPED: Using cached analyzed_jobs.json")
-        else:
-            print("\n[3/6] SKIPPED: No cached analysis found — using parsed data for scoring.")
-    else:
-        print(f"\n[3/6] Analyzing {len(parsed):,} jobs with Ollama...")
-        batch_size = args.batch_size
-        est_calls = (len(parsed) + batch_size - 1) // batch_size
-        print(f"  Estimated API calls: ~{est_calls} (batches of {batch_size})")
-
-        if not args.yes:
-            confirm = input("  Proceed with analysis? [Y/n] ").strip().lower()
-            if confirm == "n":
-                print("  Skipping analysis. Use --skip-analyze to reuse cached data.")
-                sys.exit(0)
-
-        from analyze_jobs import analyze_jobs
-        analyzed = analyze_jobs(parsed_jobs_path, analyzed_jobs_path, batch_size)
-        print(f"  Done: {len(analyzed):,} jobs analyzed.")
-
-    # Step 4: Score
+    # Step 3: Score (fast — no LLM needed, uses v5 structured data)
     scored_jobs_path = str(PROJECT_ROOT / ".tmp" / "scored_jobs.json")
     if resume_only_mode:
-        # No profile to score against — copy parsed/analyzed as "scored" with neutral scores
-        print(f"\n[4/6] SKIPPED: No user profile for scoring (resume-only mode).")
-        score_input = analyzed_jobs_path if os.path.exists(analyzed_jobs_path) else parsed_jobs_path
-        with open(score_input, "r", encoding="utf-8") as f:
+        print(f"\n[3/6] SKIPPED: No user profile for scoring (resume-only mode).")
+        with open(parsed_jobs_path, "r", encoding="utf-8") as f:
             jobs_data = json.load(f)
-        # Add neutral scores so downstream steps work
         for job in jobs_data:
             job["match_score"] = 50.0
             job["match_breakdown"] = {"skills": 50.0, "experience": 50.0, "education": 50.0}
@@ -208,50 +217,92 @@ def run_pipeline(args):
             json.dump(jobs_data, f, indent=2, ensure_ascii=False)
         print(f"  {len(jobs_data):,} jobs passed through with neutral scores.")
     else:
-        # Score from analyzed if available, otherwise from parsed
-        score_input = analyzed_jobs_path if os.path.exists(analyzed_jobs_path) else parsed_jobs_path
-        print(f"\n[4/6] Scoring jobs against your profile...")
+        print(f"\n[3/6] Scoring jobs against your profile...")
         from score_jobs import score_jobs
-        scored = score_jobs(score_input, args.user_profile, scored_jobs_path)
+        scored = score_jobs(parsed_jobs_path, args.user_profile, scored_jobs_path)
         if scored:
             top_score = scored[0].get("match_score", 0) if scored else 0
             print(f"  Done: {len(scored):,} jobs scored (top match: {top_score}%).")
 
-    # Step 5: Generate documents (LLM)
-    if args.skip_generate:
-        print("\n[5/6] SKIPPED: Document generation")
+    # Step 4: Show results and ask user how many to apply to
+    with open(scored_jobs_path, "r", encoding="utf-8") as f:
+        scored_data = json.load(f)
+    qualifying = [j for j in scored_data if j.get("match_score", 0) >= args.threshold]
+
+    MAX_APPLICATIONS = 25
+    qualifying = qualifying[:MAX_APPLICATIONS]
+
+    if not qualifying:
+        print(f"\n[4/6] No jobs scoring {args.threshold}%+.")
+        print("  Tip: Lower the threshold with --threshold or adjust your profile.")
+        num_selected = 0
     else:
-        with open(scored_jobs_path, "r") as f:
-            scored_data = json.load(f)
-        qualifying = [j for j in scored_data if j.get("match_score", 0) >= args.threshold]
-        qualifying = qualifying[:args.max_applications]
+        print(f"\n[4/6] Top matches (scoring {args.threshold}%+):")
+        for idx, j in enumerate(qualifying):
+            print(f"    {idx + 1}. [{j.get('match_score', 0):.0f}%] {j.get('title', '?')} at {j.get('company', '?')}")
 
-        if not qualifying:
-            print(f"\n[5/6] No jobs scoring {args.threshold}%+. Skipping document generation.")
-            print("  Tip: Lower the threshold with --threshold or adjust your profile.")
+        if args.skip_generate:
+            print("\n  Skipping LLM steps (--skip-generate).")
+            num_selected = 0
+        elif args.yes:
+            num_selected = min(len(qualifying), 5)
+            print(f"\n  Auto-selecting top {num_selected} for application generation.")
         else:
-            print(f"\n[5/6] Generating applications for {len(qualifying)} jobs...")
-            est_calls = len(qualifying) * 2
-            print(f"  Estimated API calls: ~{est_calls} (resume + cover letter each)")
+            default = min(len(qualifying), 5)
+            choice = input(
+                f"\n  How many to generate applications for? (1-{len(qualifying)}, Enter={default}, 0=skip) "
+            ).strip()
+            if choice == "0":
+                print("  Skipping application generation.")
+                num_selected = 0
+            elif choice:
+                try:
+                    num_selected = max(1, min(int(choice), len(qualifying)))
+                except ValueError:
+                    num_selected = default
+            else:
+                num_selected = default
 
-            proceed = True
-            if not args.yes:
-                confirm = input("  Proceed with generation? [Y/n] ").strip().lower()
-                if confirm == "n":
-                    print("  Skipping generation.")
-                    proceed = False
+    # Step 5: Analyze + Generate (LLM — only for selected jobs)
+    if num_selected == 0:
+        print("\n[5/6] SKIPPED: No jobs selected for application generation.")
+    else:
+        selected = qualifying[:num_selected]
+        selected_jobs_path = str(PROJECT_ROOT / ".tmp" / "selected_jobs.json")
+        os.makedirs(os.path.dirname(selected_jobs_path), exist_ok=True)
+        with open(selected_jobs_path, "w", encoding="utf-8") as f:
+            json.dump(selected, f, indent=2, ensure_ascii=False)
 
-            if proceed:
-                from generate_documents import generate_documents
-                generate_documents(
-                    jobs_path=scored_jobs_path,
-                    profile_path=args.user_profile if has_profile else None,
-                    base_resume_path=args.resume,
-                    output_dir=str(PROJECT_ROOT / "output"),
-                    threshold=args.threshold,
-                    max_jobs=args.max_applications,
-                )
-                print(f"  Done: applications generated for {len(qualifying)} jobs.")
+        # Analyze selected jobs with LLM (enriches data for better resume generation)
+        analyzed_jobs_path = str(PROJECT_ROOT / ".tmp" / "analyzed_jobs.json")
+        if args.skip_analyze:
+            print(f"\n[5/6] Skipping LLM analysis (--skip-analyze). Generating from scored data...")
+            analysis_input = selected_jobs_path
+        else:
+            print(f"\n[5/6] Analyzing {num_selected} job(s) with Groq...")
+            batch_size = args.batch_size
+            est_analysis = (num_selected + batch_size - 1) // batch_size
+            est_generate = num_selected * 2
+            print(f"  LLM calls: ~{est_analysis} for analysis + ~{est_generate} for documents")
+            print(f"  Groq free tier: 12K tokens/min — calls are spaced to avoid rate limits")
+
+            from analyze_jobs import analyze_jobs
+            analyzed = analyze_jobs(selected_jobs_path, analyzed_jobs_path, batch_size)
+            print(f"  Analysis complete: {len(analyzed):,} jobs enriched.")
+            analysis_input = analyzed_jobs_path
+
+        # Generate tailored resume + cover letter for each
+        print(f"  Generating applications for {num_selected} job(s)...")
+        from generate_documents import generate_documents
+        generate_documents(
+            jobs_path=analysis_input,
+            profile_path=args.user_profile if has_profile else None,
+            base_resume_path=args.resume,
+            output_dir=str(PROJECT_ROOT / "output"),
+            threshold=0,  # already filtered — generate for all
+            max_jobs=num_selected,
+        )
+        print(f"  Done: {num_selected} application(s) generated.")
 
     # Step 6: Report
     if has_profile:
@@ -283,14 +334,14 @@ def run_pipeline(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="WAT Job Search Automation Pipeline",
+        description="Job Search Automation Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   uv run python tools/run_pipeline.py                           # Full pipeline
   uv run python tools/run_pipeline.py --resume my_resume.pdf    # Use resume (no profile needed)
   uv run python tools/run_pipeline.py --skip-scrape             # Re-score without re-scraping
-  uv run python tools/run_pipeline.py --yes --max-applications 10
+  uv run python tools/run_pipeline.py --yes                     # Non-interactive (top 5)
         """,
     )
 
@@ -306,18 +357,18 @@ Examples:
                         help="Scraping method (default: auto)")
     parser.add_argument("--threshold", type=float, default=35.0,
                         help="Minimum match score for application generation (default: 35)")
-    parser.add_argument("--max-applications", type=int, default=20,
-                        help="Maximum number of applications to generate (default: 20)")
-    parser.add_argument("--batch-size", type=int, default=5,
-                        help="Jobs per LLM analysis batch (default: 5)")
+    parser.add_argument("--batch-size", type=int, default=3,
+                        help="Jobs per LLM analysis batch (default: 3)")
     parser.add_argument("--skip-scrape", action="store_true",
                         help="Skip scraping, use cached .tmp/raw_jobs.json")
+    parser.add_argument("--force-scrape", action="store_true",
+                        help="Force re-scrape even if cached results are recent")
     parser.add_argument("--skip-analyze", action="store_true",
-                        help="Skip LLM analysis, use cached .tmp/analyzed_jobs.json")
+                        help="Skip LLM analysis, generate from scored data only")
     parser.add_argument("--skip-generate", action="store_true",
-                        help="Skip document generation (score only)")
+                        help="Skip LLM steps entirely (score only)")
     parser.add_argument("--yes", "-y", action="store_true",
-                        help="Skip confirmation prompts")
+                        help="Skip prompts (auto-selects top 5)")
 
     args = parser.parse_args()
     run_pipeline(args)

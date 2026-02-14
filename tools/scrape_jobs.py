@@ -10,11 +10,13 @@ API format (discovered via browser interception):
 
 import argparse
 import base64
+import hashlib
 import json
 import os
 import sys
 import time
 import urllib.parse
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -374,8 +376,8 @@ def scrape_via_browser(search_state: dict, page_size: int = 40, max_pages: int =
                 try:
                     body = response.json()
                     captured_responses.append(body)
-                except Exception:
-                    pass
+                except (json.JSONDecodeError, ValueError):
+                    pass  # Non-JSON response (e.g. HTML error page)
 
         page.on("response", handle_response)
 
@@ -390,8 +392,8 @@ def scrape_via_browser(search_state: dict, page_size: int = 40, max_pages: int =
             try:
                 page.wait_for_timeout(15000)
                 page.wait_for_load_state("networkidle", timeout=30000)
-            except Exception:
-                pass
+            except Exception as retry_err:
+                print(f"  Challenge did not resolve: {retry_err}")
 
         print("  Waiting for API responses...")
         page.wait_for_timeout(5000)
@@ -481,11 +483,27 @@ def scrape_jobs(config_path: str, method: str = "auto", output_path: str = None)
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, "w", encoding="utf-8") as f:
             json.dump(jobs, f, indent=2, ensure_ascii=False)
+        # Save scrape metadata for cache validation
+        config_hash = _hash_config(config_path)
+        metadata = {
+            "config_hash": config_hash,
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
+            "job_count": len(jobs),
+        }
+        metadata_path = str(Path(output_path).parent / "scrape_metadata.json")
+        with open(metadata_path, "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2)
         print(f"\nScraped {len(jobs):,} jobs -> {output_path}")
     else:
         print("\nNo jobs scraped. Check your filters or try a different method.")
 
     return jobs
+
+
+def _hash_config(config_path: str) -> str:
+    """SHA-256 hash of the search config file contents."""
+    with open(config_path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
 
 
 def main():

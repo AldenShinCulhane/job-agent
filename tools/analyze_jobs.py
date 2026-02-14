@@ -20,7 +20,7 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 from llm_client import chat_completion
 
-BATCH_SIZE = 5
+BATCH_SIZE = 3
 
 ANALYSIS_PROMPT = """Analyze each job posting and extract structured information. Return a JSON array where each element corresponds to one job (in the same order as provided).
 
@@ -49,7 +49,7 @@ def build_batch_prompt(jobs: list) -> str:
             f"Experience Level: {job.get('experience_level', 'N/A')}\n"
             f"Already-extracted skills: {', '.join(job.get('skills', []))}\n"
             f"Requirements summary: {job.get('requirements_summary', 'N/A')}\n"
-            f"Description:\n{job.get('description_text', 'N/A')[:3000]}\n"
+            f"Description:\n{job.get('description_text', 'N/A')[:1500]}\n"
         )
     return "\n".join(parts)
 
@@ -151,7 +151,7 @@ def analyze_jobs(input_path: str = None, output_path: str = None, batch_size: in
         with open(progress_path, "w", encoding="utf-8") as f:
             json.dump(analyzed, f, indent=2, ensure_ascii=False)
 
-        time.sleep(0.5)
+        time.sleep(5)
 
     # Save final output and clean up
     os.makedirs(os.path.dirname(output_path), exist_ok=True)

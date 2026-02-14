@@ -12,7 +12,6 @@ import re
 from difflib import SequenceMatcher
 from pathlib import Path
 
-import requests
 import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -370,30 +369,46 @@ def collect_education(existing: dict) -> list:
 
 
 def collect_projects(existing: dict) -> list:
-    """Collect personal/academic projects."""
+    """Collect personal/academic projects with dates and bullet-point highlights."""
     print("\n--- Projects ---")
     existing_projects = existing.get("projects", [])
     if existing_projects:
         print(f"  You have {len(existing_projects)} project(s) on file:")
         for proj in existing_projects:
-            print(f"    - {proj.get('name', '?')}: {proj.get('description', '?')[:60]}")
+            dates = f" ({proj.get('start_date', '?')} - {proj.get('end_date', '?')})"
+            print(f"    - {proj.get('name', '?')}{dates}")
         if not prompt_yes_no("Re-enter projects?"):
             return existing_projects
 
     projects = []
     print("\n  Enter your projects (press Enter on name to stop):")
     while True:
+        idx = len(projects) + 1
+        print(f"\n  Project {idx}:")
         name = prompt("Project name (or Enter to finish)")
         if not name:
             break
-        description = prompt("Brief description", required=True)
+        start_date = prompt("Start date (YYYY-MM)", required=True, validate=_validate_date)
+        end_date = prompt("End date (YYYY-MM or 'present')", "present", validate=_validate_date)
         technologies = prompt_list("Technologies used", [])
         url = prompt("URL (optional)", validate=_validate_url)
+        print("    Enter highlights (one per line, empty line to finish):")
+        highlights = []
+        while True:
+            h = input("      - ").strip()
+            if not h:
+                if not highlights:
+                    print("      At least one highlight is required.")
+                    continue
+                break
+            highlights.append(h)
         projects.append({
             "name": name,
-            "description": description,
+            "start_date": start_date,
+            "end_date": end_date,
             "technologies": technologies,
             "url": url if url else "",
+            "highlights": highlights,
         })
 
     return projects
@@ -540,29 +555,50 @@ def collect_search_filters(existing: dict) -> dict:
     }
 
 
-def check_ollama_setup() -> bool:
-    """Check if Ollama is running locally. Returns True if reachable."""
-    print("\n--- LLM (Ollama) ---")
-    print("  Steps 3 (Analyze) and 5 (Generate) use Ollama for LLM processing.")
-    print("  Checking Ollama at http://localhost:11434...")
+def check_groq_setup() -> bool:
+    """Check if a Groq API key is configured.
 
-    try:
-        resp = requests.get("http://localhost:11434", timeout=3)
-        if resp.status_code == 200:
-            print("  Ollama is running!")
-            return True
-    except requests.ConnectionError:
-        pass
-    except Exception:
-        pass
+    Prompts the user to enter their key if not found in .env.
+    Returns True if a valid key is configured.
+    """
+    print("\n--- LLM (Groq) ---")
+    print("  LLM features use Groq (free, fast cloud inference).")
+    print("  Get a free API key at: https://console.groq.com")
 
-    print("  Ollama is not running.")
-    print("  The pipeline will still scrape, filter, score, and generate reports.")
-    print("  To enable LLM features (job analysis, tailored resumes/cover letters):")
-    print("    1. Install Ollama: https://ollama.com")
-    print("    2. Start Ollama")
-    print("    3. Pull a model: ollama pull llama3.3")
+    existing_key = os.getenv("GROQ_API_KEY", "")
+    if existing_key:
+        masked = existing_key[:8] + "..." + existing_key[-4:]
+        print(f"  API key found: {masked}")
+        return True
+
+    print("  No GROQ_API_KEY found in .env")
+    key = input("  Enter your Groq API key (or press Enter to skip): ").strip()
+    if key:
+        _save_env_var("GROQ_API_KEY", key)
+        print("  Saved GROQ_API_KEY to .env")
+        return True
+
+    print("  Skipping — the pipeline will still scrape, filter, score, and generate reports.")
+    print("  Add GROQ_API_KEY to .env later to enable tailored resume/cover letter generation.")
     return False
+
+
+def _save_env_var(key: str, value: str):
+    """Update or add a variable in .env, preserving other content."""
+    lines = []
+    found = False
+    if ENV_PATH.exists():
+        with open(ENV_PATH, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip().startswith(f"{key}="):
+                    lines.append(f"{key}={value}\n")
+                    found = True
+                else:
+                    lines.append(line)
+    if not found:
+        lines.append(f"{key}={value}\n")
+    with open(ENV_PATH, "w", encoding="utf-8") as f:
+        f.writelines(lines)
 
 
 def write_profile(profile: dict):
@@ -589,33 +625,21 @@ def write_filters(filters: dict):
     print(f"  Saved: {FILTERS_PATH}")
 
 
-def write_env(ollama_running: bool):
-    """Write .env file with Ollama config, preserving unrelated vars."""
-    # Read existing lines, filtering out LLM-related keys we'll rewrite
-    llm_keys = {"LLM_PROVIDER", "LLM_API_KEY", "LLM_MODEL", "LLM_BASE_URL", "ANTHROPIC_API_KEY"}
-    existing_lines = []
-    if ENV_PATH.exists():
-        with open(ENV_PATH, "r", encoding="utf-8") as f:
-            for line in f:
-                key = line.strip().split("=", 1)[0].strip()
-                if key not in llm_keys and not line.strip().startswith("#"):
-                    existing_lines.append(line)
-
-    with open(ENV_PATH, "w", encoding="utf-8") as f:
-        f.write("# Ollama must be running locally: https://ollama.com\n")
-        f.write("# Pull a model: ollama pull llama3.3\n")
-        f.write(f"LLM_PROVIDER=ollama\n")
-        f.write("\n")
-        # Preserve other env vars
-        for line in existing_lines:
-            f.write(line)
-    print(f"  Saved: {ENV_PATH}")
+def write_env():
+    """Ensure .env exists. Groq key is saved inline by check_groq_setup()."""
+    if not ENV_PATH.exists():
+        with open(ENV_PATH, "w", encoding="utf-8") as f:
+            f.write("# Get a free API key at https://console.groq.com\n")
+            f.write("# GROQ_API_KEY=gsk_...\n")
+        print(f"  Created: {ENV_PATH}")
+    else:
+        print(f"  Exists: {ENV_PATH}")
 
 
 def interactive_setup():
     """Run the full interactive setup wizard."""
     print("=" * 55)
-    print("  WAT Job Search — Setup Wizard")
+    print("  Job Search — Setup Wizard")
     print("=" * 55)
     print("\nPress Enter to keep the default value shown in [brackets].")
 
@@ -628,11 +652,11 @@ def interactive_setup():
             print(f"\nExisting profile found for: {name}")
             if not prompt_yes_no("Update your profile?", default=True):
                 print("Keeping existing profile.")
-                # Still offer to update search filters and check Ollama
+                # Still offer to update search filters and check Groq
                 filters = collect_search_filters(existing_filters)
-                ollama_running = check_ollama_setup()
+                groq_configured = check_groq_setup()
                 write_filters(filters)
-                write_env(ollama_running)
+                write_env()
                 print("\nSetup complete!")
                 return
 
@@ -643,7 +667,7 @@ def interactive_setup():
     education = collect_education(existing_profile)
     projects = collect_projects(existing_profile)
     filters = collect_search_filters(existing_filters)
-    ollama_running = check_ollama_setup()
+    groq_configured = check_groq_setup()
 
     profile = {
         "personal": personal,
@@ -663,7 +687,7 @@ def interactive_setup():
         "5": ("Education", lambda: collect_education(existing_profile), "education"),
         "6": ("Projects", lambda: collect_projects(existing_profile), "projects"),
         "7": ("Search filters", None, None),
-        "8": ("Ollama status", None, None),
+        "8": ("Groq API key", None, None),
     }
 
     while True:
@@ -684,8 +708,8 @@ def interactive_setup():
         print(f"  [6] Projects:    {len(projects)} project(s)")
         search_locs = ', '.join(loc.get('formatted_address', '') for loc in filters.get('locations', []))
         print(f"  [7] Search:      \"{filters.get('search', {}).get('query', '')}\" in {search_locs}")
-        ollama_display = "Ollama (running)" if ollama_running else "Ollama (not detected)"
-        print(f"  [8] LLM:         {ollama_display}")
+        groq_display = "Groq (configured)" if groq_configured else "Groq (no API key)"
+        print(f"  [8] LLM:         {groq_display}")
 
         print(f"\n  Enter a number (1-8) to edit that section, or press Enter to save.")
         choice = input("  Edit section: ").strip()
@@ -717,14 +741,14 @@ def interactive_setup():
         elif choice == "7":
             filters = collect_search_filters(existing_filters)
         elif choice == "8":
-            ollama_running = check_ollama_setup()
+            groq_configured = check_groq_setup()
         else:
             print("  Invalid choice. Enter 1-8 or press Enter to save.")
 
     print("\n--- Saving Configuration ---")
     write_profile(profile)
     write_filters(filters)
-    write_env(ollama_running)
+    write_env()
 
     print("\n" + "=" * 55)
     print("  Setup complete!")

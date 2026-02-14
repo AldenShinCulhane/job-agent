@@ -38,6 +38,7 @@ experience:
   positions:
     - title: "Software Engineer"
       company: "Company Name"
+      location: "City, Province/State"  # optional — falls back to personal.location
       start_date: "2022-01"
       end_date: "present"
       highlights:
@@ -45,6 +46,7 @@ experience:
         - "Led migration from monolith to microservices architecture"
     - title: "Junior Developer"
       company: "Previous Company"
+      location: ""  # optional
       start_date: "2020-06"
       end_date: "2021-12"
       highlights:
@@ -55,14 +57,21 @@ education:
   - degree: "Bachelor of Science"
     field: "Computer Science"
     institution: "University Name"
+    location: "City, Province/State"  # optional — falls back to personal.location
+    start_year: 2016                  # optional — enables "Sept 2016 -- Aug 2020" on resume
     graduation_year: 2020
-    gpa: 3.5  # optional
+    honors: ""                        # optional — e.g. "Dean's List (2019-2020)"
+    gpa: 3.5                          # optional
 
 projects:
   - name: "Project Name"
-    description: "Brief description of the project and your role"
+    start_date: "2023-01"
+    end_date: "2023-06"
     technologies:
       - Python
       - React
     url: ""  # optional
+    highlights:
+      - "Built and deployed a full-stack web application"
+      - "Implemented CI/CD pipeline using GitHub Actions"
 
