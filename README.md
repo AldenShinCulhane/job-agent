@@ -4,6 +4,8 @@ Scrapes job listings from [hiring.cafe](https://hiring.cafe), strictly filters t
 
 ## How It Works
 
+By default, a **ReAct agent** (Reason-Act-Observe loop) orchestrates the pipeline — it decides which steps to run, checks in with you at key decision points, evaluates generated documents for quality, and can adapt search filters if results are poor. Use `--no-agent` for the legacy sequential pipeline.
+
 ```
 [1] Scrape       hiring.cafe via headless browser    → .tmp/raw_jobs.json
 [2] Parse        normalize, deduplicate, and filter  → .tmp/parsed_jobs.json
@@ -15,7 +17,7 @@ Scrapes job listings from [hiring.cafe](https://hiring.cafe), strictly filters t
 
 **Filtering vs. Scoring:** Your search filters (location, title, experience level, salary, etc.) are hard gates — only jobs matching ALL your criteria appear. The match% then ranks those jobs by how well your skills, experience, and education align with what each job requires.
 
-Steps 1-3 and 6 run without any external services. Step 5 uses a free LLM API — [SambaNova](https://cloud.sambanova.ai/apis) (unlimited, no credit card).
+Steps 1-3 and 6 run without any external services. Step 5 uses a free LLM API — [SambaNova](https://cloud.sambanova.ai/apis) (unlimited, no credit card). Agent reasoning uses a separate LLM (Gemini by default) to avoid rate limit conflicts.
 
 ## Quick Start
 
@@ -87,17 +89,26 @@ cp config/search_filters.yaml.example config/search_filters.yaml
 
 > **Note:** `.env`, `config/user_profile.yaml`, and `config/search_filters.yaml` are gitignored to protect your personal information and API keys. Only the `.example` templates are tracked.
 
-## LLM (SambaNova — Free)
+## LLM Providers (Free)
 
-Step 5 uses an LLM for job analysis and tailored resume/cover letter generation.
+The pipeline uses two LLM providers — one for agent reasoning, one for document generation:
 
-1. Go to [cloud.sambanova.ai/apis](https://cloud.sambanova.ai/apis)
-2. Create a free API key (no credit card required)
-3. Add it to your `.env`: `SAMBANOVA_API_KEY=...`
+| Role | Default | Free tier | API key |
+|------|---------|-----------|---------|
+| Agent reasoning | Gemini 2.5 Flash | 10 RPM, 250 RPD | `GEMINI_API_KEY` |
+| Document generation | SambaNova (Llama 3.3 70B) | Unlimited, 20 RPM | `SAMBANOVA_API_KEY` |
 
-SambaNova provides unlimited free tokens at 20 requests/min — no daily cap. The setup wizard handles this automatically. Without an API key, the pipeline still scrapes, filters, scores, and generates a summary report — you just won't get the auto-generated application documents.
+1. Get a free SambaNova key at [cloud.sambanova.ai/apis](https://cloud.sambanova.ai/apis) (no credit card)
+2. Get a free Gemini key at [aistudio.google.com](https://aistudio.google.com/apikey) (no credit card)
+3. Add both to your `.env`:
+   ```
+   SAMBANOVA_API_KEY=...
+   GEMINI_API_KEY=...
+   ```
 
-**Alternative providers** (use `--provider` flag): Cerebras, Gemini, Groq. Set the corresponding API key in `.env` and pass `--provider cerebras` (etc.) when running the pipeline.
+The setup wizard handles this automatically. Without API keys, the pipeline still scrapes, filters, scores, and generates a summary report — you just won't get agent reasoning or auto-generated application documents.
+
+**Override providers:** `--reasoning-provider groq --generation-provider cerebras`. In legacy mode (`--no-agent`), use `--provider` instead. All providers: SambaNova, Cerebras, Gemini, Groq.
 
 ## Output
 
@@ -149,6 +160,12 @@ All three are gitignored. Committed `.example` templates show the expected forma
 ## Common Operations
 
 ```bash
+# Agent mode (default) — LLM-driven orchestration with check-ins
+uv run python tools/run_pipeline.py
+
+# Legacy sequential pipeline (no agent reasoning)
+uv run python tools/run_pipeline.py --no-agent
+
 # Re-score without re-scraping (uses cached job data)
 uv run python tools/run_pipeline.py --skip-scrape
 
@@ -156,13 +173,13 @@ uv run python tools/run_pipeline.py --skip-scrape
 uv run python tools/run_pipeline.py --resume my_resume.pdf
 
 # Score only — no LLM calls at all
-uv run python tools/run_pipeline.py --skip-scrape --skip-generate
+uv run python tools/run_pipeline.py --no-agent --skip-scrape --skip-generate
 
-# Non-interactive (auto-selects top 5)
-uv run python tools/run_pipeline.py --skip-scrape --yes
+# Non-interactive legacy mode (auto-selects top 5)
+uv run python tools/run_pipeline.py --no-agent --skip-scrape --yes
 
-# Use a different LLM provider
-uv run python tools/run_pipeline.py --provider cerebras
+# Custom providers for agent reasoning and generation
+uv run python tools/run_pipeline.py --reasoning-provider groq --generation-provider cerebras
 
 # Update your profile
 uv run python tools/setup.py
@@ -220,13 +237,14 @@ config/
   search_filters.yaml.example    # Template — copy and adjust search criteria
 tools/
   setup.py                       # Interactive setup wizard
-  run_pipeline.py                # Main entry point — runs all steps
-  llm_client.py                  # LLM client (SambaNova default, --provider for alternatives)
+  run_pipeline.py                # Main entry point — agent mode or legacy pipeline
+  agent.py                       # ReAct agent — LLM-driven orchestration loop
+  llm_client.py                  # LLM client (multi-provider, multi-turn support)
   scrape_jobs.py                 # Headless browser scraper for hiring.cafe
   parse_jobs.py                  # Normalizes, deduplicates, and filters raw API data
   analyze_jobs.py                # Optional LLM enrichment
   score_jobs.py                  # Deterministic scoring (skills, experience, education)
-  generate_documents.py          # LaTeX resume + DOCX cover letter generator
+  generate_documents.py          # LaTeX resume + cover letter PDF generator
   generate_report.py             # Summary report with rankings and skill gaps
 ```
 
@@ -247,3 +265,4 @@ tools/
 - Resumes and cover letters are each limited to 1 page (auto-trimmed if needed)
 - Processing 5 jobs requires ~12 LLM calls (2 analysis + 5 resume + 5 cover letter). Selecting more jobs increases this linearly.
 - SambaNova free tier: unlimited tokens, 20 requests/min — comfortably handles all pipeline operations
+- Agent mode adds ~5-10 reasoning LLM calls on top of pipeline calls (Gemini free tier: 10 RPM, 250 RPD)

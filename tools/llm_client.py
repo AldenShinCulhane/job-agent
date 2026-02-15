@@ -185,6 +185,83 @@ def chat_completion(
     raise LLMConfigError(f"{get_provider_name()} API: max retries exceeded.")
 
 
+def chat_completion_multi(
+    messages: list[dict],
+    max_tokens: int = 4096,
+    provider_override: str = None,
+) -> str:
+    """
+    Send a multi-turn chat completion request.
+
+    Unlike chat_completion(), this accepts a full conversation history
+    (system + user + assistant turns) and optionally uses a different
+    provider without changing global state.
+
+    Args:
+        messages: List of {"role": "system"|"user"|"assistant", "content": "..."}
+        max_tokens: Maximum tokens in the response
+        provider_override: Use this provider instead of the active one (temporary)
+
+    Returns:
+        The model's text response.
+    """
+    from openai import OpenAI, RateLimitError, APIError, APIConnectionError
+
+    if provider_override:
+        if provider_override not in _PROVIDERS:
+            raise ValueError(f"Unknown provider '{provider_override}'.")
+        config = _PROVIDERS[provider_override]
+        api_key = os.getenv(config["key_env"], "")
+    else:
+        config = _active_config
+        api_key = _api_key
+
+    if not api_key:
+        raise LLMConfigError(
+            f"No API key found for {config['display_name']}.\n"
+            f"  Set {config['key_env']}=... in your .env file."
+        )
+
+    client = OpenAI(base_url=config["base_url"], api_key=api_key)
+    model = os.getenv("LLM_MODEL", config["model"])
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                max_tokens=max_tokens,
+                messages=messages,
+            )
+            content = response.choices[0].message.content
+            if content is None:
+                if attempt == MAX_RETRIES - 1:
+                    raise LLMConfigError("LLM returned empty response.")
+                time.sleep(2)
+                continue
+            return content.strip()
+        except APIConnectionError:
+            if attempt == MAX_RETRIES - 1:
+                raise LLMConfigError(f"Cannot connect to {config['display_name']} API.")
+            wait = 2 ** (attempt + 1)
+            print(f"    Connection failed, retrying in {wait}s...")
+            time.sleep(wait)
+        except RateLimitError as e:
+            if attempt == MAX_RETRIES - 1:
+                raise LLMConfigError(f"{config['display_name']} API: max retries exceeded (rate limited).")
+            wait = _get_retry_after(e)
+            if wait is None:
+                wait = config["backoff"][min(attempt, 5)]
+            print(f"    Rate limited, waiting {wait}s... (attempt {attempt + 1}/{MAX_RETRIES})")
+            time.sleep(wait)
+        except APIError as e:
+            if attempt == MAX_RETRIES - 1:
+                raise
+            print(f"    API error: {e}, retrying...")
+            time.sleep(2)
+
+    raise LLMConfigError(f"{config['display_name']} API: max retries exceeded.")
+
+
 def _get_retry_after(error) -> float | None:
     """Extract retry-after seconds from a RateLimitError, if available."""
     try:

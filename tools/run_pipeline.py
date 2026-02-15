@@ -1,10 +1,12 @@
 """
-Main orchestrator for the agentic job search pipeline.
-Chains all tools in sequence with pre-flight validation, cost estimation,
-and skip flags for partial reruns.
+Main entry point for the Agentic Job Search Pipeline.
+
+Default mode: ReAct agent that reasons about what steps to take, calls tools,
+and adapts based on results. Use --no-agent for the legacy sequential pipeline.
 
 Usage:
-    uv run python tools/run_pipeline.py
+    uv run python tools/run_pipeline.py                           # Agent mode (default)
+    uv run python tools/run_pipeline.py --no-agent                # Legacy sequential pipeline
     uv run python tools/run_pipeline.py --resume path/to/resume.pdf
     uv run python tools/run_pipeline.py --skip-scrape --threshold 50
 """
@@ -340,10 +342,11 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  uv run python tools/run_pipeline.py                           # Full pipeline
+  uv run python tools/run_pipeline.py                           # Agent mode (default)
+  uv run python tools/run_pipeline.py --no-agent                # Legacy sequential pipeline
   uv run python tools/run_pipeline.py --resume my_resume.pdf    # Use resume (no profile needed)
-  uv run python tools/run_pipeline.py --skip-scrape             # Re-score without re-scraping
-  uv run python tools/run_pipeline.py --yes                     # Non-interactive (top 5)
+  uv run python tools/run_pipeline.py --skip-scrape             # Use cached scrape data
+  uv run python tools/run_pipeline.py --no-agent --yes          # Legacy mode, non-interactive
         """,
     )
 
@@ -373,15 +376,45 @@ Examples:
                         help="Skip prompts (auto-selects top 5)")
     parser.add_argument("--provider", choices=["sambanova", "cerebras", "gemini", "groq"],
                         default="sambanova",
-                        help="LLM provider (default: sambanova)")
+                        help="LLM provider for legacy mode (default: sambanova)")
+    parser.add_argument("--no-agent", action="store_true",
+                        help="Use legacy sequential pipeline instead of agent mode")
+    parser.add_argument("--reasoning-provider",
+                        choices=["sambanova", "cerebras", "gemini", "groq"],
+                        default="gemini",
+                        help="LLM provider for agent reasoning (default: gemini)")
+    parser.add_argument("--generation-provider",
+                        choices=["sambanova", "cerebras", "gemini", "groq"],
+                        default="sambanova",
+                        help="LLM provider for document generation (default: sambanova)")
 
     args = parser.parse_args()
 
-    # Set LLM provider before any LLM operations
-    from llm_client import set_provider
-    set_provider(args.provider)
+    if args.no_agent:
+        # Legacy sequential pipeline
+        from llm_client import set_provider
+        set_provider(args.provider)
+        run_pipeline(args)
+    else:
+        # Agent mode (default)
+        from llm_client import set_provider
+        set_provider(args.generation_provider)
 
-    run_pipeline(args)
+        from agent import AgentState, run_agent
+
+        state = AgentState(
+            reasoning_provider=args.reasoning_provider,
+            generation_provider=args.generation_provider,
+            search_config_path=args.search_config,
+            profile_path=args.user_profile,
+            resume_path=args.resume,
+            has_profile=os.path.exists(args.user_profile),
+        )
+        run_agent(
+            state,
+            skip_scrape=args.skip_scrape,
+            force_scrape=args.force_scrape,
+        )
 
 
 if __name__ == "__main__":
