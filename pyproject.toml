@@ -1,7 +1,7 @@
 [project]
 name = "job-agent"
 version = "0.1.0"
-description = "Automated job search pipeline — scrapes, scores, and generates tailored applications"
+description = "Agentic job search pipeline — scrapes, scores, and generates tailored applications"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

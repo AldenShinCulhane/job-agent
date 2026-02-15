@@ -1,4 +1,4 @@
-# Job Search Automation
+# Agentic Job Search Pipeline
 
 Scrapes job listings from [hiring.cafe](https://hiring.cafe), strictly filters them against your search criteria, scores the matches against your resume, then generates tailored resumes and cover letters for your top matches.
 

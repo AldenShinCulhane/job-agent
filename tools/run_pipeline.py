@@ -1,5 +1,5 @@
 """
-Main orchestrator for the job search automation pipeline.
+Main orchestrator for the agentic job search pipeline.
 Chains all tools in sequence with pre-flight validation, cost estimation,
 and skip flags for partial reruns.
 
@@ -112,7 +112,7 @@ def run_pipeline(args):
     start_time = time.time()
 
     print("=" * 60)
-    print("  Job Search Automation Pipeline")
+    print("  Agentic Job Search Pipeline")
     print("=" * 60)
 
     has_profile = os.path.exists(args.user_profile)
@@ -336,7 +336,7 @@ def run_pipeline(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Job Search Automation Pipeline",
+        description="Agentic Job Search Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
