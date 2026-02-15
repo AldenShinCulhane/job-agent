@@ -2,7 +2,7 @@
 Tailored resume & cover letter generator.
 
 Resumes: LaTeX template -> PDF (uses user's exact formatting with LLM-tailored bullets)
-Cover letters: python-docx DOCX (contact header + properly spaced body)
+Cover letters: LaTeX template -> PDF (contact header + properly spaced body)
 """
 
 import argparse
@@ -16,8 +16,6 @@ import time
 from pathlib import Path
 
 import yaml
-from docx import Document
-from docx.shared import Inches, Pt
 from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -845,69 +843,57 @@ Connect the candidate's actual experience to this role's specific requirements."
         return ""
 
 
-def create_cover_letter_docx(letter_text: str, profile: dict, output_path: str):
-    """Create a DOCX cover letter with contact info in body and 12pt text."""
-    doc = Document()
+def create_cover_letter_pdf(letter_text: str, profile: dict, output_dir: str):
+    """Create a PDF cover letter via LaTeX with contact info header and body text.
+
+    Writes cover_letter.tex and compiles to cover_letter.pdf.
+    Returns True if PDF was created, False if only .tex (no pdflatex).
+    """
     personal = profile.get("personal", {})
 
-    section = doc.sections[0]
-    section.top_margin = Inches(1)
-    section.bottom_margin = Inches(1)
-    section.left_margin = Inches(1)
-    section.right_margin = Inches(1)
+    # -- Build LaTeX source --
+    tex = r"""\documentclass[11pt,letterpaper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{parskip}
+\usepackage[hidelinks]{hyperref}
+\pagestyle{empty}
+\begin{document}
+"""
 
-    # -- Contact info at top of body --
-    contact_fields = [
-        (personal.get("name", ""), False, 11),
-        (personal.get("location", ""), False, 11),
-        (personal.get("email", ""), False, 11),
-        (personal.get("github", ""), False, 11),
-        (personal.get("linkedin", ""), False, 11),
-    ]
+    # Contact info block
+    contact_lines = []
+    for field in ["name", "location", "email", "github", "linkedin"]:
+        value = personal.get(field, "")
+        if value:
+            contact_lines.append(latex_escape(value))
+    if contact_lines:
+        tex += "\n".join(contact_lines) + "\n\n"
+        tex += "\\vspace{0.5em}\n\n"
 
-    for text, bold, size in contact_fields:
-        if not text:
-            continue
-        p = doc.add_paragraph()
-        p.paragraph_format.space_before = Pt(0)
-        p.paragraph_format.space_after = Pt(0)
-        p.paragraph_format.line_spacing = Pt(size + 2)
-        run = p.add_run(text)
-        run.bold = bold
-        run.font.size = Pt(size)
-        run.font.name = "Arial"
-
-    # Small gap between contact info and letter body
-    p = doc.add_paragraph("")
-    p.paragraph_format.space_before = Pt(0)
-    p.paragraph_format.space_after = Pt(4)
-
-    # -- Body --
+    # Body text
     lines = letter_text.split("\n")
     for line in lines:
         stripped = line.strip()
 
-        # Skip any markdown headers the LLM might include
+        # Skip markdown headers the LLM might include
         if stripped.startswith("## ") or stripped.startswith("# "):
             continue
 
         if not stripped:
-            # Blank line = paragraph break (small gap)
-            p = doc.add_paragraph("")
-            p.paragraph_format.space_before = Pt(0)
-            p.paragraph_format.space_after = Pt(0)
+            tex += "\n"
             continue
 
-        p = doc.add_paragraph(stripped)
-        p.paragraph_format.space_before = Pt(0)
-        p.paragraph_format.space_after = Pt(2)
-        p.paragraph_format.line_spacing = Pt(15)
-        for run in p.runs:
-            run.font.size = Pt(12)
-            run.font.name = "Arial"
+        tex += latex_escape(stripped) + "\n"
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    doc.save(output_path)
+    tex += "\n\\end{document}\n"
+
+    # Write .tex and compile
+    os.makedirs(output_dir, exist_ok=True)
+    tex_path = os.path.join(output_dir, "cover_letter.tex")
+    with open(tex_path, "w", encoding="utf-8") as f:
+        f.write(tex)
+
+    return compile_tex_to_pdf(tex_path)
 
 
 # == File Management ======================================================
@@ -917,7 +903,7 @@ def _backup_existing(job_dir: str):
     """Rename existing output files with _old suffix before writing new ones."""
     backup_names = [
         "resume.pdf", "resume.tex", "resume.docx", "resume.md",
-        "cover_letter.docx", "cover_letter.md",
+        "cover_letter.pdf", "cover_letter.tex", "cover_letter.md",
     ]
     for name in backup_names:
         path = os.path.join(job_dir, name)
@@ -1019,18 +1005,20 @@ def generate_documents(
         if has_profile:
             time.sleep(get_call_delay())
 
-        # -- Cover Letter (DOCX) --
+        # -- Cover Letter (PDF) --
         print("  Generating cover letter...")
         letter_text = generate_cover_letter(job, profile, base_resume)
         if letter_text:
             letter_text = _trim_cover_letter(letter_text)
-            letter_path = os.path.join(job_dir, "cover_letter.docx")
-            create_cover_letter_docx(letter_text, profile, letter_path)
+            pdf_ok = create_cover_letter_pdf(letter_text, profile, job_dir)
 
             md_path = os.path.join(job_dir, "cover_letter.md")
             with open(md_path, "w", encoding="utf-8") as f:
                 f.write(letter_text)
-            print(f"  -> {letter_path}")
+            if pdf_ok:
+                print(f"  -> {os.path.join(job_dir, 'cover_letter.pdf')}")
+            else:
+                print(f"  -> {os.path.join(job_dir, 'cover_letter.tex')} (compile manually with pdflatex)")
 
         # -- Job Details --
         details_path = os.path.join(job_dir, "job_details.json")

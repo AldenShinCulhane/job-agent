@@ -108,7 +108,7 @@ output/
     acme-corp_software-engineer/
       resume.pdf                             # Tailored resume (auto-compiled from LaTeX)
       resume.tex                             # LaTeX source (compile manually if no pdflatex)
-      cover_letter.docx                      # Tailored cover letter
+      cover_letter.pdf                       # Tailored cover letter
       cover_letter.md                        # Cover letter source text
       job_details.json                       # Job posting data + match breakdown
 ```
