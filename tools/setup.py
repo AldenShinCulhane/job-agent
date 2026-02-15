@@ -687,14 +687,14 @@ def interactive_setup():
 
     # Review & edit loop
     sections = {
-        "1": ("Personal info", lambda: collect_personal_info(existing_profile), "personal"),
-        "2": ("Summary", lambda: collect_summary(existing_profile), "summary"),
-        "3": ("Skills", lambda: collect_skills(existing_profile), "skills"),
-        "4": ("Experience", lambda: collect_experience(existing_profile), "experience"),
-        "5": ("Education", lambda: collect_education(existing_profile), "education"),
-        "6": ("Projects", lambda: collect_projects(existing_profile), "projects"),
-        "7": ("Search filters", None, None),
-        "8": ("Groq API key", None, None),
+        "a": ("Personal info", lambda: collect_personal_info(existing_profile), "personal"),
+        "b": ("Summary", lambda: collect_summary(existing_profile), "summary"),
+        "c": ("Skills", lambda: collect_skills(existing_profile), "skills"),
+        "d": ("Experience", lambda: collect_experience(existing_profile), "experience"),
+        "e": ("Education", lambda: collect_education(existing_profile), "education"),
+        "f": ("Projects", lambda: collect_projects(existing_profile), "projects"),
+        "g": ("Search filters", None, None),
+        "h": ("LLM API keys", None, None),
     }
 
     while True:
@@ -702,29 +702,29 @@ def interactive_setup():
         print("  Review Your Configuration")
         print("=" * 55)
 
-        print(f"\n  [1] Personal:    {personal.get('name', '')} — {personal.get('email', '')}")
-        print(f"  [2] Summary:     {(summary or '')[:60]}{'...' if len(summary or '') > 60 else ''}")
+        print(f"\n  [A] Personal:    {personal.get('name', '')} — {personal.get('email', '')}")
+        print(f"  [B] Summary:     {(summary or '')[:60]}{'...' if len(summary or '') > 60 else ''}")
         all_skills = []
         for cat_skills in skills.values():
             if isinstance(cat_skills, list):
                 all_skills.extend(cat_skills)
-        print(f"  [3] Skills:      {', '.join(all_skills[:6])}{'...' if len(all_skills) > 6 else ''}")
+        print(f"  [C] Skills:      {', '.join(all_skills[:6])}{'...' if len(all_skills) > 6 else ''}")
         positions = experience.get("positions", [])
-        print(f"  [4] Experience:  {experience.get('total_years', 0)} years, {len(positions)} position(s)")
-        print(f"  [5] Education:   {len(education)} entry(ies)")
-        print(f"  [6] Projects:    {len(projects)} project(s)")
+        print(f"  [D] Experience:  {experience.get('total_years', 0)} years, {len(positions)} position(s)")
+        print(f"  [E] Education:   {len(education)} entry(ies)")
+        print(f"  [F] Projects:    {len(projects)} project(s)")
         search_locs = ', '.join(loc.get('formatted_address', '') for loc in filters.get('locations', []))
-        print(f"  [7] Search:      \"{filters.get('search', {}).get('query', '')}\" in {search_locs}")
+        print(f"  [G] Search:      \"{filters.get('search', {}).get('query', '')}\" in {search_locs}")
         llm_display = "Configured" if llm_configured else "No API key"
-        print(f"  [8] LLM:         {llm_display}")
+        print(f"  [H] LLM:         {llm_display}")
 
-        print(f"\n  Enter a number (1-8) to edit that section, or press Enter to save.")
-        choice = input("  Edit section: ").strip()
+        print(f"\n  Enter a letter (A-H) to edit that section, or press Enter to save.")
+        choice = input("  Edit section: ").strip().lower()
 
         if not choice:
             break
 
-        if choice in sections and choice not in ("7", "8"):
+        if choice in sections and choice not in ("g", "h"):
             label, collector, key = sections[choice]
             result = collector()
             if key == "personal":
@@ -745,12 +745,12 @@ def interactive_setup():
             elif key == "projects":
                 projects = result
                 profile["projects"] = result
-        elif choice == "7":
+        elif choice == "g":
             filters = collect_search_filters(existing_filters)
-        elif choice == "8":
+        elif choice == "h":
             llm_configured = check_llm_setup()
         else:
-            print("  Invalid choice. Enter 1-8 or press Enter to save.")
+            print("  Invalid choice. Enter A-H or press Enter to save.")
 
     print("\n--- Saving Configuration ---")
     write_profile(profile)

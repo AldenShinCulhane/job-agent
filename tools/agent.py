@@ -320,10 +320,15 @@ def tool_check_in(state: AgentState, params: dict) -> str:
     print(f"\n{'─' * 50}")
     print(f"  Agent check-in: {message}")
     if options:
+        letters = "abcdefghijklmnopqrstuvwxyz"
         for i, opt in enumerate(options):
-            print(f"    {i+1}. {opt}")
+            print(f"    {letters[i].upper()}. {opt}")
         print(f"{'─' * 50}")
-        choice = input("  Your choice (number or text): ").strip()
+        choice = input("  Your choice (letter or text): ").strip()
+        # Map letter back to option text so the LLM gets useful context
+        idx = letters.find(choice.lower())
+        if 0 <= idx < len(options):
+            choice = options[idx]
     else:
         print(f"{'─' * 50}")
         choice = input("  Your response: ").strip()
@@ -625,8 +630,8 @@ def run_agent(
 
         # Display thought
         print(f"\n{'─' * 50}")
-        print(f"  Step {iteration + 1}: {thought[:120]}")
-        print(f"  → {action}({json.dumps(params)[:80]})")
+        print(f"  Step {iteration + 1}: {thought[:250]}")
+        print(f"  → {action}({json.dumps(params)[:150]})")
 
         # Check for finish
         if action == "finish":
@@ -654,7 +659,7 @@ def run_agent(
         if len(observation) > 3000:
             observation = observation[:3000] + "\n... [truncated]"
 
-        print(f"  Result: {observation[:150]}")
+        print(f"  Result: {observation[:500]}")
 
         # OBSERVE — append to conversation
         messages.append({"role": "assistant", "content": response})

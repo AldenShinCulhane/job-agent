@@ -685,16 +685,16 @@ def enforce_one_page(tex_path: str, profile: dict, tailored_bullets: dict | None
             print("    Removed last project to fit 1 page.")
             return True
 
-    # Pass 3: Tighten spacing
+    # Pass 3: Tighten spacing (gentle — avoid text overlapping headers)
     tex_content = tex_content.replace(
         r"\addtolength{\textheight}{1.0in}",
-        r"\addtolength{\textheight}{1.5in}",
+        r"\addtolength{\textheight}{1.3in}",
     ).replace(
         r"\addtolength{\topmargin}{-.5in}",
-        r"\addtolength{\topmargin}{-.7in}",
+        r"\addtolength{\topmargin}{-.65in}",
     ).replace(
         r"\titlespacing*{\section}{0pt}{12pt}{10pt}",
-        r"\titlespacing*{\section}{0pt}{6pt}{4pt}",
+        r"\titlespacing*{\section}{0pt}{8pt}{6pt}",
     )
     with open(tex_path, "w", encoding="utf-8") as f:
         f.write(tex_content)
@@ -867,11 +867,13 @@ def create_cover_letter_pdf(letter_text: str, profile: dict, output_dir: str):
         if value:
             contact_lines.append(latex_escape(value))
     if contact_lines:
-        tex += "\n".join(contact_lines) + "\n\n"
+        tex += "\\noindent\n"
+        tex += " \\\\\n".join(contact_lines) + "\n"
         tex += "\\vspace{0.5em}\n\n"
 
     # Body text
     lines = letter_text.split("\n")
+    in_closing = False
     for line in lines:
         stripped = line.strip()
 
@@ -880,10 +882,18 @@ def create_cover_letter_pdf(letter_text: str, profile: dict, output_dir: str):
             continue
 
         if not stripped:
-            tex += "\n"
+            tex += "\n\n"  # Double newline = LaTeX paragraph break with parskip
             continue
 
-        tex += latex_escape(stripped) + "\n"
+        # Detect closing line (Sincerely, Best regards, etc.)
+        closing_words = ["sincerely", "best regards", "regards", "respectfully", "thank you"]
+        if any(stripped.lower().startswith(w) for w in closing_words):
+            in_closing = True
+
+        if in_closing:
+            tex += latex_escape(stripped) + " \\\\\n"  # Line break in signature block
+        else:
+            tex += latex_escape(stripped) + "\n"
 
     tex += "\n\\end{document}\n"
 
