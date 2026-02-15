@@ -1,12 +1,14 @@
 """
 LLM client — sends requests via OpenAI-compatible APIs.
 
-Provider auto-detection (checks in order):
-  1. GEMINI_API_KEY -> Google Gemini 2.5 Flash (recommended, generous free tier)
-  2. GROQ_API_KEY  -> Groq (Llama 3.3 70B, stricter limits)
+Default provider: SambaNova (Llama 3.3 70B, unlimited free tier).
+Use set_provider() or --provider flag to switch to an alternative.
 
-Gemini free tier: 10 RPM, 250 RPD, 250K TPM (no daily token cap)
-Groq free tier:   30 RPM, 1K RPD, 12K TPM, 100K TPD
+Supported providers:
+  - sambanova: SambaNova (default) — unlimited free tokens, 20 RPM
+  - cerebras:  Cerebras — 1M tokens/day free, 30 RPM
+  - gemini:    Google Gemini 2.5 Flash — 10 RPM, 250 RPD
+  - groq:      Groq — Llama 3.3 70B, 12K TPM
 
 Override the model with LLM_MODEL env var.
 """
@@ -22,27 +24,63 @@ load_dotenv(PROJECT_ROOT / ".env")
 
 MAX_RETRIES = 6
 
-# Provider auto-detection
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+# Supported providers
+_PROVIDERS = {
+    "sambanova": {
+        "key_env": "SAMBANOVA_API_KEY",
+        "base_url": "https://api.sambanova.ai/v1",
+        "model": "Meta-Llama-3.3-70B-Instruct",
+        "delay": 3,
+        "backoff": [5, 10, 20, 30, 60, 60],
+        "display_name": "SambaNova",
+    },
+    "cerebras": {
+        "key_env": "CEREBRAS_API_KEY",
+        "base_url": "https://api.cerebras.ai/v1",
+        "model": "llama-3.3-70b",
+        "delay": 3,
+        "backoff": [5, 10, 20, 30, 60, 60],
+        "display_name": "Cerebras",
+    },
+    "gemini": {
+        "key_env": "GEMINI_API_KEY",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "model": "gemini-2.5-flash",
+        "delay": 7,
+        "backoff": [7, 15, 30, 30, 60, 60],
+        "display_name": "Gemini",
+    },
+    "groq": {
+        "key_env": "GROQ_API_KEY",
+        "base_url": "https://api.groq.com/openai/v1",
+        "model": "llama-3.3-70b-versatile",
+        "delay": 7,
+        "backoff": [15, 30, 60, 60, 60, 60],
+        "display_name": "Groq",
+    },
+}
 
-if GEMINI_API_KEY:
-    _PROVIDER = "gemini"
-    _API_KEY = GEMINI_API_KEY
-    _BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-    _DEFAULT_MODEL = "gemini-2.5-flash"
-elif GROQ_API_KEY:
-    _PROVIDER = "groq"
-    _API_KEY = GROQ_API_KEY
-    _BASE_URL = "https://api.groq.com/openai/v1"
-    _DEFAULT_MODEL = "llama-3.3-70b-versatile"
-else:
-    _PROVIDER = None
-    _API_KEY = ""
-    _BASE_URL = ""
-    _DEFAULT_MODEL = ""
+_DEFAULT_PROVIDER = "sambanova"
 
-MODEL = os.getenv("LLM_MODEL", _DEFAULT_MODEL)
+# Active provider state
+_active_provider = _DEFAULT_PROVIDER
+_active_config = _PROVIDERS[_DEFAULT_PROVIDER]
+_api_key = os.getenv(_active_config["key_env"], "")
+MODEL = os.getenv("LLM_MODEL", _active_config["model"])
+
+
+def set_provider(name: str):
+    """Set the active LLM provider. Called by run_pipeline.py when --provider is used."""
+    global _active_provider, _active_config, _api_key, MODEL
+
+    name = name.lower()
+    if name not in _PROVIDERS:
+        raise ValueError(f"Unknown provider '{name}'. Choose from: {', '.join(_PROVIDERS.keys())}")
+
+    _active_provider = name
+    _active_config = _PROVIDERS[name]
+    _api_key = os.getenv(_active_config["key_env"], "")
+    MODEL = os.getenv("LLM_MODEL", _active_config["model"])
 
 
 class LLMConfigError(Exception):
@@ -51,17 +89,23 @@ class LLMConfigError(Exception):
 
 
 def check_llm() -> bool:
-    """Check if an LLM API key is configured. Returns True if set."""
-    return bool(GEMINI_API_KEY or GROQ_API_KEY)
+    """Check if the active provider's API key is configured. Returns True if set."""
+    return bool(_api_key)
 
 
 def get_provider_name() -> str:
-    """Return the active provider name for display."""
-    if _PROVIDER == "gemini":
-        return "Gemini"
-    elif _PROVIDER == "groq":
-        return "Groq"
-    return "None"
+    """Return the active provider's display name."""
+    return _active_config["display_name"]
+
+
+def get_expected_key_name() -> str:
+    """Return the env var name the active provider expects (for error messages)."""
+    return _active_config["key_env"]
+
+
+def get_call_delay() -> float:
+    """Return recommended seconds to wait between API calls for the active provider."""
+    return _active_config["delay"]
 
 
 def chat_completion(
@@ -87,14 +131,15 @@ def chat_completion(
     """
     from openai import OpenAI, RateLimitError, APIError, APIConnectionError
 
-    if not _API_KEY:
+    if not _api_key:
         raise LLMConfigError(
-            "No LLM API key found. Set one of these in your .env file:\n"
-            "  GEMINI_API_KEY=AIza...  (recommended — https://aistudio.google.com/apikeys)\n"
-            "  GROQ_API_KEY=gsk_...    (alternative — https://console.groq.com)"
+            f"No API key found for {get_provider_name()}.\n"
+            f"  Set {get_expected_key_name()}=... in your .env file.\n"
+            f"  Get a free key at https://cloud.sambanova.ai/apis (SambaNova, recommended)\n"
+            f"  Or use --provider to select a different provider."
         )
 
-    client = OpenAI(base_url=_BASE_URL, api_key=_API_KEY)
+    client = OpenAI(base_url=_active_config["base_url"], api_key=_api_key)
 
     for attempt in range(MAX_RETRIES):
         try:
@@ -128,12 +173,7 @@ def chat_completion(
                 raise LLMConfigError(f"{get_provider_name()} API: max retries exceeded (rate limited).")
             wait = _get_retry_after(e)
             if wait is None:
-                if _PROVIDER == "gemini":
-                    # Gemini: 10 RPM limit, so wait ~7s per retry
-                    wait = [7, 15, 30, 30, 60, 60][min(attempt, 5)]
-                else:
-                    # Groq: TPM is the bottleneck, needs longer waits
-                    wait = [15, 30, 60, 60, 60, 60][min(attempt, 5)]
+                wait = _active_config["backoff"][min(attempt, 5)]
             print(f"    Rate limited, waiting {wait}s... (attempt {attempt + 1}/{MAX_RETRIES})")
             time.sleep(wait)
         except APIError as e:

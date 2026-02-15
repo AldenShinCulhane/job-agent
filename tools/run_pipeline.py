@@ -50,15 +50,14 @@ def validate_environment(args, has_profile: bool) -> list:
     # LLM API key (required for LLM steps — analyze + generate)
     needs_llm = not args.skip_generate
     if needs_llm:
-        from llm_client import check_llm
+        from llm_client import check_llm, get_provider_name, get_expected_key_name
         if not check_llm():
             issues.append(
-                "No LLM API key found. LLM steps (analyze, generate) will fail.\n"
-                "    Option 1 (recommended): Get a free Gemini key at https://aistudio.google.com/apikeys\n"
-                "    Then add to .env: GEMINI_API_KEY=AIza...\n"
-                "    Option 2: Get a free Groq key at https://console.groq.com\n"
-                "    Then add to .env: GROQ_API_KEY=gsk_...\n"
-                "    Or skip LLM steps: --skip-generate"
+                f"No API key for {get_provider_name()} (active provider).\n"
+                f"    Set {get_expected_key_name()}=... in your .env file.\n"
+                f"    Get a free SambaNova key at https://cloud.sambanova.ai/apis (recommended)\n"
+                f"    Or use --provider to select a different provider.\n"
+                f"    Or skip LLM steps: --skip-generate"
             )
 
     # Dependencies
@@ -372,8 +371,16 @@ Examples:
                         help="Skip LLM steps entirely (score only)")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="Skip prompts (auto-selects top 5)")
+    parser.add_argument("--provider", choices=["sambanova", "cerebras", "gemini", "groq"],
+                        default="sambanova",
+                        help="LLM provider (default: sambanova)")
 
     args = parser.parse_args()
+
+    # Set LLM provider before any LLM operations
+    from llm_client import set_provider
+    set_provider(args.provider)
+
     run_pipeline(args)
 
 

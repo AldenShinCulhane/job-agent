@@ -13,7 +13,6 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -24,7 +23,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
-from llm_client import chat_completion
+from llm_client import chat_completion, get_call_delay
 
 
 # == LaTeX Resume Template ================================================
@@ -243,12 +242,11 @@ def generate_tailored_bullets(job: dict, profile: dict) -> dict | None:
 Rules:
 - Keep ALL positions and ALL projects. Never remove entries.
 - Keep ALL bullets. Return the EXACT SAME NUMBER of bullets per entry as the input.
-- Only reword bullets to emphasize skills and experience relevant to the target job.
+- Rewrite each bullet to emphasize skills and experience directly relevant to the target job.
+- Write detailed, substantive bullets — do not shorten them. Longer bullets that fill 2-3 printed lines are preferred.
 - Use **bold** around key technical terms and tools that match the job requirements.
 - Do NOT fabricate experience, achievements, or skills the candidate doesn't have.
-- Do NOT add new bullet points or merge existing ones.
-- Do NOT remove any bullet points.
-- Preserve the substance, metrics, and specific details of each bullet.
+- Preserve concrete metrics, numbers, and specific details when rewriting.
 
 Return ONLY valid JSON in this exact structure:
 {
@@ -262,7 +260,8 @@ Return ONLY valid JSON in this exact structure:
   ]
 }
 
-The experience array must have the same number of entries as positions given.
+The experience array must have the same number of entries (sub-arrays) as positions given.
+The projects array must have the same number of entries (sub-arrays) as projects given.
 Each entry must have the same number of bullets as the original."""
 
     user_msg = f"""TARGET JOB:
@@ -299,7 +298,7 @@ Tailor these bullets for the target job. Return JSON only."""
 
         result = json.loads(response)
 
-        # Validate structure — lenient: fall back per-position instead of all-or-nothing
+        # Validate structure — tolerant: accept ±1 count, fall back per-position if too far off
         exp_bullets = result.get("experience", [])
         proj_bullets = result.get("projects", [])
 
@@ -307,22 +306,35 @@ Tailor these bullets for the target job. Return JSON only."""
         validated_exp = []
         for i, pos in enumerate(positions):
             expected = len(pos.get("highlights", []))
-            if i < len(exp_bullets) and len(exp_bullets[i]) == expected:
+            returned = len(exp_bullets[i]) if i < len(exp_bullets) else 0
+            if returned == expected:
                 validated_exp.append(exp_bullets[i])
+            elif returned == expected - 1:
+                # 1 short — tailored bullets are still better than originals
+                validated_exp.append(exp_bullets[i])
+            elif returned > expected:
+                # Extra bullets — trim to expected count
+                validated_exp.append(exp_bullets[i][:expected])
             else:
+                # Too far off — fall back to originals
                 if i < len(exp_bullets):
-                    print(f"    Position {i + 1}: LLM returned {len(exp_bullets[i])} bullets (expected {expected}), using originals")
+                    print(f"    Position {i + 1}: LLM returned {returned} bullets (expected {expected}), using originals")
                 validated_exp.append(pos.get("highlights", []))
 
         # Fix project bullets (per-project fallback)
         validated_proj = []
         for i, proj in enumerate(projects):
             expected = len(proj.get("highlights", []))
-            if i < len(proj_bullets) and len(proj_bullets[i]) == expected:
+            returned = len(proj_bullets[i]) if i < len(proj_bullets) else 0
+            if returned == expected:
                 validated_proj.append(proj_bullets[i])
+            elif returned == expected - 1:
+                validated_proj.append(proj_bullets[i])
+            elif returned > expected:
+                validated_proj.append(proj_bullets[i][:expected])
             else:
                 if i < len(proj_bullets):
-                    print(f"    Project {i + 1}: LLM returned {len(proj_bullets[i])} bullets (expected {expected}), using originals")
+                    print(f"    Project {i + 1}: LLM returned {returned} bullets (expected {expected}), using originals")
                 validated_proj.append(proj.get("highlights", []))
 
         return {"experience": validated_exp, "projects": validated_proj}
@@ -602,7 +614,7 @@ def enforce_one_page(tex_path: str, profile: dict, tailored_bullets: dict | None
     """Check if compiled PDF exceeds 1 page; if so, trim content and recompile.
 
     Trimming strategy (applied in order until PDF fits on 1 page):
-      1. Trim the longest bullet in each position/project to ~100 chars
+      1. Remove the shortest bullet from positions/projects with >2 bullets (repeat)
       2. Remove the last project
       3. Tighten LaTeX spacing
 
@@ -640,24 +652,25 @@ def enforce_one_page(tex_path: str, profile: dict, tailored_bullets: dict | None
 
     trimmed_profile = dict(profile)
 
-    # Pass 1: Trim longest bullets to ~100 chars
-    for bullet_list in mut_exp + mut_proj:
-        for j, bullet in enumerate(bullet_list):
-            if len(bullet) > 100:
-                # Cut at last space before 100 chars
-                cut = bullet[:100].rfind(" ")
-                if cut > 60:
-                    bullet_list[j] = bullet[:cut]
-                else:
-                    bullet_list[j] = bullet[:100]
+    # Pass 1: Remove least-relevant bullets (shortest bullet from positions with >2 bullets)
+    changed = True
+    while changed:
+        changed = False
+        for bullet_list in mut_exp + mut_proj:
+            if len(bullet_list) > 2:
+                # Remove the shortest bullet (least content)
+                shortest_idx = min(range(len(bullet_list)), key=lambda k: len(bullet_list[k]))
+                bullet_list.pop(shortest_idx)
+                changed = True
+                break  # Recompile after each removal to check page count
 
-    trimmed_tailored = {"experience": mut_exp, "projects": mut_proj}
-    tex_content = build_resume_tex(trimmed_profile, trimmed_tailored)
-    with open(tex_path, "w", encoding="utf-8") as f:
-        f.write(tex_content)
-    if compile_tex_to_pdf(tex_path) and _get_pdf_page_count(pdf_path) <= 1:
-        print("    Trimmed bullets to fit 1 page.")
-        return True
+        trimmed_tailored = {"experience": mut_exp, "projects": mut_proj}
+        tex_content = build_resume_tex(trimmed_profile, trimmed_tailored)
+        with open(tex_path, "w", encoding="utf-8") as f:
+            f.write(tex_content)
+        if compile_tex_to_pdf(tex_path) and _get_pdf_page_count(pdf_path) <= 1:
+            print("    Removed bullets to fit 1 page.")
+            return True
 
     # Pass 2: Remove last project
     if len(mut_proj) > 1:
@@ -697,16 +710,34 @@ def enforce_one_page(tex_path: str, profile: dict, tailored_bullets: dict | None
 
 # == Cover Letter =========================================================
 
-# At 12pt Arial with 1" margins on letter paper, ~3,000 chars fills one page
-# (including ~200 chars of contact header added by create_cover_letter_docx)
-COVER_LETTER_MAX_CHARS = 2800
+# At 12pt Arial with 1" margins on letter paper, ~3,000 chars fills one page.
+# Contact header (name + location + email + github + linkedin) takes ~5 lines of overhead.
+COVER_LETTER_MAX_CHARS = 2500
 
 
 def _trim_cover_letter(text: str) -> str:
-    """Trim cover letter text to fit on 1 page (~2,800 chars for body).
+    """Trim cover letter text to fit on 1 page (~2,500 chars for body).
 
-    If over budget, trims the longest body paragraph (preserving opening/closing).
+    Strips any date line the LLM may have added, then trims the longest
+    body paragraph if still over budget (preserving opening/closing).
     """
+    # Strip date line if present (e.g. "February 14, 2026" or "02/14/2026")
+    date_pattern = re.compile(
+        r"^(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},?\s+\d{4}$"
+        r"|^\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}$",
+        re.IGNORECASE,
+    )
+    cleaned_lines = text.split("\n")
+    # Check first few non-empty lines for a date
+    for idx in range(min(3, len(cleaned_lines))):
+        if cleaned_lines[idx].strip() and date_pattern.match(cleaned_lines[idx].strip()):
+            cleaned_lines.pop(idx)
+            # Remove trailing blank line after date
+            if idx < len(cleaned_lines) and not cleaned_lines[idx].strip():
+                cleaned_lines.pop(idx)
+            break
+    text = "\n".join(cleaned_lines).strip()
+
     if len(text) <= COVER_LETTER_MAX_CHARS:
         return text
 
@@ -757,28 +788,26 @@ def generate_cover_letter(job: dict, profile: dict, base_resume: str) -> str:
     """Generate a tailored cover letter using the configured LLM."""
     analysis = job.get("analysis", {})
     personal = profile.get("personal", {})
-    today = datetime.now().strftime("%B %d, %Y")
 
     system_prompt = """You are an expert career consultant. Write a professional cover letter
 that connects the candidate's specific experience to the job requirements.
 
 Write the letter as plain text with NO formatting markers (no ##, no **, no markdown).
 Include in this exact order:
-1. Today's date (provided below)
+1. "Dear Hiring Manager,"
 2. A blank line
-3. "Dear Hiring Manager,"
-4. A blank line
-5. 4 substantive, detailed paragraphs:
+3. 4 substantive, detailed paragraphs:
    - Opening: express enthusiasm and summarize your fit for this specific role
    - Experience: describe relevant experience with concrete details, metrics, and achievements
    - Company fit: explain why this specific company and role excites you, referencing their mission or culture
    - Closing: restate your value, express eagerness for next steps
-6. A blank line
-7. "Sincerely,"
-8. The candidate's full name
+4. A blank line
+5. "Sincerely,"
+6. The candidate's full name
 
+Do NOT include a date line.
 The letter MUST fit on exactly 1 page when printed at 12pt font with 1-inch margins.
-Keep the total body text under 400 words (about 2,800 characters).
+Keep the total body text under 350 words (about 2,500 characters).
 Each paragraph should be 3-5 sentences with specific details — not generic filler.
 Be specific: reference actual skills, tools, and achievements from the candidate's resume.
 Do NOT fabricate achievements or skills the candidate does not have.
@@ -798,8 +827,6 @@ Name: {personal.get('name', 'N/A')}
 Summary: {profile.get('summary', 'N/A')}
 Years of Experience: {profile.get('experience', {}).get('total_years', 'N/A')}
 Matched Skills: {', '.join(job.get('matched_skills', []))}
-
-TODAY'S DATE: {today}
 
 BASE RESUME (for reference):
 {base_resume[:3000]}
@@ -831,7 +858,7 @@ def create_cover_letter_docx(letter_text: str, profile: dict, output_path: str):
 
     # -- Contact info at top of body --
     contact_fields = [
-        (personal.get("name", ""), True, 14),
+        (personal.get("name", ""), False, 11),
         (personal.get("location", ""), False, 11),
         (personal.get("email", ""), False, 11),
         (personal.get("github", ""), False, 11),
@@ -988,9 +1015,9 @@ def generate_documents(
         else:
             print("  Skipping resume (no profile). Set up with: uv run python tools/setup.py")
 
-        # Wait between LLM calls (Gemini: 10 RPM, Groq: 12K TPM)
+        # Wait between LLM calls to respect provider rate limits
         if has_profile:
-            time.sleep(7)
+            time.sleep(get_call_delay())
 
         # -- Cover Letter (DOCX) --
         print("  Generating cover letter...")
@@ -1013,9 +1040,9 @@ def generate_documents(
 
         generated_count += 1
 
-        # Wait before next job's LLM calls (Gemini: 10 RPM)
+        # Wait before next job's LLM calls
         if i < len(qualifying) - 1:
-            time.sleep(7)
+            time.sleep(get_call_delay())
 
     print(f"\nGenerated {generated_count} applications -> {os.path.join(output_dir, 'applications')}")
     return generated_count

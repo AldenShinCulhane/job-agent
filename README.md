@@ -15,7 +15,7 @@ Scrapes job listings from [hiring.cafe](https://hiring.cafe), strictly filters t
 
 **Filtering vs. Scoring:** Your search filters (location, title, experience level, salary, etc.) are hard gates — only jobs matching ALL your criteria appear. The match% then ranks those jobs by how well your skills, experience, and education align with what each job requires.
 
-Steps 1-3 and 6 run without any external services. Step 5 uses a free LLM API — [Gemini](https://aistudio.google.com/apikeys) (recommended) or [Groq](https://console.groq.com).
+Steps 1-3 and 6 run without any external services. Step 5 uses a free LLM API — [SambaNova](https://cloud.sambanova.ai/apis) (unlimited, no credit card).
 
 ## Quick Start
 
@@ -87,21 +87,17 @@ cp config/search_filters.yaml.example config/search_filters.yaml
 
 > **Note:** `.env`, `config/user_profile.yaml`, and `config/search_filters.yaml` are gitignored to protect your personal information and API keys. Only the `.example` templates are tracked.
 
-## LLM (Gemini — Free)
+## LLM (SambaNova — Free)
 
-Step 5 uses an LLM for job analysis and tailored resume/cover letter generation. The pipeline auto-detects which provider you have configured.
+Step 5 uses an LLM for job analysis and tailored resume/cover letter generation.
 
-**Recommended: Google Gemini** (250K tokens/min, 250 requests/day — generous free tier)
-1. Go to [aistudio.google.com/apikeys](https://aistudio.google.com/apikeys)
-2. Create an API key (just needs a Google account, no credit card)
-3. Add it to your `.env`: `GEMINI_API_KEY=AIza...`
+1. Go to [cloud.sambanova.ai/apis](https://cloud.sambanova.ai/apis)
+2. Create a free API key (no credit card required)
+3. Add it to your `.env`: `SAMBANOVA_API_KEY=...`
 
-**Alternative: Groq** (12K tokens/min, 100K tokens/day — stricter limits)
-1. Sign up at [console.groq.com](https://console.groq.com)
-2. Create an API key
-3. Add it to your `.env`: `GROQ_API_KEY=gsk_...`
+SambaNova provides unlimited free tokens at 20 requests/min — no daily cap. The setup wizard handles this automatically. Without an API key, the pipeline still scrapes, filters, scores, and generates a summary report — you just won't get the auto-generated application documents.
 
-The setup wizard handles this automatically. Without an API key, the pipeline still scrapes, filters, scores, and generates a summary report — you just won't get the auto-generated application documents.
+**Alternative providers** (use `--provider` flag): Cerebras, Gemini, Groq. Set the corresponding API key in `.env` and pass `--provider cerebras` (etc.) when running the pipeline.
 
 ## Output
 
@@ -127,7 +123,7 @@ The setup wizard (`tools/setup.py`) creates these files for you:
 |------|-----------------|
 | `config/user_profile.yaml` | Your skills, experience, education, projects |
 | `config/search_filters.yaml` | Search query, locations, experience level, salary range |
-| `.env` | LLM API key (Gemini or Groq) |
+| `.env` | LLM API key (SambaNova by default) |
 
 All three are gitignored. Committed `.example` templates show the expected format.
 
@@ -165,6 +161,9 @@ uv run python tools/run_pipeline.py --skip-scrape --skip-generate
 # Non-interactive (auto-selects top 5)
 uv run python tools/run_pipeline.py --skip-scrape --yes
 
+# Use a different LLM provider
+uv run python tools/run_pipeline.py --provider cerebras
+
 # Update your profile
 uv run python tools/setup.py
 ```
@@ -190,8 +189,8 @@ The API blocked you. Solutions:
 2. Wait 5-10 minutes and try again
 3. Reduce `pagination.max_pages` in search filters
 
-### "No LLM API key found"
-Get a free API key at [aistudio.google.com/apikeys](https://aistudio.google.com/apikeys) (Gemini, recommended) or [console.groq.com](https://console.groq.com) (Groq). Add it to `.env`. Or skip LLM steps with `--skip-generate`.
+### "No API key for SambaNova"
+Get a free key at [cloud.sambanova.ai/apis](https://cloud.sambanova.ai/apis) and add `SAMBANOVA_API_KEY=...` to `.env`. Or use `--provider` to select a different provider, or `--skip-generate` to skip LLM steps entirely.
 
 ### "No jobs found" or all jobs filtered out
 - Check search filters — try broader terms or more locations
@@ -222,7 +221,7 @@ config/
 tools/
   setup.py                       # Interactive setup wizard
   run_pipeline.py                # Main entry point — runs all steps
-  llm_client.py                  # LLM client (Gemini/Groq via OpenAI-compatible API)
+  llm_client.py                  # LLM client (SambaNova default, --provider for alternatives)
   scrape_jobs.py                 # Headless browser scraper for hiring.cafe
   parse_jobs.py                  # Normalizes, deduplicates, and filters raw API data
   analyze_jobs.py                # Optional LLM enrichment
@@ -237,7 +236,7 @@ tools/
 - [uv](https://docs.astral.sh/uv/) package manager
 - Chromium (installed via `uv run playwright install chromium`)
 - (Optional) [MiKTeX](https://miktex.org/download) or TeX Live for PDF resume compilation
-- (Optional) [Gemini](https://aistudio.google.com/apikeys) or [Groq](https://console.groq.com) API key for LLM features (free)
+- (Optional) [SambaNova](https://cloud.sambanova.ai/apis) API key for LLM features (free, unlimited)
 
 ## Known Constraints
 
@@ -247,5 +246,4 @@ tools/
 - The API's text search is broad — the post-scrape filter enforces strict title/location matching
 - Resumes and cover letters are each limited to 1 page (auto-trimmed if needed)
 - Processing 5 jobs requires ~12 LLM calls (2 analysis + 5 resume + 5 cover letter). Selecting more jobs increases this linearly.
-- Gemini free tier: 10 requests/min, 250/day — comfortably handles ~20 pipeline runs per day
-- Groq free tier (if used instead): 12K tokens/min, 100K tokens/day — can hit token limits after 1-2 runs with 5+ jobs
+- SambaNova free tier: unlimited tokens, 20 requests/min — comfortably handles all pipeline operations

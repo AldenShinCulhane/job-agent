@@ -288,7 +288,8 @@ def test_resume_tailoring():
 
     print("    Tailoring for frontend job...")
     result_frontend = generate_tailored_bullets(job_frontend, profile)
-    time.sleep(7)  # Rate limit spacing
+    from llm_client import get_call_delay
+    time.sleep(get_call_delay())
     print("    Tailoring for backend job...")
     result_backend = generate_tailored_bullets(job_backend, profile)
 
@@ -403,7 +404,8 @@ def test_different_profiles():
     result_fe = generate_tailored_bullets(job, MOCK_PROFILE_FRONTEND)
     tex_fe = build_resume_tex(MOCK_PROFILE_FRONTEND, result_fe)
 
-    time.sleep(7)
+    from llm_client import get_call_delay
+    time.sleep(get_call_delay())
 
     print("    Tailoring for backend profile...")
     result_be = generate_tailored_bullets(job, MOCK_PROFILE_BACKEND)
@@ -472,29 +474,31 @@ def main():
 
     if not results[0]:
         print("\n  LLM connection failed — skipping remaining tests.")
-        print("  Add GEMINI_API_KEY or GROQ_API_KEY to .env and try again.")
+        print("  Set SAMBANOVA_API_KEY in .env (get a free key at https://cloud.sambanova.ai/apis).")
         sys.exit(1)
 
     import time
+    from llm_client import get_call_delay
+    delay = get_call_delay()
 
     # Test 2: Resume tailoring
-    time.sleep(7)
+    time.sleep(delay)
     results.append(test_resume_tailoring())
 
     # Test 3: Resume 1-page
-    time.sleep(7)
+    time.sleep(delay)
     results.append(test_resume_one_page())
 
     # Test 4: Cover letter
-    time.sleep(7)
+    time.sleep(delay)
     results.append(test_cover_letter_generation())
 
     # Test 5: Different profiles
-    time.sleep(7)
+    time.sleep(delay)
     results.append(test_different_profiles())
 
     # Test 6: Resume upload mode
-    time.sleep(7)
+    time.sleep(delay)
     results.append(test_resume_upload_mode())
 
     # Summary

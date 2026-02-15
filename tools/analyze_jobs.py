@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
-from llm_client import chat_completion
+from llm_client import chat_completion, get_call_delay
 
 BATCH_SIZE = 3
 
@@ -151,7 +151,7 @@ def analyze_jobs(input_path: str = None, output_path: str = None, batch_size: in
         with open(progress_path, "w", encoding="utf-8") as f:
             json.dump(analyzed, f, indent=2, ensure_ascii=False)
 
-        time.sleep(7)
+        time.sleep(get_call_delay())
 
     # Save final output and clean up
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
