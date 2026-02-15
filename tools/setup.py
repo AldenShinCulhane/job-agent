@@ -586,8 +586,7 @@ def check_llm_setup() -> bool:
         return True
 
     print("  Skipping — the pipeline will still scrape, filter, score, and generate reports.")
-    print("  Add SAMBANOVA_API_KEY to .env later to enable tailored resume/cover letter generation.")
-    print("  (Advanced: use --provider flag to select an alternative provider)")
+    print("  Add at least one LLM API key to .env later to enable tailored resume/cover letter generation.")
     return False
 
 

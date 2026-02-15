@@ -52,13 +52,12 @@ def validate_environment(args, has_profile: bool) -> list:
     # LLM API key (required for LLM steps — analyze + generate)
     needs_llm = not args.skip_generate
     if needs_llm:
-        from llm_client import check_llm, get_provider_name, get_expected_key_name
+        from llm_client import check_llm, get_expected_key_name
         if not check_llm():
             issues.append(
-                f"No API key for {get_provider_name()} (active provider).\n"
-                f"    Set {get_expected_key_name()}=... in your .env file.\n"
-                f"    Get a free SambaNova key at https://cloud.sambanova.ai/apis (recommended)\n"
-                f"    Or use --provider to select a different provider.\n"
+                f"No LLM API keys configured.\n"
+                f"    Add at least one to your .env file: {get_expected_key_name()}\n"
+                f"    Get a free key at https://cloud.sambanova.ai/apis (SambaNova, recommended)\n"
                 f"    Or skip LLM steps: --skip-generate"
             )
 
@@ -71,11 +70,6 @@ def validate_environment(args, has_profile: bool) -> list:
         import yaml
     except ImportError:
         issues.append("'pyyaml' package not installed. Run: uv sync")
-    try:
-        import docx
-    except ImportError:
-        if not args.skip_generate:
-            issues.append("'python-docx' package not installed. Run: uv sync")
 
     return issues
 
@@ -154,7 +148,10 @@ def run_pipeline(args):
             print(f"    - {issue}")
         print("\nFix the issues above and try again.")
         sys.exit(1)
-    print("  All checks passed.\n")
+    print("  All checks passed.")
+    from llm_client import provider_status
+    print(provider_status())
+    print()
 
     # Step 1: Scrape
     raw_jobs_path = str(PROJECT_ROOT / ".tmp" / "raw_jobs.json")
@@ -283,8 +280,8 @@ def run_pipeline(args):
             analysis_input = selected_jobs_path
         else:
             from llm_client import get_provider_name
-            provider = get_provider_name()
-            print(f"\n[5/6] Analyzing {num_selected} job(s) with {provider}...")
+            providers = get_provider_name()
+            print(f"\n[5/6] Analyzing {num_selected} job(s) with LLM ({providers})...")
             batch_size = args.batch_size
             est_analysis = (num_selected + batch_size - 1) // batch_size
             est_generate = num_selected * 2
@@ -374,37 +371,19 @@ Examples:
                         help="Skip LLM steps entirely (score only)")
     parser.add_argument("--yes", "-y", action="store_true",
                         help="Skip prompts (auto-selects top 5)")
-    parser.add_argument("--provider", choices=["sambanova", "cerebras", "gemini", "groq"],
-                        default="sambanova",
-                        help="LLM provider for legacy mode (default: sambanova)")
     parser.add_argument("--no-agent", action="store_true",
                         help="Use legacy sequential pipeline instead of agent mode")
-    parser.add_argument("--reasoning-provider",
-                        choices=["sambanova", "cerebras", "gemini", "groq"],
-                        default="gemini",
-                        help="LLM provider for agent reasoning (default: gemini)")
-    parser.add_argument("--generation-provider",
-                        choices=["sambanova", "cerebras", "gemini", "groq"],
-                        default="sambanova",
-                        help="LLM provider for document generation (default: sambanova)")
 
     args = parser.parse_args()
 
     if args.no_agent:
         # Legacy sequential pipeline
-        from llm_client import set_provider
-        set_provider(args.provider)
         run_pipeline(args)
     else:
         # Agent mode (default)
-        from llm_client import set_provider
-        set_provider(args.generation_provider)
-
         from agent import AgentState, run_agent
 
         state = AgentState(
-            reasoning_provider=args.reasoning_provider,
-            generation_provider=args.generation_provider,
             search_config_path=args.search_config,
             profile_path=args.user_profile,
             resume_path=args.resume,

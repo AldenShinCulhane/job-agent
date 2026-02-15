@@ -5,10 +5,8 @@ Uses a Reason-Act-Observe loop: the LLM reasons about what step to take,
 calls a tool, reads the result, and decides next. Existing pipeline scripts
 become "tools" the agent invokes — they stay unchanged.
 
-Dual-provider setup: one LLM for agent reasoning (default: gemini),
-another for document generation (default: sambanova). This avoids rate
-limit conflicts between frequent short reasoning calls and infrequent
-long generation calls.
+LLM calls go through llm_client.py which automatically selects the best
+available provider and fails over to the next one if rate limited.
 """
 
 import json
@@ -56,8 +54,6 @@ class AgentState:
     jobs_analyzed: int = 0
     jobs_generated: int = 0
     report_generated: bool = False
-    reasoning_provider: str = "gemini"
-    generation_provider: str = "sambanova"
     search_config_path: str = SEARCH_FILTERS
     profile_path: str = USER_PROFILE
     resume_path: str | None = None
@@ -472,10 +468,6 @@ Action Input: <JSON object with parameters, or {{}} if no parameters>
 - Has user profile: {state.has_profile}
 - Resume provided: {state.resume_path is not None}
 - Errors so far: {len(state.errors)}
-
-## Providers
-- Reasoning (you): {state.reasoning_provider}
-- Generation (documents): {state.generation_provider}
 """
 
 
@@ -567,13 +559,12 @@ def run_agent(
     force_scrape: bool = False,
 ):
     """Run the ReAct agent loop."""
-    from llm_client import chat_completion_multi, get_call_delay
+    from llm_client import chat_completion_multi, get_call_delay, provider_status
 
     print("=" * 60)
     print("  Agentic Job Search Pipeline — Agent Mode")
     print("=" * 60)
-    print(f"  Reasoning:   {state.reasoning_provider}")
-    print(f"  Generation:  {state.generation_provider}")
+    print(provider_status())
     print(f"  Profile:     {'loaded' if state.has_profile else 'none'}")
     if state.resume_path:
         print(f"  Resume:      {state.resume_path}")
@@ -623,7 +614,6 @@ def run_agent(
             response = chat_completion_multi(
                 messages,
                 max_tokens=1024,
-                provider_override=state.reasoning_provider,
             )
         except Exception as e:
             print(f"\n  Agent reasoning error: {e}")
@@ -695,12 +685,6 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description="ReAct agent for the job search pipeline")
-    parser.add_argument("--reasoning-provider", default="gemini",
-                        choices=["sambanova", "cerebras", "gemini", "groq"],
-                        help="LLM provider for agent reasoning (default: gemini)")
-    parser.add_argument("--generation-provider", default="sambanova",
-                        choices=["sambanova", "cerebras", "gemini", "groq"],
-                        help="LLM provider for document generation (default: sambanova)")
     parser.add_argument("--resume", default=None,
                         help="Path to base resume file")
     parser.add_argument("--skip-scrape", action="store_true",
@@ -709,13 +693,7 @@ def main():
                         help="Force re-scrape even if cache is valid")
     args = parser.parse_args()
 
-    # Set up generation provider as the global default (for analyze_jobs, generate_documents)
-    from llm_client import set_provider
-    set_provider(args.generation_provider)
-
     state = AgentState(
-        reasoning_provider=args.reasoning_provider,
-        generation_provider=args.generation_provider,
         resume_path=args.resume,
         has_profile=os.path.exists(USER_PROFILE),
     )

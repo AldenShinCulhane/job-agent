@@ -17,7 +17,7 @@ By default, a **ReAct agent** (Reason-Act-Observe loop) orchestrates the pipelin
 
 **Filtering vs. Scoring:** Your search filters (location, title, experience level, salary, etc.) are hard gates — only jobs matching ALL your criteria appear. The match% then ranks those jobs by how well your skills, experience, and education align with what each job requires.
 
-Steps 1-3 and 6 run without any external services. Step 5 uses a free LLM API — [SambaNova](https://cloud.sambanova.ai/apis) (unlimited, no credit card). Agent reasoning uses a separate LLM (Gemini by default) to avoid rate limit conflicts.
+Steps 1-3 and 6 run without any external services. Step 5 uses free LLM APIs with automatic failover — add one or more API keys and the pipeline handles the rest.
 
 ## Quick Start
 
@@ -91,24 +91,16 @@ cp config/search_filters.yaml.example config/search_filters.yaml
 
 ## LLM Providers (Free)
 
-The pipeline uses two LLM providers — one for agent reasoning, one for document generation:
+Add **at least one** free API key to your `.env` — the pipeline automatically picks the best available provider and fails over to the next if rate limited. More keys = better resilience for uninterrupted runs.
 
-| Role | Default | Free tier | API key |
-|------|---------|-----------|---------|
-| Agent reasoning | Gemini 2.5 Flash | 10 RPM, 250 RPD | `GEMINI_API_KEY` |
-| Document generation | SambaNova (Llama 3.3 70B) | Unlimited, 20 RPM | `SAMBANOVA_API_KEY` |
+| Provider | Free tier | API key | Sign up |
+|----------|-----------|---------|---------|
+| SambaNova (recommended) | Unlimited tokens, 20 RPM | `SAMBANOVA_API_KEY` | [cloud.sambanova.ai/apis](https://cloud.sambanova.ai/apis) |
+| Cerebras | 1M tokens/day, 30 RPM | `CEREBRAS_API_KEY` | [cloud.cerebras.ai](https://cloud.cerebras.ai/) |
+| Groq | 12K TPM | `GROQ_API_KEY` | [console.groq.com](https://console.groq.com/) |
+| Gemini | 10 RPM, 250 RPD | `GEMINI_API_KEY` | [aistudio.google.com](https://aistudio.google.com/apikey) |
 
-1. Get a free SambaNova key at [cloud.sambanova.ai/apis](https://cloud.sambanova.ai/apis) (no credit card)
-2. Get a free Gemini key at [aistudio.google.com](https://aistudio.google.com/apikey) (no credit card)
-3. Add both to your `.env`:
-   ```
-   SAMBANOVA_API_KEY=...
-   GEMINI_API_KEY=...
-   ```
-
-The setup wizard handles this automatically. Without API keys, the pipeline still scrapes, filters, scores, and generates a summary report — you just won't get agent reasoning or auto-generated application documents.
-
-**Override providers:** `--reasoning-provider groq --generation-provider cerebras`. In legacy mode (`--no-agent`), use `--provider` instead. All providers: SambaNova, Cerebras, Gemini, Groq.
+All providers are free with no credit card required. The setup wizard handles this automatically. Without any API keys, the pipeline still scrapes, filters, scores, and generates a summary report — you just won't get the agent reasoning or auto-generated application documents.
 
 ## Output
 
@@ -134,7 +126,7 @@ The setup wizard (`tools/setup.py`) creates these files for you:
 |------|-----------------|
 | `config/user_profile.yaml` | Your skills, experience, education, projects |
 | `config/search_filters.yaml` | Search query, locations, experience level, salary range |
-| `.env` | LLM API key (SambaNova by default) |
+| `.env` | LLM API keys (at least one required for LLM features) |
 
 All three are gitignored. Committed `.example` templates show the expected format.
 
@@ -178,9 +170,6 @@ uv run python tools/run_pipeline.py --no-agent --skip-scrape --skip-generate
 # Non-interactive legacy mode (auto-selects top 5)
 uv run python tools/run_pipeline.py --no-agent --skip-scrape --yes
 
-# Custom providers for agent reasoning and generation
-uv run python tools/run_pipeline.py --reasoning-provider groq --generation-provider cerebras
-
 # Update your profile
 uv run python tools/setup.py
 ```
@@ -206,8 +195,8 @@ The API blocked you. Solutions:
 2. Wait 5-10 minutes and try again
 3. Reduce `pagination.max_pages` in search filters
 
-### "No API key for SambaNova"
-Get a free key at [cloud.sambanova.ai/apis](https://cloud.sambanova.ai/apis) and add `SAMBANOVA_API_KEY=...` to `.env`. Or use `--provider` to select a different provider, or `--skip-generate` to skip LLM steps entirely.
+### "No LLM API keys configured"
+Add at least one free API key to your `.env` file. SambaNova is recommended — get a free key at [cloud.sambanova.ai/apis](https://cloud.sambanova.ai/apis). Or use `--skip-generate` to skip LLM steps entirely.
 
 ### "No jobs found" or all jobs filtered out
 - Check search filters — try broader terms or more locations
@@ -239,7 +228,7 @@ tools/
   setup.py                       # Interactive setup wizard
   run_pipeline.py                # Main entry point — agent mode or legacy pipeline
   agent.py                       # ReAct agent — LLM-driven orchestration loop
-  llm_client.py                  # LLM client (multi-provider, multi-turn support)
+  llm_client.py                  # LLM client with automatic provider failover
   scrape_jobs.py                 # Headless browser scraper for hiring.cafe
   parse_jobs.py                  # Normalizes, deduplicates, and filters raw API data
   analyze_jobs.py                # Optional LLM enrichment
@@ -254,7 +243,7 @@ tools/
 - [uv](https://docs.astral.sh/uv/) package manager
 - Chromium (installed via `uv run playwright install chromium`)
 - (Optional) [MiKTeX](https://miktex.org/download) or TeX Live for PDF resume compilation
-- (Optional) [SambaNova](https://cloud.sambanova.ai/apis) API key for LLM features (free, unlimited)
+- (Optional) At least one free LLM API key for agent reasoning and document generation (see [LLM Providers](#llm-providers-free))
 
 ## Known Constraints
 
@@ -264,5 +253,4 @@ tools/
 - The API's text search is broad — the post-scrape filter enforces strict title/location matching
 - Resumes and cover letters are each limited to 1 page (auto-trimmed if needed)
 - Processing 5 jobs requires ~12 LLM calls (2 analysis + 5 resume + 5 cover letter). Selecting more jobs increases this linearly.
-- SambaNova free tier: unlimited tokens, 20 requests/min — comfortably handles all pipeline operations
-- Agent mode adds ~5-10 reasoning LLM calls on top of pipeline calls (Gemini free tier: 10 RPM, 250 RPD)
+- Free-tier LLM providers have rate limits (20 RPM for SambaNova, 10 RPM for Gemini, etc.) — auto-failover handles this if multiple keys are configured

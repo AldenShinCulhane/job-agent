@@ -474,7 +474,7 @@ def main():
 
     if not results[0]:
         print("\n  LLM connection failed — skipping remaining tests.")
-        print("  Set SAMBANOVA_API_KEY in .env (get a free key at https://cloud.sambanova.ai/apis).")
+        print("  Add at least one LLM API key to .env (get a free SambaNova key at https://cloud.sambanova.ai/apis).")
         sys.exit(1)
 
     import time
