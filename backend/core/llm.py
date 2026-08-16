@@ -327,6 +327,13 @@ async def structured(
             db.set_state("engine_status", "auth_required")
             db.set_state("last_error", str(exc))
             raise
+        except ConfigError as exc:
+            # Persisted for /api/status even when the model was already
+            # pinned — a lockdown breach or broken CLI must not leave the
+            # engine reporting ok.
+            db.set_state("engine_status", "config_error")
+            db.set_state("last_error", str(exc))
+            raise
 
     _clear_wait_state()
     output = getattr(result, "structured_output", None)

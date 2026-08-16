@@ -18,21 +18,32 @@ from pathlib import Path
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / ".data"
 CLAUDE_CONFIG_DIR = DATA_DIR / "claude"
 
-# Alternate credential / provider routing. Names verified against Claude
-# Code CLI docs; anything here gets dropped from our process environment.
+# Alternate credential / provider routing. Names from the Claude Code
+# environment-variable reference (code.claude.com/docs/en/env-vars);
+# anything here gets dropped from our process environment. The OAuth token
+# variables are subscription credentials, but an inherited
+# CLAUDE_CODE_OAUTH_TOKEN would take precedence over the config-stored
+# login and defeat the isolated .data/claude/ identity.
 FORBIDDEN_ENV = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
     "ANTHROPIC_VERTEX_BASE_URL",
     "ANTHROPIC_FOUNDRY_BASE_URL",
     "AWS_BEARER_TOKEN_BEDROCK",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
     "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
     "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
 )
 
 

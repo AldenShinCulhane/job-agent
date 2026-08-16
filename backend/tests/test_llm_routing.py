@@ -230,13 +230,62 @@ async def test_unknown_task_tier_rejected(engine):
         await llm.structured("p", SCHEMA, task="nonsense")
 
 
+async def test_pinned_path_config_error_persisted(engine):
+    """A lockdown breach / broken CLI after pinning must not leave
+    /api/status reporting ok."""
+    db.set_state("pinned_model", llm.MODEL_PREFERRED)
+    db.set_state("engine_status", "ok")
+    install_query(engine, [CLINotFoundError("claude binary missing")])
+    with pytest.raises(llm.ConfigError):
+        await llm.structured("p", SCHEMA, task="extract")
+    status = llm.engine_status()
+    assert status["status"] == "config_error"
+    assert "missing" in status["last_error"]
+
+
 # --- environment hardening --------------------------------------------------
 
+# Written independently of claude_env.FORBIDDEN_ENV (from the Claude Code
+# env-var reference) so an omission there fails here — a test iterating
+# FORBIDDEN_ENV itself could never catch a missing variable.
+EXPECTED_FORBIDDEN = {
+    # API key / token / endpoint overrides
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_BASE_URL",
+    # external provider routing
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
+    "ANTHROPIC_VERTEX_BASE_URL",
+    "ANTHROPIC_FOUNDRY_BASE_URL",
+    "AWS_BEARER_TOKEN_BEDROCK",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CODE_SKIP_MANTLE_AUTH",
+    # OAuth material that would override the isolated .data/claude login
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
+    "CLAUDE_CODE_OAUTH_SCOPES",
+}
+
+
+def test_forbidden_env_covers_expected_set():
+    assert EXPECTED_FORBIDDEN <= set(claude_env.FORBIDDEN_ENV), (
+        "claude_env.FORBIDDEN_ENV is missing: "
+        f"{sorted(EXPECTED_FORBIDDEN - set(claude_env.FORBIDDEN_ENV))}"
+    )
+
+
 def test_harden_strips_alternate_auth_and_providers(monkeypatch):
-    for var in claude_env.FORBIDDEN_ENV:
+    for var in EXPECTED_FORBIDDEN:
         monkeypatch.setenv(var, "sneaky")
     claude_env.harden_process_env()
-    for var in claude_env.FORBIDDEN_ENV:
+    for var in EXPECTED_FORBIDDEN:
         assert var not in os.environ, var
     assert os.environ["CLAUDE_CONFIG_DIR"] == str(claude_env.CLAUDE_CONFIG_DIR)
     assert os.environ["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
