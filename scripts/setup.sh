@@ -84,10 +84,10 @@ else
   fail "uv sync failed — re-run 'uv sync' manually to see the error"
 fi
 
-if (cd frontend && npm install --no-fund --no-audit >/dev/null 2>&1); then
-  ok "frontend dependencies (npm install)"
+if (cd frontend && npm ci --no-fund --no-audit >/dev/null 2>&1); then
+  ok "frontend dependencies (npm ci)"
 else
-  fail "npm install failed — re-run 'cd frontend && npm install' to see the error"
+  fail "npm ci failed — re-run 'cd frontend && npm ci' to see the error"
 fi
 
 if (cd frontend && npm run build >/dev/null 2>&1); then
@@ -109,15 +109,14 @@ fi
 echo
 echo "3. Claude sign-in (uses your Claude subscription — no API key)"
 
-STATUS=$(uv run python -c "from backend.core.claude_cli import auth_status; import json; print(json.dumps(auth_status()))" 2>/dev/null || echo '{}')
-case "$STATUS" in
-  *'"loggedIn": true'*|*'"loggedIn":true'*)
-    ok "signed in to Claude"
-    ;;
-  *)
-    warn "not signed in — run: uv run python -m backend.core.claude_cli auth login"
-    ;;
-esac
+# loggedIn alone is not enough — API-key or external-provider auth must not
+# pass as subscription auth.
+PROBLEM=$(uv run python -c "from backend.core.claude_cli import subscription_problem; print(subscription_problem() or '')" 2>/dev/null || echo "auth check failed — run 'uv sync' and retry")
+if [ -z "$PROBLEM" ]; then
+  ok "signed in with a claude.ai subscription"
+else
+  warn "$PROBLEM"
+fi
 
 echo
 if [ "$FAILURES" -gt 0 ]; then

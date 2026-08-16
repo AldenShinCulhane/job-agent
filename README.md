@@ -60,14 +60,27 @@ you sign in once with the same account you use for Claude.
 - Subscription usage limits apply. If you hit your plan's limit mid-batch,
   the app pauses, shows a banner, and resumes automatically — no work is
   lost and nothing is regenerated.
-- The model is locked down for this app: no file, shell, or web tools —
-  every call is a single-turn, JSON-only request.
+- The model is locked down for this app: no file, shell, or web tools, and
+  no open-ended agent loop — every call is a single prompt that must answer
+  in JSON.
+- The app keeps its own Claude sign-in in `.data/claude/`, separate from
+  any Claude Code install you may have — so the login command above is
+  needed once even if you already use Claude Code.
+
+> **Note for redistributors:** Anthropic requires prior approval for
+> third-party products that offer claude.ai sign-in (see the
+> [Agent SDK terms](https://code.claude.com/docs/en/agent-sdk/overview)).
+> Using this repo yourself on your own account is personal tooling; if you
+> ship a product based on it, get that approval first.
 
 ## Privacy
 
 - **Your resume content and job descriptions are sent to Claude (Anthropic)
-  for processing.** That's the entire AI surface — nothing else leaves your
-  machine. See [Anthropic's privacy policy](https://www.anthropic.com/legal/privacy).
+  for processing.** See [Anthropic's privacy policy](https://www.anthropic.com/legal/privacy).
+  Beyond that, the app's network traffic is LinkedIn itself (through your
+  own signed-in browser session) and dependency downloads during setup;
+  the bundled Claude CLI runs with telemetry and auto-update traffic
+  disabled.
 - The server binds to `127.0.0.1` only — nothing is exposed to your network.
 - All local state (your profile, jobs database, LinkedIn browser session)
   lives in `.data/`, created with owner-only permissions. Generated PDFs go
