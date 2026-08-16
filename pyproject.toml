@@ -1,17 +1,22 @@
 [project]
 name = "job-agent"
-version = "0.1.0"
-description = "Agentic job search pipeline — scrapes, scores, and generates tailored applications"
+version = "2.0.0.dev0"
+description = "LinkedIn-native tailoring studio — scored job search with tailored LaTeX resume + cover letter PDFs"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "beautifulsoup4>=4.14.3",
-    "openai>=1.82.0",
-    "playwright>=1.58.0",
-    "playwright-stealth>=2.0.2",
-    "pypdf2>=3.0.1",
-    "python-docx>=1.2.0",
-    "python-dotenv>=1.2.1",
-    "pyyaml>=6.0.3",
-    "requests>=2.32.5",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.34",
+    "claude-agent-sdk>=0.1.0",
+    "pydantic>=2.10",
 ]
+
+[project.scripts]
+job-agent = "backend.main:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend"]

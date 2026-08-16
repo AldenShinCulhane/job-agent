@@ -1,29 +1,24 @@
-# Personal documents (resumes, cover letters, etc.)
+# Personal documents — never commit resumes or cover letters
 *.pdf
 *.docx
 
-# Environment and secrets
+# Secrets
 .env
-credentials.json
-token.json
 
-# User-specific config (contains PII and personal search criteria)
-config/user_profile.yaml
-config/search_filters.yaml
+# Local data: SQLite DB, LinkedIn browser profile, model probe cache
+.data/
 
-# Generated output (contains PII in resumes/cover letters)
+# Generated packages (contain PII)
 output/
 
-# Temporary/intermediate files
-.tmp/
-
-# Python / uv
+# Python
 __pycache__/
-*.pyc
-*.pyo
-venv/
+*.py[co]
 .venv/
-uv.lock
+
+# Node / frontend
+node_modules/
+frontend/dist/
 
 # OS
 .DS_Store
