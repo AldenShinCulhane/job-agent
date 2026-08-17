@@ -262,6 +262,66 @@ def test_cached_engine_tried_first(tmp_path, monkeypatch):
     assert result.engine == "pdflatex"
 
 
+def test_cached_engine_timeout_falls_back_to_remaining_engines(tmp_path, monkeypatch):
+    """Regression: a hang (subprocess.TimeoutExpired) must become
+    CompileError so the fallback loop reaches the next engine, instead of
+    escaping as an unhandled exception."""
+    import subprocess
+    from types import SimpleNamespace
+
+    from pypdf import PdfWriter
+
+    engines = [("tectonic", "/fake/tectonic"), ("pdflatex", "/fake/pdflatex")]
+    calls: list[str] = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command[0])
+        if command[0] == "/fake/tectonic":
+            raise subprocess.TimeoutExpired(cmd=command, timeout=1)
+        writer = PdfWriter()
+        writer.add_blank_page(width=612, height=792)
+        with open(kwargs["cwd"] / "doc.pdf", "wb") as fh:
+            writer.write(fh)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(latex, "available_engines", lambda: list(engines))
+    monkeypatch.setattr(latex.subprocess, "run", fake_run)
+    monkeypatch.setattr(latex, "_working_engine", engines[0])  # cached: tectonic
+
+    result = latex.compile_tex("x", tmp_path, jobname="doc")
+    assert calls[0] == "/fake/tectonic"
+    assert calls.count("/fake/pdflatex") == 2  # both pdflatex passes ran
+    assert result.engine == "pdflatex"
+    assert latex._working_engine == engines[1]
+
+
+def test_corrupt_pdf_falls_back_to_remaining_engines(tmp_path, monkeypatch):
+    engines = [("tectonic", "/fake/tectonic"), ("pdflatex", "/fake/pdflatex")]
+
+    def run(engine, binary, tex_path, workdir):
+        if engine == "tectonic":
+            # Engine "succeeds" but emits garbage — unreadable PDF.
+            (workdir / f"{tex_path.stem}.pdf").write_bytes(b"not a pdf")
+            return "ok"
+        return _fake_engine_success(engine, binary, tex_path, workdir)
+
+    monkeypatch.setattr(latex, "available_engines", lambda: list(engines))
+    monkeypatch.setattr(latex, "_run_engine", run)
+    monkeypatch.setattr(latex, "_working_engine", None)
+
+    result = latex.compile_tex("x", tmp_path, jobname="doc")
+    assert result.engine == "pdflatex"
+
+
+def test_launch_oserror_wraps_as_compile_error(tmp_path, monkeypatch):
+    def raise_oserror(command, **kwargs):
+        raise FileNotFoundError(command[0])
+
+    monkeypatch.setattr(latex.subprocess, "run", raise_oserror)
+    with pytest.raises(latex.CompileError, match="failed to launch"):
+        latex._run_engine("tectonic", "/gone/tectonic", tmp_path / "doc.tex", tmp_path)
+
+
 # --- live compile (needs a LaTeX engine; skipped when absent) ---------------
 
 @pytest.mark.skipif(

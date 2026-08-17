@@ -58,10 +58,19 @@ def _run_engine(engine: str, binary: str, tex_path: Path, workdir: Path) -> str:
 
     output = ""
     for command in commands:
-        proc = subprocess.run(
-            command, capture_output=True, text=True, timeout=_COMPILE_TIMEOUT_S,
-            cwd=workdir,
-        )
+        # Every way an engine can fail must become CompileError, or the
+        # fallback loop in compile_tex never reaches the next engine.
+        try:
+            proc = subprocess.run(
+                command, capture_output=True, text=True, timeout=_COMPILE_TIMEOUT_S,
+                cwd=workdir,
+            )
+        except subprocess.TimeoutExpired:
+            raise CompileError(
+                f"{engine} timed out after {_COMPILE_TIMEOUT_S}s", output[-2000:]
+            )
+        except OSError as exc:
+            raise CompileError(f"{engine} failed to launch: {exc}", output[-2000:])
         output = proc.stdout + proc.stderr
         if proc.returncode != 0:
             raise CompileError(f"{engine} failed (exit {proc.returncode})", output[-2000:])
@@ -97,8 +106,15 @@ def compile_tex(tex_source: str, workdir: Path, jobname: str = "document") -> Co
         if not pdf_path.is_file():
             errors.append(CompileError(f"{engine} produced no PDF", output[-2000:]))
             continue
+        try:
+            pages = page_count(pdf_path)
+        except Exception as exc:  # corrupt output counts as an engine failure
+            errors.append(
+                CompileError(f"{engine} produced an unreadable PDF: {exc}", output[-2000:])
+            )
+            continue
         _working_engine = (engine, binary)
-        return CompileResult(pdf_path=pdf_path, pages=page_count(pdf_path), engine=engine)
+        return CompileResult(pdf_path=pdf_path, pages=pages, engine=engine)
 
     summary = "; ".join(str(e) for e in errors)
     raise CompileError(f"all LaTeX engines failed: {summary}", errors[-1].log_tail)
