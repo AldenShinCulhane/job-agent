@@ -1,10 +1,13 @@
 """Environment hardening for every Claude CLI / Agent SDK subprocess.
 
 Subscription-only means more than "no ANTHROPIC_API_KEY": auth tokens,
-base-URL overrides, and Bedrock/Vertex/Foundry routing flags would all
-silently switch billing away from the user's claude.ai login. Every code
-path that spawns the CLI (SDK queries, auth login/status) must call
-harden_process_env() first so the subprocess inherits none of them.
+base-URL overrides, provider selectors (Bedrock/Vertex/Foundry/Mantle),
+profile/federation credentials, and OAuth token variables all outrank or
+bypass the config-stored /login. A name-by-name denylist drifts behind
+CLI releases, so the scrub is policy-based: entire namespaces are
+stripped, then only app-controlled variables are set. Every code path
+that spawns the CLI (SDK queries, auth login/status) must call
+harden_process_env() first.
 
 The app also runs the CLI against its own config dir (`.data/claude/`)
 instead of the user's global `~/.claude`, so the user's Claude Code
@@ -18,38 +21,29 @@ from pathlib import Path
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / ".data"
 CLAUDE_CONFIG_DIR = DATA_DIR / "claude"
 
-# Alternate credential / provider routing. Names from the Claude Code
-# environment-variable reference (code.claude.com/docs/en/env-vars);
-# anything here gets dropped from our process environment. The OAuth token
-# variables are subscription credentials, but an inherited
-# CLAUDE_CODE_OAUTH_TOKEN would take precedence over the config-stored
-# login and defeat the isolated .data/claude/ identity.
-FORBIDDEN_ENV = (
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_BEDROCK_BASE_URL",
-    "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
-    "ANTHROPIC_VERTEX_BASE_URL",
-    "ANTHROPIC_FOUNDRY_BASE_URL",
-    "AWS_BEARER_TOKEN_BEDROCK",
-    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_FOUNDRY",
-    "CLAUDE_CODE_USE_MANTLE",
-    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
-    "CLAUDE_CODE_SKIP_VERTEX_AUTH",
-    "CLAUDE_CODE_SKIP_MANTLE_AUTH",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_REFRESH_TOKEN",
-    "CLAUDE_CODE_OAUTH_SCOPES",
+FORBIDDEN_PREFIXES = (
+    # Keys, tokens, endpoints, profile/federation/org overrides — every
+    # documented ANTHROPIC_* variable either overrides auth/routing or is
+    # config this app sets explicitly through the SDK instead.
+    "ANTHROPIC_",
+    # OAuth material that outranks the config-stored login identity.
+    "CLAUDE_CODE_OAUTH_",
+    # External provider selectors (Bedrock/Vertex/Foundry/Mantle/AWS).
+    "CLAUDE_CODE_USE_",
+    # Provider auth-skip flags.
+    "CLAUDE_CODE_SKIP_",
 )
+FORBIDDEN_EXACT = ("AWS_BEARER_TOKEN_BEDROCK",)
+
+
+def is_forbidden(var: str) -> bool:
+    return var in FORBIDDEN_EXACT or var.startswith(FORBIDDEN_PREFIXES)
 
 
 def harden_process_env() -> None:
-    for var in FORBIDDEN_ENV:
-        os.environ.pop(var, None)
+    for var in list(os.environ):
+        if is_forbidden(var):
+            os.environ.pop(var, None)
 
     CLAUDE_CONFIG_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(DATA_DIR, 0o700)

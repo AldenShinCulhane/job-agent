@@ -208,9 +208,11 @@ def _enter_usage_exhausted() -> None:
 
 
 def _clear_wait_state() -> None:
+    """Success recovery: a stale last_error must not survive an ok status."""
     db.set_state("engine_status", "ok")
     db.delete_state("retry_at")
     db.delete_state("usage_backoff_minutes")
+    db.delete_state("last_error")
 
 
 def seconds_until_retry() -> float:
@@ -283,7 +285,6 @@ async def probe() -> str:
             raise
         db.set_state("pinned_model", model)
         _clear_wait_state()
-        db.delete_state("last_error")
         return model
 
     raise ConfigError("probe fell through without pinning a model")  # unreachable
@@ -292,6 +293,7 @@ async def probe() -> str:
 def reset_probe() -> None:
     """Settings-page hook: forget the pinned model and re-probe next call."""
     db.delete_state("pinned_model")
+    db.delete_state("last_error")
     db.set_state("engine_status", "unprobed")
 
 

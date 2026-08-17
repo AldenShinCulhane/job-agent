@@ -28,6 +28,9 @@ async def main() -> None:
     assert "ANTHROPIC_API_KEY" not in os.environ, "engine must strip the API key"
     db.init()
 
+    # A cached pin would skip the fresh isolated-config probe (and its
+    # subscription pre-check) — the smoke must exercise the real path.
+    llm.reset_probe()
     model = await llm.probe()
     print(f"probe pinned: {model}")
 

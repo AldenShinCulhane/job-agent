@@ -245,27 +245,35 @@ async def test_pinned_path_config_error_persisted(engine):
 
 # --- environment hardening --------------------------------------------------
 
-# Written independently of claude_env.FORBIDDEN_ENV (from the Claude Code
-# env-var reference) so an omission there fails here — a test iterating
-# FORBIDDEN_ENV itself could never catch a missing variable.
+# Written independently of the claude_env policy (from the Claude Code
+# env-var reference) so a policy gap fails here — a test iterating the
+# policy's own data could never catch a missing variable.
 EXPECTED_FORBIDDEN = {
     # API key / token / endpoint overrides
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
     "ANTHROPIC_BASE_URL",
-    # external provider routing
+    # direct-auth overrides that outrank /login
+    "ANTHROPIC_PROFILE",
+    "ANTHROPIC_FEDERATION_RULE_ID",
+    "ANTHROPIC_ORGANIZATION_ID",
+    "ANTHROPIC_WORKSPACE_ID",
+    # external provider routing / credentials
     "ANTHROPIC_BEDROCK_BASE_URL",
     "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
     "ANTHROPIC_VERTEX_BASE_URL",
     "ANTHROPIC_FOUNDRY_BASE_URL",
+    "ANTHROPIC_AWS_PROFILE",
     "AWS_BEARER_TOKEN_BEDROCK",
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
     "CLAUDE_CODE_USE_FOUNDRY",
     "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_SKIP_ANTHROPIC_AWS_AUTH",
     "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
     "CLAUDE_CODE_SKIP_VERTEX_AUTH",
+    "CLAUDE_CODE_SKIP_FOUNDRY_AUTH",
     "CLAUDE_CODE_SKIP_MANTLE_AUTH",
     # OAuth material that would override the isolated .data/claude login
     "CLAUDE_CODE_OAUTH_TOKEN",
@@ -273,12 +281,24 @@ EXPECTED_FORBIDDEN = {
     "CLAUDE_CODE_OAUTH_SCOPES",
 }
 
+# App-controlled variables the scrub must NOT touch.
+EXPECTED_ALLOWED = {
+    "CLAUDE_CONFIG_DIR",
+    "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    "PATH",
+    "HOME",
+}
 
-def test_forbidden_env_covers_expected_set():
-    assert EXPECTED_FORBIDDEN <= set(claude_env.FORBIDDEN_ENV), (
-        "claude_env.FORBIDDEN_ENV is missing: "
-        f"{sorted(EXPECTED_FORBIDDEN - set(claude_env.FORBIDDEN_ENV))}"
-    )
+
+def test_scrub_policy_covers_expected_set():
+    missed = sorted(v for v in EXPECTED_FORBIDDEN if not claude_env.is_forbidden(v))
+    assert not missed, f"scrub policy misses: {missed}"
+
+
+def test_scrub_policy_spares_app_controlled_vars():
+    overreach = sorted(v for v in EXPECTED_ALLOWED if claude_env.is_forbidden(v))
+    assert not overreach, f"scrub policy would strip: {overreach}"
 
 
 def test_harden_strips_alternate_auth_and_providers(monkeypatch):
@@ -290,3 +310,20 @@ def test_harden_strips_alternate_auth_and_providers(monkeypatch):
     assert os.environ["CLAUDE_CONFIG_DIR"] == str(claude_env.CLAUDE_CONFIG_DIR)
     assert os.environ["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
     assert os.environ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+
+
+# --- success recovery -------------------------------------------------------
+
+async def test_success_clears_stale_error_state(engine):
+    """After an auth failure is fixed, a successful call must leave no
+    stale last_error next to an ok status."""
+    db.set_state("pinned_model", llm.MODEL_PREFERRED)
+    db.set_state("engine_status", "auth_required")
+    db.set_state("last_error", "Not logged in · Please run /login")
+
+    install_query(engine, [[make_result({"x": "y"})]])
+    assert await llm.structured("p", SCHEMA, task="extract") == {"x": "y"}
+
+    status = llm.engine_status()
+    assert status["status"] == "ok"
+    assert status["last_error"] is None
