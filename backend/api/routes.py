@@ -1,3 +1,5 @@
+import asyncio
+import logging
 import tempfile
 from pathlib import Path
 
@@ -5,11 +7,14 @@ from fastapi import APIRouter, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from jsonschema import Draft202012Validator
 
+from backend import sources
 from backend.core import db, llm
 from backend.core.events import broker
 from backend.resume import facts, ingest, template
 from backend.resume.schema import PROFILE_SCHEMA
 from backend.tailor import compile as latex
+
+log = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -164,3 +169,116 @@ async def confirm_profile(body: dict):
     db.confirm_profile(version)
     broker.publish("profile", {"version": version, "event": "confirmed"})
     return {"ok": True, "version": version}
+
+
+# --- LinkedIn session + search (gate 2 lives inside connect) ----------------
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _connect_then_search(run_id: int) -> None:
+    """Background driver for a search run: establish the session (waiting
+    for the user's sign-in if needed), then collect. Every failure lands
+    in a terminal run status — the task never dies silently."""
+    try:
+        await sources.source.connect()
+    except sources.CaptchaStop as exc:
+        db.update_search_run(run_id, status="stopped_captcha", message=str(exc))
+        return
+    except sources.AuthRequired as exc:
+        db.update_search_run(run_id, status="stopped_auth", message=str(exc))
+        return
+    except Exception as exc:  # noqa: BLE001 — terminal state over silent death
+        log.exception("LinkedIn connect failed for run %s", run_id)
+        db.update_search_run(
+            run_id, status="stopped_error", message=f"{type(exc).__name__}: {exc}"
+        )
+        return
+    await sources.source.resume(run_id)
+
+
+@router.get("/linkedin/status")
+async def linkedin_status():
+    return await sources.source.health()
+
+
+@router.post("/linkedin/connect")
+async def linkedin_connect():
+    """Open the headed browser window and detect sign-in in the
+    background; the UI follows progress via /linkedin/status and SSE."""
+    _spawn(_connect_only())
+    return await sources.source.health()
+
+
+async def _connect_only() -> None:
+    try:
+        await sources.source.connect()
+    except (sources.AuthRequired, sources.CaptchaStop):
+        pass  # state is already persisted and bannered by the supervisor
+    except Exception:  # noqa: BLE001
+        log.exception("LinkedIn connect failed")
+
+
+@router.post("/search/start")
+async def search_start(body: dict):
+    keywords = (body.get("keywords") or "").strip()
+    if not keywords:
+        raise HTTPException(status_code=422, detail="Search needs keywords.")
+    config = {
+        "keywords": keywords,
+        "location": (body.get("location") or "").strip() or None,
+        "date_posted": body.get("date_posted"),
+        "workplace": body.get("workplace") or [],
+        "experience": body.get("experience") or [],
+        "cap": body.get("cap"),
+    }
+    run_id = db.create_search_run(config)
+    _spawn(_connect_then_search(run_id))
+    return {"run_id": run_id, "status": "running"}
+
+
+@router.post("/search/resume")
+async def search_resume(body: dict | None = None):
+    run = (
+        db.get_search_run(body["run_id"])
+        if body and body.get("run_id")
+        else db.latest_search_run()
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="No search run to resume.")
+    if run["status"] == "done":
+        return run
+    db.update_search_run(run["id"], status="running", message=None)
+    _spawn(_connect_then_search(run["id"]))
+    return {**run, "status": "running"}
+
+
+@router.get("/search/latest")
+async def search_latest():
+    run = db.latest_search_run()
+    return run if run is not None else {"id": None}
+
+
+@router.get("/jobs")
+async def jobs_list():
+    return {"jobs": db.list_jobs()}
+
+
+@router.post("/jobs/{job_id}/detail")
+async def job_detail_fetch(job_id: str, force: bool = False):
+    try:
+        return await sources.source.fetch_detail(job_id, force=force)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Unknown job {job_id}")
+    except sources.DailyCapReached as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
+    except (sources.AuthRequired, sources.CaptchaStop) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except sources.DetailParseError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))

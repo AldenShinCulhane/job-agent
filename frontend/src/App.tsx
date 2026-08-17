@@ -2,6 +2,14 @@ import { useEffect, useState } from 'react'
 import { api } from './api'
 import type { EngineStatus } from './api'
 import Onboarding from './pages/Onboarding'
+import Search from './pages/Search'
+
+const TABS = [
+  { id: 'profile', label: 'Profile' },
+  { id: 'search', label: 'Search' },
+] as const
+
+type TabId = (typeof TABS)[number]['id']
 
 const STATUS_LABELS: Record<string, { label: string; tone: string }> = {
   ok: { label: 'Claude ready', tone: 'bg-emerald-100 text-emerald-800' },
@@ -19,6 +27,7 @@ const STATUS_LABELS: Record<string, { label: string; tone: string }> = {
 
 export default function App() {
   const [engine, setEngine] = useState<EngineStatus | null>(null)
+  const [tab, setTab] = useState<TabId>('profile')
 
   useEffect(() => {
     api
@@ -50,8 +59,25 @@ export default function App() {
           </span>
         )}
       </header>
+      <nav className="border-b border-slate-200 bg-white px-8">
+        <div className="mx-auto flex max-w-7xl gap-6">
+          {TABS.map((t) => (
+            <button
+              key={t.id}
+              className={`border-b-2 py-3 text-sm font-medium ${
+                tab === t.id
+                  ? 'border-slate-900 text-slate-900'
+                  : 'border-transparent text-slate-500 hover:text-slate-800'
+              }`}
+              onClick={() => setTab(t.id)}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </nav>
       <main className="mx-auto max-w-7xl p-8">
-        <Onboarding />
+        {tab === 'profile' ? <Onboarding /> : <Search />}
       </main>
     </div>
   )

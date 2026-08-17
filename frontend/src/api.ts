@@ -63,6 +63,52 @@ export interface EngineStatus {
   last_error: string | null
 }
 
+export interface LinkedInStatus {
+  state: string
+  detail: string | null
+}
+
+export interface Job {
+  job_id: string
+  title: string
+  company: string
+  location: string | null
+  posted_text: string | null
+  workplace: string | null
+  easy_apply: boolean
+  url: string
+  first_seen_at: string
+  last_seen_at: string
+  description: string | null
+  description_hash: string | null
+  detail_fetched_at: string | null
+}
+
+export interface JobDetail extends Job {
+  refetched: boolean
+  changed: boolean
+}
+
+export interface SearchConfig {
+  keywords: string
+  location?: string | null
+  date_posted?: string | null
+  workplace?: string[]
+  experience?: string[]
+  cap?: number | null
+}
+
+export interface SearchRun {
+  id: number | null
+  config?: SearchConfig
+  status?: string
+  next_start?: number
+  collected?: number
+  message?: string | null
+  started_at?: string
+  updated_at?: string
+}
+
 async function toJson<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let detail = res.statusText
@@ -99,4 +145,23 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ version }),
     }).then(toJson<{ ok: boolean; version: number }>),
+  linkedinStatus: () => fetch('/api/linkedin/status').then(toJson<LinkedInStatus>),
+  linkedinConnect: () =>
+    fetch('/api/linkedin/connect', { method: 'POST' }).then(toJson<LinkedInStatus>),
+  searchStart: (config: SearchConfig) =>
+    fetch('/api/search/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(config),
+    }).then(toJson<{ run_id: number; status: string }>),
+  searchResume: () =>
+    fetch('/api/search/resume', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    }).then(toJson<SearchRun>),
+  searchLatest: () => fetch('/api/search/latest').then(toJson<SearchRun>),
+  jobs: () => fetch('/api/jobs').then(toJson<{ jobs: Job[] }>),
+  jobDetail: (jobId: string) =>
+    fetch(`/api/jobs/${jobId}/detail`, { method: 'POST' }).then(toJson<JobDetail>),
 }

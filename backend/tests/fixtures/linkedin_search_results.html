@@ -1,0 +1,48 @@
+<!-- Sanitized minimal structure of the logged-in jobs search results list.
+     All names, companies, and ids are fake. Structure mirrors the current
+     DOM: li[data-occludable-job-id] cards inside the results list. -->
+<div class="scaffold-layout__list">
+  <ul class="jobs-search-results__list">
+    <li data-occludable-job-id="9000000001" class="jobs-search-results__list-item">
+      <div class="job-card-container">
+        <div class="artdeco-entity-lockup__title">
+          <a class="job-card-list__title--link" href="/jobs/view/9000000001/?trk=fixture">
+            <span aria-hidden="true">Backend Engineer</span>
+            <span class="visually-hidden">Backend Engineer with verification</span>
+          </a>
+        </div>
+        <div class="artdeco-entity-lockup__subtitle">Example Widgets Inc.</div>
+        <ul class="job-card-container__metadata-wrapper">
+          <li>Toronto, ON (Hybrid)</li>
+        </ul>
+        <time datetime="2026-08-14">2 days ago</time>
+        <ul class="job-card-list__footer-wrapper">
+          <li class="job-card-container__footer-item">Easy Apply</li>
+          <li class="job-card-container__footer-item">Promoted</li>
+        </ul>
+      </div>
+    </li>
+    <li data-occludable-job-id="9000000002" class="jobs-search-results__list-item">
+      <div class="job-card-container">
+        <div class="artdeco-entity-lockup__title">
+          <a class="job-card-list__title--link" href="/jobs/view/9000000002/?trk=fixture">
+            <span aria-hidden="true">Full-Stack Developer</span>
+          </a>
+        </div>
+        <div class="artdeco-entity-lockup__subtitle">Sample Analytics Ltd.</div>
+        <ul class="job-card-container__metadata-wrapper">
+          <li>Remote, Canada</li>
+        </ul>
+        <time datetime="2026-08-15">1 day ago</time>
+        <ul class="job-card-list__footer-wrapper">
+          <li class="job-card-container__footer-item">Promoted</li>
+        </ul>
+      </div>
+    </li>
+    <li data-occludable-job-id="9000000003" class="jobs-search-results__list-item">
+      <!-- Card with no title/company rendered yet (lazy placeholder) —
+           parser must skip it without crashing. -->
+      <div class="job-card-container"></div>
+    </li>
+  </ul>
+</div>
