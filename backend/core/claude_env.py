@@ -55,3 +55,9 @@ def harden_process_env() -> None:
     # traffic from the bundled CLI is switched off as well.
     os.environ["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] = "1"
     os.environ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+    # Without this the CLI persists full prompts/responses as session
+    # JSONL under .data/claude/projects — which from M1 on would mean
+    # resume content and job descriptions on disk. Calls are independent
+    # single-turn requests; session history has no value here. (Set after
+    # the scrub: the CLAUDE_CODE_SKIP_ prefix strips any inherited value.)
+    os.environ["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] = "1"

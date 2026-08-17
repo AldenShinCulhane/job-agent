@@ -263,7 +263,9 @@ EXPECTED_FORBIDDEN = {
     "ANTHROPIC_BEDROCK_MANTLE_BASE_URL",
     "ANTHROPIC_VERTEX_BASE_URL",
     "ANTHROPIC_FOUNDRY_BASE_URL",
-    "ANTHROPIC_AWS_PROFILE",
+    "ANTHROPIC_AWS_API_KEY",
+    "ANTHROPIC_AWS_BASE_URL",
+    "ANTHROPIC_AWS_WORKSPACE_ID",
     "AWS_BEARER_TOKEN_BEDROCK",
     "CLAUDE_CODE_USE_ANTHROPIC_AWS",
     "CLAUDE_CODE_USE_BEDROCK",
@@ -310,6 +312,15 @@ def test_harden_strips_alternate_auth_and_providers(monkeypatch):
     assert os.environ["CLAUDE_CONFIG_DIR"] == str(claude_env.CLAUDE_CONFIG_DIR)
     assert os.environ["CLAUDE_CODE_DISABLE_AUTO_MEMORY"] == "1"
     assert os.environ["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+    assert os.environ["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] == "1"
+
+
+def test_prompt_history_suppression_wins_over_inherited_value(monkeypatch):
+    """The CLAUDE_CODE_SKIP_ prefix scrubs any inherited value; the
+    app-controlled "1" must be set afterwards, never the inherited one."""
+    monkeypatch.setenv("CLAUDE_CODE_SKIP_PROMPT_HISTORY", "0")
+    claude_env.harden_process_env()
+    assert os.environ["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] == "1"
 
 
 # --- success recovery -------------------------------------------------------
