@@ -25,6 +25,15 @@ CREATE TABLE IF NOT EXISTS profile_versions (
     confirmed    INTEGER NOT NULL DEFAULT 0,
     created_at   TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS artifacts (
+    kind       TEXT NOT NULL,
+    ref        TEXT NOT NULL,
+    engine     TEXT NOT NULL,
+    pages      INTEGER NOT NULL,
+    path       TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (kind, ref)
+);
 """
 
 
@@ -109,3 +118,31 @@ def confirm_profile(version: int) -> None:
         conn.execute(
             "UPDATE profile_versions SET confirmed = 1 WHERE version = ?", (version,)
         )
+
+
+# --- Artifact provenance (which engine produced a PDF, and its page count;
+# page-limit decisions are only valid for the engine that made them) ---------
+
+def record_artifact(kind: str, ref: str, engine: str, pages: int, path: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO artifacts (kind, ref, engine, pages, path, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(kind, ref) DO UPDATE SET engine = excluded.engine, "
+            "pages = excluded.pages, path = excluded.path, "
+            "created_at = excluded.created_at",
+            (kind, ref, engine, pages, path, now),
+        )
+
+
+def get_artifact(kind: str, ref: str) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT engine, pages, path, created_at FROM artifacts "
+            "WHERE kind = ? AND ref = ?",
+            (kind, ref),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"engine": row[0], "pages": row[1], "path": row[2], "created_at": row[3]}

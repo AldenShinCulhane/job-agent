@@ -3,15 +3,35 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
+from jsonschema import Draft202012Validator
 
 from backend.core import db, llm
 from backend.core.events import broker
 from backend.resume import facts, ingest, template
+from backend.resume.schema import PROFILE_SCHEMA
 from backend.tailor import compile as latex
 
 router = APIRouter()
 
 PREVIEW_DIR = db.DATA_DIR / "previews"
+
+_PROFILE_VALIDATOR = Draft202012Validator(PROFILE_SCHEMA)
+
+
+def _validate_profile(profile: dict) -> None:
+    """422 unless the profile matches PROFILE_SCHEMA and has a name."""
+    errors = sorted(
+        _PROFILE_VALIDATOR.iter_errors(profile),
+        key=lambda e: list(e.absolute_path),
+    )
+    if errors:
+        first = errors[0]
+        where = "/" + "/".join(str(p) for p in first.absolute_path)
+        raise HTTPException(
+            status_code=422, detail=f"Profile invalid at {where}: {first.message}"
+        )
+    if not (profile.get("name") or "").strip():
+        raise HTTPException(status_code=422, detail="Profile needs at least a name.")
 
 
 @router.get("/status")
@@ -74,6 +94,7 @@ async def upload_resume(file: UploadFile):
     except llm.EngineError as exc:
         raise HTTPException(status_code=503, detail=f"{type(exc).__name__}: {exc}")
 
+    _validate_profile(profile)
     version = db.save_profile(profile)
     broker.publish("profile", {"version": version, "event": "extracted"})
     return _profile_payload(version, profile, False, extraction_method=method)
@@ -90,11 +111,24 @@ async def get_profile():
 
 @router.put("/profile")
 async def update_profile(profile: dict):
-    if not profile.get("name"):
-        raise HTTPException(status_code=422, detail="Profile needs at least a name.")
+    _validate_profile(profile)
     version = db.save_profile(profile)
     broker.publish("profile", {"version": version, "event": "edited"})
     return _profile_payload(version, profile, False)
+
+
+def _ensure_preview(version: int, profile: dict) -> Path:
+    """Compile (or reuse) the preview PDF for a version, recording which
+    engine produced it and its page count. Raises latex.CompileError."""
+    workdir = PREVIEW_DIR / f"v{version}"
+    pdf_path = workdir / "resume.pdf"
+    if pdf_path.is_file() and db.get_artifact("preview", str(version)) is not None:
+        return pdf_path
+    result = latex.compile_tex(template.render(profile), workdir, jobname="resume")
+    db.record_artifact(
+        "preview", str(version), result.engine, result.pages, str(result.pdf_path)
+    )
+    return result.pdf_path
 
 
 @router.get("/profile/preview.pdf")
@@ -102,23 +136,31 @@ async def profile_preview(version: int):
     profile = db.get_profile(version)
     if profile is None:
         raise HTTPException(status_code=404, detail=f"No profile version {version}")
-
-    workdir = PREVIEW_DIR / f"v{version}"
-    pdf_path = workdir / "resume.pdf"
-    if not pdf_path.is_file():
-        try:
-            result = latex.compile_tex(template.render(profile), workdir, jobname="resume")
-        except latex.CompileError as exc:
-            raise HTTPException(status_code=500, detail=f"{exc} | {exc.log_tail[-500:]}")
-        pdf_path = result.pdf_path
+    try:
+        pdf_path = _ensure_preview(version, profile)
+    except latex.CompileError as exc:
+        raise HTTPException(status_code=500, detail=f"{exc} | {exc.log_tail[-500:]}")
     return FileResponse(pdf_path, media_type="application/pdf", filename="resume-preview.pdf")
 
 
 @router.post("/profile/confirm")
 async def confirm_profile(body: dict):
     version = body.get("version")
-    if not isinstance(version, int) or db.get_profile(version) is None:
+    if not isinstance(version, int):
         raise HTTPException(status_code=422, detail="Pass the profile version to confirm.")
+    profile = db.get_profile(version)
+    if profile is None:
+        raise HTTPException(status_code=422, detail=f"No profile version {version}")
+    # A confirmed profile becomes canonical truth for tailoring — it must
+    # be schema-valid and actually render before we accept it.
+    _validate_profile(profile)
+    try:
+        _ensure_preview(version, profile)
+    except latex.CompileError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Profile does not compile, fix it before confirming: {exc}",
+        )
     db.confirm_profile(version)
     broker.publish("profile", {"version": version, "event": "confirmed"})
     return {"ok": True, "version": version}

@@ -29,9 +29,11 @@ class CompileResult:
     engine: str
 
 
-# First engine that successfully compiles is reused for the process
-# lifetime — a broken tectonic install (observed: bare SIGABRT) must not
+# Last engine that successfully compiled is tried *first* on later
+# compiles — a broken tectonic install (observed: bare SIGABRT) must not
 # tax every compile with a failed attempt before the pdflatex fallback.
+# The remaining engines still run if the cached one fails on a given
+# document: an engine can succeed on one input and choke on another.
 _working_engine: tuple[str, str] | None = None
 
 
@@ -68,10 +70,12 @@ def _run_engine(engine: str, binary: str, tex_path: Path, workdir: Path) -> str:
 
 def compile_tex(tex_source: str, workdir: Path, jobname: str = "document") -> CompileResult:
     """Compile with the first engine that works (tectonic preferred,
-    pdflatex fallback). Raises CompileError with the log tail when every
-    engine fails."""
+    pdflatex fallback; last known-good engine moves to the front).
+    Raises CompileError with the log tail when every engine fails."""
     global _working_engine
-    engines = [_working_engine] if _working_engine else available_engines()
+    engines = available_engines()
+    if _working_engine in engines:
+        engines = [_working_engine] + [e for e in engines if e != _working_engine]
     if not engines:
         raise CompileError(
             "No LaTeX engine found — install tectonic (brew install tectonic) "

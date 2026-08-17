@@ -109,6 +109,36 @@ def test_ledger_duplicate_text_gets_unique_ids():
     assert len(paths) == 2 and len(set(paths)) == 2
 
 
+def test_ledger_same_bullet_under_two_employers_stays_bound_to_its_employer():
+    base = SAMPLE_PROFILE["experiences"][0]
+    exp_a = {**base, "company": "Acme", "bullets": ["Same bullet"]}
+    exp_b = {**base, "company": "Beta", "bullets": ["Same bullet"]}
+    profile = {**SAMPLE_PROFILE, "experiences": [exp_a, exp_b], "projects": []}
+
+    def bullet_company(ledger, prof):
+        out = {}
+        for fact_id, entry in ledger.items():
+            if entry["kind"] != "bullet":
+                continue
+            exp_index = int(entry["path"].split("/")[2])
+            out[fact_id] = prof["experiences"][exp_index]["company"]
+        return out
+
+    before = bullet_company(facts.build_ledger(profile), profile)
+    assert sorted(before.values()) == ["Acme", "Beta"]
+
+    reordered = {**profile, "experiences": [exp_b, exp_a]}
+    after = bullet_company(facts.build_ledger(reordered), reordered)
+    # Same ID set, and each ID still denotes the same employer's bullet.
+    assert before == after
+
+
+def test_ledger_project_entity_includes_link():
+    ledger = facts.build_ledger(SAMPLE_PROFILE)
+    entities = [e["text"] for e in ledger.values() if e["kind"] == "project"]
+    assert any("github.com/janedoe/job-agent" in text for text in entities)
+
+
 def test_ledger_covers_every_bullet_and_entity():
     ledger = facts.build_ledger(SAMPLE_PROFILE)
     kinds = [e["kind"] for e in ledger.values()]
@@ -181,6 +211,55 @@ def test_scanned_pdf_triggers_ocr_call(tmp_path, monkeypatch):
     assert method == "pdf+ocr"
     assert calls == [blank]
     assert "OCR RECOVERED" in text
+
+
+# --- engine fallback ordering (no real engines involved) --------------------
+
+def _fake_engine_success(engine, binary, tex_path, workdir):
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    with open(workdir / f"{tex_path.stem}.pdf", "wb") as fh:
+        writer.write(fh)
+    return "ok"
+
+
+def test_cached_engine_failure_falls_back_to_remaining_engines(tmp_path, monkeypatch):
+    engines = [("tectonic", "/fake/tectonic"), ("pdflatex", "/fake/pdflatex")]
+    calls: list[str] = []
+
+    def run(engine, binary, tex_path, workdir):
+        calls.append(engine)
+        if engine == "tectonic":
+            raise latex.CompileError("tectonic failed (exit -6)")
+        return _fake_engine_success(engine, binary, tex_path, workdir)
+
+    monkeypatch.setattr(latex, "available_engines", lambda: list(engines))
+    monkeypatch.setattr(latex, "_run_engine", run)
+    monkeypatch.setattr(latex, "_working_engine", engines[0])  # cached: tectonic
+
+    result = latex.compile_tex("x", tmp_path, jobname="doc")
+    assert calls == ["tectonic", "pdflatex"]
+    assert result.engine == "pdflatex"
+    assert latex._working_engine == engines[1]
+
+
+def test_cached_engine_tried_first(tmp_path, monkeypatch):
+    engines = [("tectonic", "/fake/tectonic"), ("pdflatex", "/fake/pdflatex")]
+    calls: list[str] = []
+
+    def run(engine, binary, tex_path, workdir):
+        calls.append(engine)
+        return _fake_engine_success(engine, binary, tex_path, workdir)
+
+    monkeypatch.setattr(latex, "available_engines", lambda: list(engines))
+    monkeypatch.setattr(latex, "_run_engine", run)
+    monkeypatch.setattr(latex, "_working_engine", engines[1])  # cached: pdflatex
+
+    result = latex.compile_tex("x", tmp_path, jobname="doc")
+    assert calls == ["pdflatex"]
+    assert result.engine == "pdflatex"
 
 
 # --- live compile (needs a LaTeX engine; skipped when absent) ---------------

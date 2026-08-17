@@ -1,6 +1,34 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
-import type { Profile, ProfilePayload } from '../api'
+import type { Education, Experience, Profile, ProfilePayload, Project, SkillGroup } from '../api'
+
+// Blank entries so the user can add anything extraction missed — the
+// confirmation editor must allow correcting *every* field, including
+// whole entries that were omitted.
+const EMPTY_EXPERIENCE: Experience = {
+  title: '',
+  company: '',
+  location: null,
+  start: '',
+  end: '',
+  bullets: [],
+}
+const EMPTY_PROJECT: Project = {
+  name: '',
+  technologies: [],
+  date: null,
+  link: null,
+  bullets: [],
+}
+const EMPTY_EDUCATION: Education = {
+  institution: '',
+  location: null,
+  degree: '',
+  start: null,
+  end: null,
+  details: [],
+}
+const EMPTY_SKILL_GROUP: SkillGroup = { category: '', items: [] }
 
 const inputCls =
   'w-full rounded-md border border-slate-300 px-2 py-1 text-sm focus:border-slate-500 focus:outline-none'
@@ -26,9 +54,11 @@ function Field({
 function BulletsEditor({
   bullets,
   onChange,
+  addLabel = 'bullet',
 }: {
   bullets: string[]
   onChange: (b: string[]) => void
+  addLabel?: string
 }) {
   return (
     <div className="space-y-1">
@@ -41,7 +71,7 @@ function BulletsEditor({
           />
           <button
             className="self-start text-slate-400 hover:text-rose-600"
-            title="Remove bullet"
+            title={`Remove ${addLabel}`}
             onClick={() => onChange(bullets.filter((_, j) => j !== i))}
           >
             ✕
@@ -52,9 +82,32 @@ function BulletsEditor({
         className="text-sm text-slate-500 hover:text-slate-800"
         onClick={() => onChange([...bullets, ''])}
       >
-        + bullet
+        + {addLabel}
       </button>
     </div>
+  )
+}
+
+function SectionHeader({ title, onAdd, addLabel }: { title: string; onAdd: () => void; addLabel: string }) {
+  return (
+    <div className="mb-2 flex items-center justify-between">
+      <h3 className="font-medium">{title}</h3>
+      <button className="text-sm text-slate-500 hover:text-slate-800" onClick={onAdd}>
+        + {addLabel}
+      </button>
+    </div>
+  )
+}
+
+function RemoveEntryButton({ title, onRemove }: { title: string; onRemove: () => void }) {
+  return (
+    <button
+      className="absolute right-2 top-2 text-slate-400 hover:text-rose-600"
+      title={title}
+      onClick={onRemove}
+    >
+      ✕
+    </button>
   )
 }
 
@@ -207,9 +260,14 @@ export default function Onboarding() {
         </div>
 
         <div>
-          <h3 className="mb-2 font-medium">Experience</h3>
+          <SectionHeader
+            title="Experience"
+            addLabel="experience"
+            onAdd={() => edit((p) => p.experiences.push(structuredClone(EMPTY_EXPERIENCE)))}
+          />
           {draft.experiences.map((exp, i) => (
-            <div key={i} className="mb-4 space-y-2 rounded-lg border border-slate-200 p-3">
+            <div key={i} className="relative mb-4 space-y-2 rounded-lg border border-slate-200 p-3 pr-8">
+              <RemoveEntryButton title="Remove experience" onRemove={() => edit((p) => p.experiences.splice(i, 1))} />
               <div className="grid grid-cols-2 gap-2">
                 <Field label="Title" value={exp.title} onChange={(v) => edit((p) => (p.experiences[i].title = v))} />
                 <Field label="Company" value={exp.company} onChange={(v) => edit((p) => (p.experiences[i].company = v))} />
@@ -225,9 +283,14 @@ export default function Onboarding() {
         </div>
 
         <div>
-          <h3 className="mb-2 font-medium">Projects</h3>
+          <SectionHeader
+            title="Projects"
+            addLabel="project"
+            onAdd={() => edit((p) => p.projects.push(structuredClone(EMPTY_PROJECT)))}
+          />
           {draft.projects.map((proj, i) => (
-            <div key={i} className="mb-4 space-y-2 rounded-lg border border-slate-200 p-3">
+            <div key={i} className="relative mb-4 space-y-2 rounded-lg border border-slate-200 p-3 pr-8">
+              <RemoveEntryButton title="Remove project" onRemove={() => edit((p) => p.projects.splice(i, 1))} />
               <div className="grid grid-cols-2 gap-2">
                 <Field label="Name" value={proj.name} onChange={(v) => edit((p) => (p.projects[i].name = v))} />
                 <Field label="Date" value={proj.date ?? ''} onChange={(v) => edit((p) => (p.projects[i].date = v || null))} />
@@ -246,34 +309,59 @@ export default function Onboarding() {
         </div>
 
         <div>
-          <h3 className="mb-2 font-medium">Education</h3>
+          <SectionHeader
+            title="Education"
+            addLabel="education"
+            onAdd={() => edit((p) => p.education.push(structuredClone(EMPTY_EDUCATION)))}
+          />
           {draft.education.map((edu, i) => (
-            <div key={i} className="mb-4 grid grid-cols-2 gap-2 rounded-lg border border-slate-200 p-3">
-              <Field label="Institution" value={edu.institution} onChange={(v) => edit((p) => (p.education[i].institution = v))} />
-              <Field label="Degree" value={edu.degree} onChange={(v) => edit((p) => (p.education[i].degree = v))} />
-              <Field label="Location" value={edu.location ?? ''} onChange={(v) => edit((p) => (p.education[i].location = v || null))} />
+            <div key={i} className="relative mb-4 space-y-2 rounded-lg border border-slate-200 p-3 pr-8">
+              <RemoveEntryButton title="Remove education" onRemove={() => edit((p) => p.education.splice(i, 1))} />
               <div className="grid grid-cols-2 gap-2">
-                <Field label="Start" value={edu.start ?? ''} onChange={(v) => edit((p) => (p.education[i].start = v || null))} />
-                <Field label="End" value={edu.end ?? ''} onChange={(v) => edit((p) => (p.education[i].end = v || null))} />
+                <Field label="Institution" value={edu.institution} onChange={(v) => edit((p) => (p.education[i].institution = v))} />
+                <Field label="Degree" value={edu.degree} onChange={(v) => edit((p) => (p.education[i].degree = v))} />
+                <Field label="Location" value={edu.location ?? ''} onChange={(v) => edit((p) => (p.education[i].location = v || null))} />
+                <div className="grid grid-cols-2 gap-2">
+                  <Field label="Start" value={edu.start ?? ''} onChange={(v) => edit((p) => (p.education[i].start = v || null))} />
+                  <Field label="End" value={edu.end ?? ''} onChange={(v) => edit((p) => (p.education[i].end = v || null))} />
+                </div>
               </div>
+              <BulletsEditor
+                bullets={edu.details}
+                addLabel="detail"
+                onChange={(d) => edit((p) => (p.education[i].details = d))}
+              />
             </div>
           ))}
         </div>
 
         <div>
-          <h3 className="mb-2 font-medium">Skills</h3>
+          <SectionHeader
+            title="Skills"
+            addLabel="skill group"
+            onAdd={() => edit((p) => p.skills.push(structuredClone(EMPTY_SKILL_GROUP)))}
+          />
           {draft.skills.map((group, i) => (
-            <div key={i} className="mb-2 grid grid-cols-3 gap-2">
-              <Field label="Category" value={group.category} onChange={(v) => edit((p) => (p.skills[i].category = v))} />
-              <div className="col-span-2">
-                <Field
-                  label="Items (comma-separated)"
-                  value={group.items.join(', ')}
-                  onChange={(v) =>
-                    edit((p) => (p.skills[i].items = v.split(',').map((s) => s.trim()).filter(Boolean)))
-                  }
-                />
+            <div key={i} className="mb-2 flex items-start gap-2">
+              <div className="grid flex-1 grid-cols-3 gap-2">
+                <Field label="Category" value={group.category} onChange={(v) => edit((p) => (p.skills[i].category = v))} />
+                <div className="col-span-2">
+                  <Field
+                    label="Items (comma-separated)"
+                    value={group.items.join(', ')}
+                    onChange={(v) =>
+                      edit((p) => (p.skills[i].items = v.split(',').map((s) => s.trim()).filter(Boolean)))
+                    }
+                  />
+                </div>
               </div>
+              <button
+                className="mt-5 text-slate-400 hover:text-rose-600"
+                title="Remove skill group"
+                onClick={() => edit((p) => p.skills.splice(i, 1))}
+              >
+                ✕
+              </button>
             </div>
           ))}
         </div>
