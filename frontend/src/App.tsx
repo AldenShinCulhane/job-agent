@@ -1,20 +1,11 @@
 import { useEffect, useState } from 'react'
-
-interface EngineStatus {
-  status: string
-  model: string | null
-  retry_in_seconds: number | null
-  last_error: string | null
-}
-
-interface AppStatus {
-  app: string
-  engine: EngineStatus
-}
+import { api } from './api'
+import type { EngineStatus } from './api'
+import Onboarding from './pages/Onboarding'
 
 const STATUS_LABELS: Record<string, { label: string; tone: string }> = {
-  ok: { label: 'Ready', tone: 'bg-emerald-100 text-emerald-800' },
-  unprobed: { label: 'Not yet probed', tone: 'bg-slate-100 text-slate-600' },
+  ok: { label: 'Claude ready', tone: 'bg-emerald-100 text-emerald-800' },
+  unprobed: { label: 'Claude not yet probed', tone: 'bg-slate-100 text-slate-600' },
   waiting_usage_exhausted: {
     label: 'Waiting — usage limit reached',
     tone: 'bg-amber-100 text-amber-800',
@@ -27,48 +18,40 @@ const STATUS_LABELS: Record<string, { label: string; tone: string }> = {
 }
 
 export default function App() {
-  const [status, setStatus] = useState<AppStatus | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [engine, setEngine] = useState<EngineStatus | null>(null)
 
   useEffect(() => {
-    fetch('/api/status')
-      .then((r) => r.json())
-      .then(setStatus)
-      .catch((e) => setError(String(e)))
+    api
+      .status()
+      .then((s) => setEngine(s.engine))
+      .catch(() => setEngine(null))
   }, [])
 
-  const engine = status?.engine
-  const badge = engine ? STATUS_LABELS[engine.status] ?? { label: engine.status, tone: 'bg-slate-100 text-slate-600' } : null
+  const badge = engine
+    ? (STATUS_LABELS[engine.status] ?? { label: engine.status, tone: 'bg-slate-100 text-slate-600' })
+    : null
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
-      <header className="border-b border-slate-200 bg-white px-8 py-4">
-        <h1 className="text-xl font-semibold">Job Agent</h1>
-        <p className="text-sm text-slate-500">
-          LinkedIn job search with tailored resume + cover letter packages
-        </p>
+      <header className="flex items-center justify-between border-b border-slate-200 bg-white px-8 py-4">
+        <div>
+          <h1 className="text-xl font-semibold">Job Agent</h1>
+          <p className="text-sm text-slate-500">
+            LinkedIn job search with tailored resume + cover letter packages
+          </p>
+        </div>
+        {badge && (
+          <span
+            className={`rounded-full px-3 py-1 text-sm font-medium ${badge.tone}`}
+            title={engine?.last_error ?? undefined}
+          >
+            {badge.label}
+            {engine?.model ? ` · ${engine.model}` : ''}
+          </span>
+        )}
       </header>
-      <main className="mx-auto max-w-3xl p-8">
-        <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
-          <h2 className="mb-4 text-sm font-medium uppercase tracking-wide text-slate-500">
-            Claude engine
-          </h2>
-          {error && <p className="text-rose-600">Backend unreachable: {error}</p>}
-          {!error && !status && <p className="text-slate-400">Loading…</p>}
-          {badge && engine && (
-            <div className="flex items-center gap-3">
-              <span className={`rounded-full px-3 py-1 text-sm font-medium ${badge.tone}`}>
-                {badge.label}
-              </span>
-              {engine.model && (
-                <span className="font-mono text-sm text-slate-600">{engine.model}</span>
-              )}
-            </div>
-          )}
-          {engine?.last_error && (
-            <p className="mt-3 text-sm text-slate-500">{engine.last_error}</p>
-          )}
-        </section>
+      <main className="mx-auto max-w-7xl p-8">
+        <Onboarding />
       </main>
     </div>
   )

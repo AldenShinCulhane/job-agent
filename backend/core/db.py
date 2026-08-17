@@ -19,6 +19,12 @@ CREATE TABLE IF NOT EXISTS engine_state (
     value      TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS profile_versions (
+    version      INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_json TEXT NOT NULL,
+    confirmed    INTEGER NOT NULL DEFAULT 0,
+    created_at   TEXT NOT NULL
+);
 """
 
 
@@ -58,3 +64,48 @@ def set_state(key: str, value: str) -> None:
 def delete_state(key: str) -> None:
     with _connect() as conn:
         conn.execute("DELETE FROM engine_state WHERE key = ?", (key,))
+
+
+# --- Profile versions (append-only; tailoring pins a specific version) ------
+
+def save_profile(profile: dict) -> int:
+    import json
+
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO profile_versions (profile_json, created_at) VALUES (?, ?)",
+            (json.dumps(profile), now),
+        )
+        return cursor.lastrowid
+
+
+def latest_profile() -> tuple[int, dict, bool] | None:
+    """(version, profile, confirmed) for the newest version, or None."""
+    import json
+
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT version, profile_json, confirmed FROM profile_versions "
+            "ORDER BY version DESC LIMIT 1"
+        ).fetchone()
+    if row is None:
+        return None
+    return row[0], json.loads(row[1]), bool(row[2])
+
+
+def get_profile(version: int) -> dict | None:
+    import json
+
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT profile_json FROM profile_versions WHERE version = ?", (version,)
+        ).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def confirm_profile(version: int) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE profile_versions SET confirmed = 1 WHERE version = ?", (version,)
+        )
