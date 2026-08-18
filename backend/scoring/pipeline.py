@@ -48,31 +48,33 @@ def pending_count(run_id: int) -> int:
 
 async def run_pipeline(run_id: int) -> dict:
     """One pass over the run's jobs. Returns a summary
-    {scored, skipped, failed, stopped} where `stopped` names the
-    session-level condition that ended the pass early (or None)."""
+    {scored, skipped, failed, stopped, detail} where `stopped` names the
+    session-level condition that ended the pass early (or None) and
+    `detail` carries its human-readable cause."""
     version, profile = confirmed_profile()
     user_years = profile_years_experience(profile)
     scored = skipped = failed = 0
     stopped: str | None = None
+    detail: str | None = None
 
     def profile_stale() -> bool:
         latest = db.latest_profile()
         return latest is None or not latest[2] or latest[0] != version
 
-    jobs = db.list_jobs(run_id)
-    total = len(jobs)
-    for job in jobs:
-        job_id = job["job_id"]
-        try:
-            # Generation token: the pass belongs to the profile version it
-            # started with. Confirming a new profile cancels the worker,
-            # but an in-flight iteration could still write a stale score
-            # after an await — verify at iteration start AND again right
+    async def process_job(job_id: str) -> str:
+        """'scored' | 'skipped' | 'raced' | 'stale_profile'. The JD can be
+        refreshed (user force-fetch) while normalization awaits — the
+        hash is re-read before the write and a mismatch reprocesses the
+        job once from the new text; a second race gives up ('raced', the
+        retry timer revisits it)."""
+        for _ in range(2):
+            # Generation token: the pass belongs to the profile version
+            # it started with. Confirming a new profile cancels the
+            # worker, but an in-flight iteration could still write a
+            # stale score after an await — verify at start AND right
             # before the write below.
             if profile_stale():
-                stopped = "stale_profile"
-                log.info("scoring run %s stopped: profile changed mid-pass", run_id)
-                break
+                return "stale_profile"
             current = db.get_job(job_id)
             existing = db.get_score(job_id)
             if (
@@ -81,10 +83,9 @@ async def run_pipeline(run_id: int) -> dict:
                 and current.get("description_hash")
                 and existing["jd_hash"] == current["description_hash"]
             ):
-                skipped += 1
-                continue
-            # fetch_detail is TTL/cache-aware: fresh descriptions cost no
-            # browser action. Pace only around actual fetches.
+                return "skipped"
+            # fetch_detail is TTL/cache-aware: fresh descriptions cost
+            # no browser action. Pace only around actual fetches.
             fetched = await sources.source.fetch_detail(job_id)
             if fetched.get("refetched"):
                 await sources.page_delay()
@@ -92,9 +93,15 @@ async def run_pipeline(run_id: int) -> dict:
             requirements = await normalize_job(job_id)
             result = score_job(requirements, profile, user_years=user_years)
             if profile_stale():  # the awaits above may have raced a confirm
-                stopped = "stale_profile"
-                log.info("scoring run %s stopped: profile changed mid-job", run_id)
-                break
+                return "stale_profile"
+            fresh = db.get_job(job_id)
+            if fresh.get("description_hash") != current.get("description_hash"):
+                # JD refreshed mid-normalization: a score stamped with
+                # the old hash would be invisible to the UI yet count as
+                # pending forever. Recompute from the new text.
+                log.info("job %s description moved mid-normalize; reprocessing",
+                         job_id)
+                continue
             db.save_score(
                 job_id,
                 current["description_hash"],
@@ -102,29 +109,53 @@ async def run_pipeline(run_id: int) -> dict:
                 result["deterministic_score"],
                 result["breakdown"],
             )
-            scored += 1
-            broker.publish(
-                "scoring",
-                {"run_id": run_id, "done": scored + skipped, "total": total},
-            )
+            return "scored"
+        return "raced"
+
+    jobs = db.list_jobs(run_id)
+    total = len(jobs)
+    for job in jobs:
+        job_id = job["job_id"]
+        try:
+            outcome = await process_job(job_id)
+            if outcome == "scored":
+                scored += 1
+                broker.publish(
+                    "scoring",
+                    {"run_id": run_id, "done": scored + skipped, "total": total},
+                )
+            elif outcome == "skipped":
+                skipped += 1
+            elif outcome == "raced":
+                failed += 1  # bounded — the retry timer revisits it
+            else:  # stale_profile
+                stopped = "stale_profile"
+                log.info("scoring run %s stopped: profile changed mid-pass", run_id)
+                break
         except asyncio.CancelledError:
             raise
         except (sources.AuthRequired, sources.CaptchaStop) as exc:
-            stopped = "session"
+            stopped, detail = "session", str(exc)
             log.info("scoring run %s stopped: %s", run_id, exc)
             break
         except sources.DailyCapReached as exc:
-            stopped = "cap"
+            stopped, detail = "cap", str(exc)
             log.info("scoring run %s stopped at daily cap: %s", run_id, exc)
             break
         except llm.UsageExhausted as exc:
-            stopped = "usage"
+            stopped, detail = "usage", str(exc)
             log.info("scoring run %s stopped, usage exhausted: %s", run_id, exc)
             break
+        except (llm.AuthRequired, llm.ModelNotEntitled, llm.ConfigError) as exc:
+            # Human-actionable engine failures: retrying on a timer can't
+            # fix a missing login or bad config — surface instead.
+            stopped, detail = "engine_blocked", str(exc)
+            log.warning("scoring run %s blocked on engine: %s", run_id, exc)
+            break
         except llm.EngineError as exc:
-            # Auth/config/transient engine failures affect every job the
-            # same way — stopping beats repeating the failure ~100 times.
-            stopped = "engine"
+            # Transient engine trouble affects every job the same way —
+            # stopping beats repeating the failure ~100 times.
+            stopped, detail = "engine", str(exc)
             log.warning("scoring run %s stopped, engine error: %s", run_id, exc)
             break
         except Exception:  # noqa: BLE001 — isolate per-job failures
@@ -132,6 +163,6 @@ async def run_pipeline(run_id: int) -> dict:
             log.exception("scoring job %s failed; continuing", job_id)
 
     summary = {"scored": scored, "skipped": skipped, "failed": failed,
-               "stopped": stopped}
+               "stopped": stopped, "detail": detail}
     log.info("scoring run %s pass finished: %s", run_id, summary)
     return summary

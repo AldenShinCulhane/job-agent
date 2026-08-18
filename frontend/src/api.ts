@@ -185,7 +185,12 @@ export const api = {
   searchLatest: () => fetch('/api/search/latest').then(toJson<SearchRun>),
   jobs: () =>
     fetch('/api/jobs').then(
-      toJson<{ jobs: Job[]; run_id: number | null; scoring_pending: number }>,
+      toJson<{
+        jobs: Job[]
+        run_id: number | null
+        scoring_pending: number
+        scoring_stall: { reason: string; detail: string | null } | null
+      }>,
     ),
   jobDetail: (jobId: string) =>
     fetch(`/api/jobs/${jobId}/detail`, { method: 'POST' }).then(toJson<JobDetail>),

@@ -237,10 +237,10 @@ async def test_normalization_cached_by_jd_hash(test_db, monkeypatch):
     db.invalidate_derived("n1")
     db.save_job_detail("n1", "We need Rust now.", "hash-b")
     assert db.get_score("n1") is None
-    assert db.get_requirements("hash-a") is not None
+    assert db.get_requirements(norm.cache_key("hash-a")) is not None
     await norm.normalize_job("n1")
     assert calls == ["normalize", "normalize"]
-    assert test_db.get_requirements("hash-b") is not None
+    assert test_db.get_requirements(norm.cache_key("hash-b")) is not None
 
 
 async def test_detail_hash_change_invalidates_cascade(test_db):
@@ -345,7 +345,8 @@ async def test_pipeline_scores_run_idempotently(test_db, fake_source,
     assert pipeline.pending_count(run_id) == 2
 
     summary = await pipeline.run_pipeline(run_id)
-    assert summary == {"scored": 2, "skipped": 0, "failed": 0, "stopped": None}
+    assert summary == {"scored": 2, "skipped": 0, "failed": 0,
+                       "stopped": None, "detail": None}
     assert pipeline.pending_count(run_id) == 0
     assert fake_source == ["p1", "p2"]
     assert fake_normalize_llm == ["normalize", "normalize"]
@@ -355,7 +356,8 @@ async def test_pipeline_scores_run_idempotently(test_db, fake_source,
 
     # Second pass: everything cached — no fetches, no LLM, all skipped.
     summary = await pipeline.run_pipeline(run_id)
-    assert summary == {"scored": 0, "skipped": 2, "failed": 0, "stopped": None}
+    assert summary == {"scored": 0, "skipped": 2, "failed": 0,
+                       "stopped": None, "detail": None}
     assert fake_source == ["p1", "p2"]
     assert fake_normalize_llm == ["normalize", "normalize"]
 
@@ -446,8 +448,8 @@ async def test_maybe_resume_scoring_spawns_for_done_run(test_db, monkeypatch):
 def test_llm_rerank_never_overwrites_baseline(test_db):
     _seed_job()
     db.save_score("n1", "hash-a", 1, 77.5, {"skills": 90.0})
-    db.set_llm_rerank("n1", 84.0, 1)
-    db.set_explanation("n1", {"pitch": "solid fit"})
+    assert db.apply_rerank([("n1", "hash-a", 84.0, 1)], 1) is True
+    assert db.set_explanation("n1", {"pitch": "solid fit"}, 1, "hash-a") is True
     stored = db.get_score("n1")
     assert stored["deterministic_score"] == 77.5  # baseline untouched
     assert stored["llm_rerank"] == 84.0 and stored["llm_rank"] == 1
@@ -627,7 +629,8 @@ async def test_pipeline_worker_arms_bounded_retry(test_db, monkeypatch):
     delays = []
 
     async def fake_run(run_id):
-        return {"scored": 0, "skipped": 0, "failed": 0, "stopped": "engine"}
+        return {"scored": 0, "skipped": 0, "failed": 0, "stopped": "engine",
+                "detail": "engine hiccup"}
 
     def fake_arm(delay):
         delays.append(delay)
@@ -638,6 +641,149 @@ async def test_pipeline_worker_arms_bounded_retry(test_db, monkeypatch):
     for _ in range(routes._PIPELINE_MAX_RETRIES + 2):
         await routes._pipeline_worker(1)
     assert delays == [60.0, 120.0, 240.0]  # bounded backoff, then break
+    # The open circuit is user-visible, not just a log line.
+    assert routes._get_scoring_stall() == {
+        "reason": "retry_exhausted", "detail": "engine hiccup",
+    }
+
+
+async def test_pipeline_reprocesses_jd_refresh_during_normalization(
+    test_db, fake_source, monkeypatch
+):
+    """A forced detail refresh landing while normalization awaits must
+    not strand the job (old-hash score = invisible to the UI but counted
+    scored): the hash is re-read before the write and the job reruns
+    from the new text."""
+    from backend.core import llm
+    from backend.scoring import pipeline
+
+    _confirm_profile()
+    run_id = _seed_run(["p1"])
+    calls = []
+
+    async def mutating_structured(prompt, schema, task, system_prompt=""):
+        calls.append(task)
+        if len(calls) == 1:
+            # User force-refreshes the posting mid-normalization.
+            db.save_job_detail("p1", "Rewritten posting.", "hash-new")
+        return req(required_skills=["Python"])
+
+    monkeypatch.setattr(llm, "structured", mutating_structured)
+    summary = await pipeline.run_pipeline(run_id)
+    assert summary["scored"] == 1 and summary["failed"] == 0
+    assert calls == ["normalize", "normalize"]  # reprocessed once
+    assert db.get_score("p1")["jd_hash"] == "hash-new"  # stamped current
+    assert pipeline.pending_count(run_id) == 0  # no endless "Scoring…"
+
+
+async def test_pipeline_blocked_engine_is_typed(test_db, fake_source, monkeypatch):
+    from backend.core import llm
+    from backend.scoring import pipeline
+
+    _confirm_profile()
+    run_id = _seed_run(["p1", "p2"])
+
+    async def blocked_structured(prompt, schema, task, system_prompt=""):
+        raise llm.AuthRequired("Not logged in")
+
+    monkeypatch.setattr(llm, "structured", blocked_structured)
+    summary = await pipeline.run_pipeline(run_id)
+    assert summary["stopped"] == "engine_blocked"
+    assert "Not logged in" in summary["detail"]
+
+
+async def test_worker_persists_blocked_stall_without_timer(test_db, monkeypatch):
+    """Auth/config engine failures are human-actionable: persist the
+    reason, arm NO retry timer."""
+    from backend.api import routes
+    from backend.scoring import pipeline
+
+    armed = []
+
+    async def fake_run(run_id):
+        return {"scored": 0, "skipped": 0, "failed": 0,
+                "stopped": "engine_blocked", "detail": "Not logged in"}
+
+    monkeypatch.setattr(pipeline, "run_pipeline", fake_run)
+    monkeypatch.setattr(routes, "_arm_pipeline_retry", lambda d: armed.append(d))
+    monkeypatch.setattr(routes, "_pipeline_retry_attempts", 0)
+    await routes._pipeline_worker(1)
+    assert armed == []
+    assert routes._get_scoring_stall() == {
+        "reason": "engine_blocked", "detail": "Not logged in",
+    }
+
+
+async def test_probe_success_clears_stall_and_resumes(test_db, monkeypatch):
+    from backend.api import routes
+    from backend.core import llm
+
+    routes._set_scoring_stall("engine_blocked", "Not logged in")
+    monkeypatch.setattr(routes, "_pipeline_retry_attempts", 2)
+    resumed = []
+
+    async def fake_probe():
+        return "claude-fable-5"
+
+    monkeypatch.setattr(llm, "probe", fake_probe)
+    monkeypatch.setattr(routes, "_maybe_resume_scoring",
+                        lambda: resumed.append(True) or True)
+    result = await routes.probe_engine()
+    assert result["ok"] is True
+    assert routes._get_scoring_stall() is None
+    assert routes._pipeline_retry_attempts == 0
+    assert resumed == [True]
+
+
+async def test_explain_mid_call_mutation_refused(test_db, monkeypatch):
+    """A score row rewritten during the explanation call must not
+    receive the old-data explanation."""
+    from backend.core import llm
+    from backend.scoring import llm_layer
+
+    _confirm_profile()
+    version = db.latest_profile()[0]
+    _seed_job()
+    db.save_score("n1", "hash-a", version, 80.0,
+                  {"matched_skills": [], "missing_skills": []})
+
+    async def mutating_structured(prompt, schema, task, system_prompt=""):
+        # New profile confirmed + job re-scored while the LLM runs.
+        db.save_score("n1", "hash-a", version + 1, 91.0,
+                      {"matched_skills": [], "missing_skills": []})
+        return {"strengths": ["stale"], "gaps": [], "pitch": "stale"}
+
+    monkeypatch.setattr(llm, "structured", mutating_structured)
+    with pytest.raises(ValueError):
+        await llm_layer.explain_job("n1")
+    assert db.get_score("n1")["explanation"] is None  # newer row untouched
+
+
+async def test_rerank_mid_call_mutation_aborts_cluster(test_db, monkeypatch):
+    """One cluster row moving during the rerank call aborts the whole
+    cluster atomically — zero writes, including to unmoved rows."""
+    from backend.core import llm
+    from backend.scoring import llm_layer
+
+    _confirm_profile()
+    run_id = _seed_run(["r1", "r2"])
+    for job_id in ("r1", "r2"):
+        db.save_job_detail(job_id, "d", f"h-{job_id}")
+        db.save_score(job_id, f"h-{job_id}", 1, 85.0,
+                      {"matched_skills": [], "missing_skills": []})
+
+    async def mutating_structured(prompt, schema, task, system_prompt=""):
+        # r1's posting is refreshed and re-scored under a new hash.
+        db.save_job_detail("r1", "changed", "h-changed")
+        db.save_score("r1", "h-changed", 1, 70.0,
+                      {"matched_skills": [], "missing_skills": []})
+        return {"ordered_job_ids": ["r1", "r2"]}
+
+    monkeypatch.setattr(llm, "structured", mutating_structured)
+    with pytest.raises(ValueError):
+        await llm_layer.rerank_close_matches(run_id)
+    assert db.get_score("r1")["llm_rank"] is None
+    assert db.get_score("r2")["llm_rank"] is None  # unmoved row also untouched
 
 
 async def test_spawn_pipeline_recycles_on_profile_change(test_db, monkeypatch):

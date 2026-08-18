@@ -12,6 +12,10 @@ from backend.core import db, llm
 
 log = logging.getLogger(__name__)
 
+# Part of the cache identity: bump whenever the prompt or schema changes
+# meaning, so old extractions aren't served for the new contract.
+SCHEMA_VERSION = 1
+
 # The scorer compares levels numerically; extraction normalizes free-text
 # education requirements onto this fixed scale (or null when unstated).
 EDUCATION_LEVELS = ("associate", "bachelor", "master", "doctorate")
@@ -93,17 +97,24 @@ def _prompt(job: dict) -> str:
     )
 
 
+def cache_key(jd_hash: str) -> str:
+    """Cache identity = extraction contract version + description hash:
+    a prompt/schema change must not serve structurally old extractions."""
+    return f"v{SCHEMA_VERSION}:{jd_hash}"
+
+
 async def normalize_job(job_id: str) -> dict:
     """Return the normalized requirements for a job's description. The
-    cache is content-addressed by JD hash — two postings with the same
-    description share one extraction, and a description never pays for
-    extraction twice."""
+    cache is content-addressed by (schema version, JD hash) — two
+    postings with the same description share one extraction, and a
+    description never pays for extraction twice."""
     job = db.get_job(job_id)
     if job is None:
         raise KeyError(f"unknown job {job_id}")
     if not job.get("description") or not job.get("description_hash"):
         raise ValueError(f"job {job_id} has no cached description to normalize")
-    cached = db.get_requirements(job["description_hash"])
+    key = cache_key(job["description_hash"])
+    cached = db.get_requirements(key)
     if cached is not None:
         return cached
     requirements = await llm.structured(
@@ -112,6 +123,6 @@ async def normalize_job(job_id: str) -> dict:
         task="normalize",
         system_prompt=_SYSTEM_PROMPT,
     )
-    db.save_requirements(job["description_hash"], requirements)
+    db.save_requirements(key, requirements)
     log.info("job %s normalized (hash %s)", job_id, job["description_hash"])
     return requirements

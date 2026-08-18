@@ -53,6 +53,10 @@ export default function Search() {
   const [run, setRun] = useState<SearchRun | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
   const [scoringPending, setScoringPending] = useState(0)
+  const [scoringStall, setScoringStall] = useState<{
+    reason: string
+    detail: string | null
+  } | null>(null)
   const [expanded, setExpanded] = useState<string | null>(null)
   const [busyDetail, setBusyDetail] = useState<string | null>(null)
   const [busyExplain, setBusyExplain] = useState<string | null>(null)
@@ -83,6 +87,7 @@ export default function Search() {
       setRun(latest.id === null ? null : latest)
       setJobs(jobList.jobs)
       setScoringPending(jobList.scoring_pending ?? 0)
+      setScoringStall(jobList.scoring_stall ?? null)
     } catch (e) {
       setError(String(e))
     }
@@ -106,7 +111,7 @@ export default function Search() {
   // recovery) so the UI catches the backend's automatic restart.
   const fastPoll =
     run?.status === 'running' ||
-    (run?.status === 'done' && scoringPending > 0) || // pipeline working
+    (run?.status === 'done' && scoringPending > 0 && !scoringStall) || // pipeline working
     linkedin?.state === 'connecting' ||
     linkedin?.state === 'logged_out' ||
     linkedin?.state === 'captcha_stop'
@@ -114,7 +119,8 @@ export default function Search() {
     !fastPoll &&
     (run?.status === 'stopped_cap' ||
       run?.status === 'stopped_auth' ||
-      run?.status === 'stopped_captcha')
+      run?.status === 'stopped_captcha' ||
+      (scoringPending > 0 && scoringStall !== null)) // stalled — watch lazily
   useEffect(() => {
     if (!fastPoll && !slowPoll) return
     const timer = setInterval(refresh, fastPoll ? 2500 : 30000)
@@ -391,9 +397,19 @@ export default function Search() {
             {visibleJobs.length !== jobs.length ? ` of ${jobs.length}` : ''})
           </h2>
           <div className="flex flex-wrap items-center gap-3 text-sm">
-            {scoringPending > 0 && (
+            {scoringPending > 0 && !scoringStall && (
               <span className="rounded-full bg-sky-100 px-3 py-1 text-xs font-medium text-sky-800">
                 Scoring… {jobs.length - scoringPending}/{jobs.length}
+              </span>
+            )}
+            {scoringPending > 0 && scoringStall && (
+              <span
+                className="rounded-full bg-amber-100 px-3 py-1 text-xs font-medium text-amber-800"
+                title={scoringStall.detail ?? undefined}
+              >
+                {scoringStall.reason === 'engine_blocked'
+                  ? 'Scoring paused — Claude engine needs attention (see Status)'
+                  : 'Scoring paused — automatic retries exhausted'}
               </span>
             )}
             {selected.size > 0 && (

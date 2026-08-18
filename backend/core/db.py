@@ -431,26 +431,48 @@ def save_score(
         )
 
 
-def set_llm_rerank(job_id: str, rerank: float | None, rank: int | None) -> None:
-    """LLM layer only — never touches the deterministic baseline. `rank`
-    is the 1-based cluster ordinal, which survives even when every
-    cluster score is identical (rerank values alone would tie)."""
-    with _connect() as conn:
-        conn.execute(
-            "UPDATE job_scores SET llm_rerank = ?, llm_rank = ? WHERE job_id = ?",
-            (rerank, rank, job_id),
-        )
-
-
-def set_explanation(job_id: str, explanation: dict | None) -> None:
-    """LLM layer only — never touches the deterministic baseline."""
+def set_explanation(job_id: str, explanation: dict | None,
+                    profile_version: int, jd_hash: str) -> bool:
+    """LLM layer only — never touches the deterministic baseline.
+    Conditional: writes only if the score row still belongs to the
+    (profile_version, jd_hash) the explanation was generated for — a
+    row rewritten during the LLM call is left alone. Returns whether
+    the write landed."""
     import json
 
     with _connect() as conn:
-        conn.execute(
-            "UPDATE job_scores SET explanation_json = ? WHERE job_id = ?",
-            (json.dumps(explanation) if explanation is not None else None, job_id),
+        cursor = conn.execute(
+            "UPDATE job_scores SET explanation_json = ? "
+            "WHERE job_id = ? AND profile_version = ? AND jd_hash = ?",
+            (json.dumps(explanation) if explanation is not None else None,
+             job_id, profile_version, jd_hash),
         )
+        return cursor.rowcount > 0
+
+
+def apply_rerank(writes: list[tuple[str, str, float, int]],
+                 profile_version: int) -> bool:
+    """Atomically apply a rerank pass: `writes` is
+    [(job_id, jd_hash, rerank, rank)]. Every target row must still match
+    (profile_version, jd_hash) — one moved row (profile confirmed or JD
+    refreshed during the LLM call) aborts the whole cluster with zero
+    writes. Returns whether the cluster was applied."""
+    with _connect() as conn:
+        for job_id, jd_hash, _, _ in writes:
+            row = conn.execute(
+                "SELECT 1 FROM job_scores WHERE job_id = ? "
+                "AND profile_version = ? AND jd_hash = ?",
+                (job_id, profile_version, jd_hash),
+            ).fetchone()
+            if row is None:
+                return False
+        for job_id, jd_hash, rerank, rank in writes:
+            conn.execute(
+                "UPDATE job_scores SET llm_rerank = ?, llm_rank = ? "
+                "WHERE job_id = ? AND profile_version = ? AND jd_hash = ?",
+                (rerank, rank, job_id, profile_version, jd_hash),
+            )
+    return True
 
 
 def scoring_pending(run_id: int, profile_version: int) -> int:

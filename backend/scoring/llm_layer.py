@@ -10,6 +10,7 @@ own score range, and the deterministic baseline is never overwritten
 import logging
 
 from backend.core import db, llm
+from backend.normalize.requirements import cache_key
 from backend.scoring.pipeline import confirmed_profile
 from backend.scoring.score import flatten_profile_skills, profile_years_experience
 
@@ -98,7 +99,7 @@ async def explain_job(job_id: str) -> dict:
         raise ValueError(f"job {job_id} is not scored for the current profile yet")
     if score["explanation"] is not None:
         return score["explanation"]
-    requirements = db.get_requirements(job["description_hash"])
+    requirements = db.get_requirements(cache_key(job["description_hash"]))
     prompt = (
         "Explain this candidate-job fit: concrete strengths, concrete "
         "gaps, and a one-line pitch the candidate could lead with.\n\n"
@@ -108,7 +109,13 @@ async def explain_job(job_id: str) -> dict:
     explanation = await llm.structured(
         prompt, EXPLAIN_SCHEMA, task="score_explain", system_prompt=_SYSTEM_PROMPT
     )
-    db.set_explanation(job_id, explanation)
+    # Conditional write: if the score row moved during the LLM call (new
+    # profile confirmed, JD refreshed), this explanation describes data
+    # that no longer exists — refuse rather than attach it to the newer
+    # score.
+    if not db.set_explanation(job_id, explanation, version,
+                              job["description_hash"]):
+        raise ValueError(f"job {job_id} was re-scored during explanation; retry")
     return explanation
 
 
@@ -135,7 +142,7 @@ async def rerank_close_matches(run_id: int, band: float = RERANK_BAND) -> dict:
     summaries = []
     for job in cluster:
         score = db.get_score(job["job_id"])
-        requirements = db.get_requirements(job["description_hash"])
+        requirements = db.get_requirements(cache_key(job["description_hash"]))
         summaries.append(_job_summary(job, score, requirements))
     prompt = (
         "These jobs scored within a few points of each other — too close "
@@ -149,13 +156,21 @@ async def rerank_close_matches(run_id: int, band: float = RERANK_BAND) -> dict:
         prompt, RERANK_SCHEMA, task="score_explain", system_prompt=_SYSTEM_PROMPT
     )
     ordered = result["ordered_job_ids"]
-    expected = {j["job_id"] for j in cluster}
-    if set(ordered) != expected or len(ordered) != len(expected):
+    by_id = {j["job_id"]: j for j in cluster}
+    if set(ordered) != set(by_id) or len(ordered) != len(by_id):
         raise ValueError("rerank did not return each cluster job exactly once")
     hi = max(j["deterministic_score"] for j in cluster)
     lo = min(j["deterministic_score"] for j in cluster)
     step = (hi - lo) / (len(ordered) - 1)
-    for position, job_id in enumerate(ordered):
-        db.set_llm_rerank(job_id, round(hi - position * step, 2), position + 1)
+    # Atomic cluster write, conditional on every row still matching the
+    # (version, hash) it was ranked under — one job re-scored during the
+    # LLM call aborts the whole pass with zero writes.
+    writes = [
+        (job_id, by_id[job_id]["description_hash"],
+         round(hi - position * step, 2), position + 1)
+        for position, job_id in enumerate(ordered)
+    ]
+    if not db.apply_rerank(writes, version):
+        raise ValueError("scores changed during rerank; nothing was written")
     log.info("reranked %d close matches in run %s", len(ordered), run_id)
     return {"reranked": len(ordered), "ordered_job_ids": ordered}
