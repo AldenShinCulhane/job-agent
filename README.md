@@ -105,6 +105,13 @@ practical, the app:
 If that risk isn't acceptable to you, don't use the LinkedIn integration.
 The job-source layer is a small interface, so other sources can be added.
 
+**Sign in with your LinkedIn email and password.** Google refuses its own
+sign-in inside automated browsers ("This browser or app may not be
+secure"), so "Continue with Google" will not work in the window the app
+opens — and the app will never try to disguise the browser to get around
+that. If your LinkedIn account only has Google sign-in, set a password
+first (LinkedIn Settings → Sign in & security).
+
 ## How tailoring stays honest
 
 Every fact in your confirmed resume gets a stable source ID. Tailored

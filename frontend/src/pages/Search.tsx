@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
+import type { KeyboardEvent } from 'react'
 import { api } from '../api'
 import type { Job, LinkedInStatus, SearchRun } from '../api'
 
@@ -36,6 +37,17 @@ const EXPERIENCE_OPTIONS = [
   { id: 'executive', label: 'Executive' },
 ] as const
 
+// Tab on an empty field accepts its placeholder suggestion; focus stays
+// put so the accepted value is visible, and the next Tab moves on.
+const acceptPlaceholderOnTab =
+  (setter: (value: string) => void) => (e: KeyboardEvent<HTMLInputElement>) => {
+    const el = e.currentTarget
+    if (e.key === 'Tab' && !e.shiftKey && el.value === '' && el.placeholder) {
+      e.preventDefault()
+      setter(el.placeholder)
+    }
+  }
+
 export default function Search() {
   const [linkedin, setLinkedin] = useState<LinkedInStatus | null>(null)
   const [run, setRun] = useState<SearchRun | null>(null)
@@ -43,6 +55,7 @@ export default function Search() {
   const [expanded, setExpanded] = useState<string | null>(null)
   const [busyDetail, setBusyDetail] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [profileLocation, setProfileLocation] = useState<string | null>(null)
 
   const [keywords, setKeywords] = useState('')
   const [location, setLocation] = useState('')
@@ -69,6 +82,15 @@ export default function Search() {
   useEffect(() => {
     refresh()
   }, [refresh])
+
+  // The location suggestion comes from the confirmed profile's contact
+  // block; fetched once — the profile doesn't change on this page.
+  useEffect(() => {
+    api
+      .getProfile()
+      .then((p) => setProfileLocation(p.profile?.contact.location ?? null))
+      .catch(() => {})
+  }, [])
 
   // Fast poll while a run is active or the session is mid-transition;
   // slow poll while a stop will self-resume (cap reset, auth/captcha
@@ -168,6 +190,8 @@ export default function Search() {
         {linkedin?.detail && <p className="mt-2 text-sm text-amber-700">{linkedin.detail}</p>}
         <p className="mt-2 text-xs text-slate-400">
           A real browser window opens for sign-in; your session stays on this machine.
+          Sign in with your LinkedIn email and password — Google blocks its sign-in
+          inside automated browsers, so "Continue with Google" won't work here.
           Automated collection is paced but still against LinkedIn's terms — account
           restriction is a risk you accept (see README).
         </p>
@@ -178,11 +202,23 @@ export default function Search() {
         <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
           <label className="col-span-2 block">
             <span className={labelCls}>Keywords</span>
-            <input className={inputCls} value={keywords} onChange={(e) => setKeywords(e.target.value)} placeholder="software engineer" />
+            <input
+              className={inputCls}
+              value={keywords}
+              onChange={(e) => setKeywords(e.target.value)}
+              onKeyDown={acceptPlaceholderOnTab(setKeywords)}
+              placeholder="software engineer"
+            />
           </label>
           <label className="block">
             <span className={labelCls}>Location</span>
-            <input className={inputCls} value={location} onChange={(e) => setLocation(e.target.value)} placeholder="Toronto, ON" />
+            <input
+              className={inputCls}
+              value={location}
+              onChange={(e) => setLocation(e.target.value)}
+              onKeyDown={acceptPlaceholderOnTab(setLocation)}
+              placeholder={profileLocation ?? 'Toronto, ON'}
+            />
           </label>
           <label className="block">
             <span className={labelCls}>Posted within</span>
