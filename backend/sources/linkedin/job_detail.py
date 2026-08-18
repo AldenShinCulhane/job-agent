@@ -10,6 +10,8 @@ import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 
+from bs4 import Comment
+
 from backend.core import db
 from backend.sources.linkedin import selectors
 
@@ -45,7 +47,10 @@ def parse_detail(html: str) -> str:
     # Selector-free fallback: LinkedIn's classes are obfuscated and churn,
     # but the description section is headed "About the job". Climb from
     # that anchor to the first ancestor with substantial text.
-    anchor = soup.find(string=lambda s: s and "About the job" in s)
+    anchor = soup.find(
+        # Real text only — bs4 string search also matches HTML comments.
+        string=lambda s: s and "About the job" in s and not isinstance(s, Comment)
+    )
     if anchor is not None:
         el = anchor.parent
         while el is not None and el.name not in ("body", "html", "[document]"):
