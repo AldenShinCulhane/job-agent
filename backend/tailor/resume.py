@@ -14,8 +14,10 @@ from backend.core import llm
 
 # Recorded in package provenance; bump when the prompt or schema changes
 # in a way that makes previously generated packages non-comparable.
-PROMPT_VERSION = 1
-SCHEMA_VERSION = 1
+# v2: cover-letter closing became application-owned (removed from the
+# schema so no unvalidated LLM text can reach the rendered PDF).
+PROMPT_VERSION = 2
+SCHEMA_VERSION = 2
 
 # Keep prompts bounded: descriptions beyond this are truncated with a
 # marker (the requirements extraction already captured the essentials).
@@ -98,14 +100,15 @@ TAILOR_SCHEMA = {
         "skills_order": {"type": "array", "items": {"type": "string"}},
         "experiences": _ENTRY_BULLETS,
         "projects": _ENTRY_BULLETS,
+        # The closing/signature is application-owned (cover.CLOSING) —
+        # every LLM-authored string in the letter is a validated claim.
         "cover_letter": {
             "type": "object",
             "additionalProperties": False,
-            "required": ["paragraphs", "closing"],
+            "required": ["paragraphs"],
             "properties": {
                 "paragraphs": {"type": "array", "items": _PARAGRAPH,
                                "minItems": 2, "maxItems": 5},
-                "closing": {"type": "string", "minLength": 1},
             },
         },
     },
@@ -153,9 +156,9 @@ Resume rules:
 - Keep the candidate's voice factual and specific; no buzzword padding.
 
 Cover letter rules:
-- 2-4 short paragraphs plus a closing (e.g. "Sincerely,"). It must fit
-  one page. Do not include contact details, date, or greeting — the
-  application renders those.
+- 2-4 short paragraphs. It must fit one page. Do not include contact
+  details, date, greeting, or a closing/signature — the application
+  renders those.
 - Factual claims cite source_ids exactly like resume bullets; sentences
   of pure motivation/interest may have empty source_ids.
 - Specific to this company and role; never generic boilerplate.""",

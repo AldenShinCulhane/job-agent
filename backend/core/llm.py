@@ -99,7 +99,9 @@ def _classify(error_text: str) -> type[EngineError]:
     return TransientFailure
 
 
-def _effective_effort(task: str) -> str:
+def effective_effort(task: str) -> str:
+    """The effort tier a task actually runs at (public: recorded in
+    package provenance), with the max→xhigh cap applied."""
     effort = TASK_EFFORT[task]
     if effort == "max" and not ALLOW_MAX_EFFORT:
         return "xhigh"
@@ -319,7 +321,7 @@ async def structured(
     if _semaphore is None:
         _semaphore = asyncio.Semaphore(MAX_CONCURRENT_CALLS)
 
-    options = _options(model, _effective_effort(task), system_prompt, schema)
+    options = _options(model, effective_effort(task), system_prompt, schema)
     async with _semaphore:
         try:
             result = await _run_with_retry(prompt, options)

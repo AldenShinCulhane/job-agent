@@ -9,6 +9,10 @@ in Layout with the proven template's values as defaults.
 import re
 from dataclasses import dataclass
 
+# Recorded in package provenance; bump when this deterministic
+# transformation changes the rendered output.
+TEMPLATE_VERSION = 1
+
 # Typographic normalization applied before escaping. pdfLaTeX (2018+) and
 # Tectonic both take UTF-8, but consistent ASCII punctuation renders
 # identically on both engines.

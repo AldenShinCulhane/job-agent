@@ -237,43 +237,57 @@ _PIPELINE_MAX_RETRIES = 3
 # suppressed across restarts — the circuit breaker is enforced, not just
 # remembered — while a stall for a superseded run/profile is obsolete
 # and cleared. Cleared on progress and on a live engine probe.
+# The package batch persists the same engine_blocked stall shape under
+# its own key: both are served by the same recovery loop, and a
+# successful probe from either side recovers both.
 _SCORING_STALL_KEY = "scoring_stall"
+_PACKAGE_STALL_KEY = "package_stall"
 
 
-def _set_scoring_stall(reason: str, detail: str | None,
-                       run_id: int, profile_version: int) -> str:
-    """Persist a stall with its recovery schedule. `token` is the stall's
-    identity: the recovery loop acts only on the exact stall it was armed
-    for, so a stale timer can never clear a replacement stall.
+def _stall_schedule(reason: str) -> dict:
+    """Fresh recovery bookkeeping for a stall payload. `token` is the
+    stall's identity: the recovery loop acts only on the exact stall it
+    was armed for, so a stale timer can never clear a replacement stall.
     `next_attempt_at`/`backoff_s` persist the schedule — after a restart
     the loop sleeps only the remaining time, never a fresh full interval."""
     if reason == "engine_blocked":
         delay = _STALL_AUTH_POLL_S + random.uniform(5, 30)
     else:
         delay = _STALL_RETRY_COOLDOWN_S + random.uniform(30, 120)
-    token = uuid.uuid4().hex
-    db.set_state(
-        _SCORING_STALL_KEY,
-        json.dumps({"reason": reason, "detail": detail,
-                    "run_id": run_id, "profile_version": profile_version,
-                    "token": token,
-                    "next_attempt_at": time.time() + delay,
-                    "backoff_s": _STALL_AUTH_POLL_S}),
-    )
-    return token
+    return {"token": uuid.uuid4().hex,
+            "next_attempt_at": time.time() + delay,
+            "backoff_s": _STALL_AUTH_POLL_S}
+
+
+def _set_scoring_stall(reason: str, detail: str | None,
+                       run_id: int, profile_version: int) -> str:
+    payload = {"reason": reason, "detail": detail, "run_id": run_id,
+               "profile_version": profile_version, **_stall_schedule(reason)}
+    db.set_state(_SCORING_STALL_KEY, json.dumps(payload))
+    return payload["token"]
+
+
+def _set_package_stall(detail: str | None) -> str:
+    """Package batches only ever stall on engine problems — usage waits
+    have their own timer and other failures are isolated per package."""
+    payload = {"reason": "engine_blocked", "detail": detail,
+               **_stall_schedule("engine_blocked")}
+    db.set_state(_PACKAGE_STALL_KEY, json.dumps(payload))
+    return payload["token"]
 
 
 def _update_stall_schedule(token: str, *, next_attempt_at: float,
-                           backoff_s: float | None = None) -> bool:
+                           backoff_s: float | None = None,
+                           key: str = _SCORING_STALL_KEY) -> bool:
     """Reschedule the stall's next automatic attempt — only if it is
     still the same stall the caller was working on."""
-    stall = _get_scoring_stall()
+    stall = _read_stall(key)
     if stall is None or stall.get("token") != token:
         return False
     stall["next_attempt_at"] = next_attempt_at
     if backoff_s is not None:
         stall["backoff_s"] = backoff_s
-    db.set_state(_SCORING_STALL_KEY, json.dumps(stall))
+    db.set_state(key, json.dumps(stall))
     return True
 
 
@@ -281,14 +295,22 @@ def _clear_scoring_stall() -> None:
     db.delete_state(_SCORING_STALL_KEY)
 
 
-def _get_scoring_stall() -> dict | None:
-    raw = db.get_state(_SCORING_STALL_KEY)
+def _clear_package_stall() -> None:
+    db.delete_state(_PACKAGE_STALL_KEY)
+
+
+def _read_stall(key: str) -> dict | None:
+    raw = db.get_state(key)
     if not raw:
         return None
     try:
         return json.loads(raw)
     except ValueError:
         return None
+
+
+def _get_scoring_stall() -> dict | None:
+    return _read_stall(_SCORING_STALL_KEY)
 
 
 def _spawn_pipeline(run_id: int) -> bool:
@@ -365,17 +387,21 @@ async def _pipeline_worker(run_id: int, profile_version: int) -> None:
             )
     elif stopped is None and scoring_pipeline.pending_count(run_id) == 0:
         _clear_scoring_stall()  # fully scored — nothing left to report
+        # Scoring just finished deriving requirements/scores — packages
+        # created before that were waiting on exactly these inputs.
+        _maybe_resume_packages()
     # session/stale_profile stops are owned by connect recovery and the
     # profile-confirm trigger respectively — no timer here.
 
 
 def _on_engine_recovered() -> None:
     """A successful probe/reprobe proves the LLM engine works again:
-    drop the stall banner, reset the circuit breaker, resume scoring —
+    drop both stall banners, reset the circuit breaker, resume scoring —
     and any package batch that was parked on an engine problem."""
     global _pipeline_retry_attempts
     _pipeline_retry_attempts = 0
     _clear_scoring_stall()
+    _clear_package_stall()
     _maybe_resume_scoring()
     _maybe_resume_packages()
 
@@ -391,8 +417,13 @@ def _on_engine_recovered() -> None:
 # and goes inert the moment that stall is cleared or replaced. The user
 # can always shortcut both with POST /search/retry-scoring (no gate —
 # it's error recovery).
+# The package stall (engine_blocked only) is served by the same loop
+# under its own key and task slot, so each queue's recovery is owned
+# independently but recovers through the same probe.
 _stall_recovery_task: asyncio.Task | None = None
 _stall_recovery_token: str | None = None
+_package_stall_task: asyncio.Task | None = None
+_package_stall_token: str | None = None
 _STALL_AUTH_POLL_S = 300.0
 _STALL_RETRY_COOLDOWN_S = 3600.0
 
@@ -414,24 +445,40 @@ def _arm_stall_recovery() -> None:
     _stall_recovery_task = asyncio.create_task(_stall_recovery_loop(token))
 
 
-def _stall_if_still(token: str) -> dict | None:
+def _arm_package_stall_recovery() -> None:
+    global _package_stall_task, _package_stall_token
+    stall = _read_stall(_PACKAGE_STALL_KEY)
+    if stall is None:
+        return
+    token = stall.get("token")
+    if _package_stall_task is not None and not _package_stall_task.done():
+        if _package_stall_token == token:
+            return
+        _package_stall_task.cancel()
+    _package_stall_token = token
+    _package_stall_task = asyncio.create_task(
+        _stall_recovery_loop(token, key=_PACKAGE_STALL_KEY))
+
+
+def _stall_if_still(token: str, key: str = _SCORING_STALL_KEY) -> dict | None:
     """The persisted stall, but only while it is still the one this
     recovery pass owns — None means resolved or replaced, stop."""
-    stall = _get_scoring_stall()
+    stall = _read_stall(key)
     if stall is None or stall.get("token") != token:
         return None
     return stall
 
 
-async def _stall_recovery_loop(token: str) -> None:
+async def _stall_recovery_loop(token: str,
+                               key: str = _SCORING_STALL_KEY) -> None:
     while True:
-        stall = _stall_if_still(token)
+        stall = _stall_if_still(token, key)
         if stall is None:
             return
         remaining = float(stall.get("next_attempt_at", 0.0)) - time.time()
         if remaining > 0:
             await asyncio.sleep(remaining)
-            stall = _stall_if_still(token)
+            stall = _stall_if_still(token, key)
             if stall is None:
                 return
         backoff = float(stall.get("backoff_s", _STALL_AUTH_POLL_S))
@@ -450,9 +497,10 @@ async def _stall_recovery_loop(token: str) -> None:
                     token,
                     next_attempt_at=time.time() + backoff + random.uniform(5, 30),
                     backoff_s=backoff,
+                    key=key,
                 )
                 continue
-            if _stall_if_still(token) is None:
+            if _stall_if_still(token, key) is None:
                 return
             if problem is not None:
                 # Still logged out / wrong auth — keep polling on the
@@ -461,6 +509,7 @@ async def _stall_recovery_loop(token: str) -> None:
                     token,
                     next_attempt_at=(time.time() + _STALL_AUTH_POLL_S
                                      + random.uniform(5, 30)),
+                    key=key,
                 )
                 continue
             # Auth looks healthy: one live reprobe proves it (or doesn't —
@@ -477,9 +526,10 @@ async def _stall_recovery_loop(token: str) -> None:
                     token,
                     next_attempt_at=time.time() + backoff + random.uniform(5, 30),
                     backoff_s=backoff,
+                    key=key,
                 )
                 continue
-            if _stall_if_still(token) is None:
+            if _stall_if_still(token, key) is None:
                 # Replaced while probing — the newer stall owns recovery.
                 return
             _on_engine_recovered()
@@ -539,6 +589,7 @@ def _maybe_resume_scoring() -> bool:
 
 _package_worker_task: asyncio.Task | None = None
 _package_retry_task: asyncio.Task | None = None
+_PACKAGE_INPUTS_POLL_S = 300.0
 
 
 def _spawn_package_worker() -> bool:
@@ -563,11 +614,23 @@ async def _package_batch_worker() -> None:
         return
     if outcome == "waiting_usage":
         _arm_package_retry(max(llm.seconds_until_retry(), 60.0))
+    elif outcome == "engine_blocked":
+        # Give the parked queue an autonomous recovery owner: persist an
+        # engine stall and arm its recovery loop, exactly like scoring —
+        # otherwise, with scoring already finished, nothing would ever
+        # trigger the probe that resumes these packages.
+        detail = next((p["error"] for p in db.packages_to_resume()
+                       if p["error"]), None)
+        _set_package_stall(detail)
+        _arm_package_stall_recovery()
+    elif outcome == "waiting_inputs":
+        # Queued behind scoring. Its completion resumes packages; this
+        # timer is the fallback in case that trigger is missed (cheap —
+        # a not-ready pass spends zero LLM).
+        _arm_package_retry(_PACKAGE_INPUTS_POLL_S)
     elif outcome == "idle" and db.packages_to_resume():
         # A selection landed in the gap between the final queue check and
-        # task exit — run again rather than strand it. engine_blocked is
-        # deliberately NOT respawned here: its packages sit 'queued' until
-        # engine recovery, and an immediate respawn would hot-loop.
+        # task exit — run again rather than strand it.
         _maybe_resume_packages()
 
 
@@ -586,6 +649,11 @@ async def _package_retry_after(delay: float) -> None:
 
 
 def _maybe_resume_packages() -> bool:
+    """Kick the package batch when resumable rows exist. A persisted
+    package stall keeps the circuit open — the batch would only re-hit
+    the broken engine; recovery (probe/reprobe) clears it and resumes."""
+    if _read_stall(_PACKAGE_STALL_KEY) is not None:
+        return False
     if not db.packages_to_resume():
         return False
     return _spawn_package_worker()
@@ -739,8 +807,9 @@ def recover_search_runs() -> list[int]:
     # A stall persisted from a previous process must not dead-end:
     # restart its recovery loop before ANY early return — a captcha stop
     # must not silently swallow engine recovery (they can stack). No-op
-    # when there is no stall.
+    # when there is no stall. The package stall gets the same treatment.
     _arm_stall_recovery()
+    _arm_package_stall_recovery()
     if sources.source.current_state() == "captcha_stop":
         log.info("captcha stop persisted — deferring search recovery until resolved")
         return []
@@ -768,6 +837,7 @@ async def shutdown_background_tasks() -> None:
         for t in [_connect_task, _cap_retry_task, _pipeline_task,
                   _pipeline_retry_task, _stall_recovery_task,
                   _package_worker_task, _package_retry_task,
+                  _package_stall_task,
                   *_search_tasks.values()]
         # Completed tasks may belong to a previous event loop (an earlier
         # lifespan in the same process); awaiting them there raises.
@@ -944,14 +1014,19 @@ async def packages_generate(body: dict):
                        "wait for scoring or open its details first.",
             )
         jobs.append(job)
+    # The page limit is read ONCE here and pinned into each package's
+    # identity — generation and fitting use only the pinned value, and a
+    # later settings change makes a future selection a new package
+    # instead of silently returning this one.
+    limit = tailor_pipeline.resume_page_limit()
     created = 0
     package_ids = []
     for job in jobs:
         package_id, was_created = db.create_package(
-            job["job_id"], version, job["description_hash"])
+            job["job_id"], version, job["description_hash"], limit)
         package_ids.append(package_id)
         created += int(was_created)
-    _spawn_package_worker()
+    _maybe_resume_packages()
     return {"package_ids": package_ids, "created": created}
 
 

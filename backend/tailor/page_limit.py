@@ -132,6 +132,33 @@ class FitResult:
     trimmed: list[str]
 
 
+# --- Persisted-fit recompiles (restart path, PLAN.md §4.6) -------------------
+# A completed fit persists {tailored, layout, trimmed} in stage_json;
+# these rebuild the PDF from exactly that state — pure template render +
+# local compile, zero LLM — so a restart after fitting never repeats the
+# condense/entailment spend.
+
+def fit_state(fit: FitResult) -> dict:
+    from dataclasses import asdict
+
+    return {"tailored": fit.tailored, "layout": asdict(fit.layout),
+            "trimmed": fit.trimmed}
+
+
+def compile_resume_state(state: dict, profile: dict,
+                         workdir: Path) -> latex.CompileResult:
+    layout = template.Layout(**state["layout"])
+    return _compile_resume(state["tailored"], profile, layout, workdir)
+
+
+def compile_cover_state(state: dict, profile: dict, job: dict,
+                        workdir: Path) -> latex.CompileResult:
+    layout = cover_mod.CoverLayout(**state["layout"])
+    letter = state["tailored"]["cover_letter"]
+    tex = cover_mod.render_cover(profile, job, letter["paragraphs"], layout)
+    return latex.compile_tex(tex, workdir, jobname="cover_letter")
+
+
 def _compile_resume(tailored: dict, profile: dict, layout: template.Layout,
                     workdir: Path) -> latex.CompileResult:
     merged = tailor_resume.tailored_profile(profile, tailored)
@@ -176,14 +203,25 @@ async def fit_resume(tailored: dict, profile: dict, ledger: dict,
             raise ValidationFailed(failures)
         result = _compile_resume(tailored, profile, layout, workdir)
 
-    if result.pages > 1 and last_page_fullness(result.pdf_path) < SPARSE_FULLNESS:
-        # One balance pass: the next unused ladder step, kept only if it
-        # actually helps (fewer pages, or the same).
-        ladder = resume_ladder(layout)
-        balanced_layout = ladder[0]
-        balanced = _compile_resume(tailored, profile, balanced_layout, workdir)
-        if balanced.pages <= result.pages:
-            layout, result = balanced_layout, balanced
+    if result.pages > 1:
+        fullness = last_page_fullness(result.pdf_path)
+        if fullness < SPARSE_FULLNESS:
+            # One balance pass: the next unused ladder step, kept only on
+            # MEASURED improvement — fewer pages, or the same page count
+            # with a fuller last page. Tightening spacing on an already
+            # sparse layout can make the last page emptier; that outcome
+            # is discarded, never shipped.
+            balanced_layout = resume_ladder(layout)[0]
+            balanced = _compile_resume(tailored, profile, balanced_layout,
+                                       workdir)
+            if balanced.pages < result.pages or (
+                    balanced.pages == result.pages
+                    and last_page_fullness(balanced.pdf_path) > fullness):
+                layout, result = balanced_layout, balanced
+            else:
+                # Restore the kept layout's PDF — the balanced compile
+                # overwrote it at the same path.
+                result = _compile_resume(tailored, profile, layout, workdir)
 
     return FitResult(result=result, layout=layout, tailored=tailored,
                      trimmed=trimmed)
@@ -192,15 +230,15 @@ async def fit_resume(tailored: dict, profile: dict, ledger: dict,
 # --- Cover fit ----------------------------------------------------------------
 
 # Same paragraph shape as the generation schema — condensing must keep
-# the citation discipline.
+# the citation discipline. (The closing is application-owned and not
+# part of any LLM schema.)
 _COVER_LETTER_SCHEMA = tailor_resume.TAILOR_SCHEMA["properties"]["cover_letter"]
 _CONDENSE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["paragraphs", "closing"],
+    "required": ["paragraphs"],
     "properties": {
         "paragraphs": _COVER_LETTER_SCHEMA["properties"]["paragraphs"],
-        "closing": {"type": "string", "minLength": 1},
     },
 }
 
@@ -222,7 +260,7 @@ async def fit_cover(tailored: dict, profile: dict, ledger: dict,
     def _compile(current_layout) -> latex.CompileResult:
         letter = tailored["cover_letter"]
         tex = cover_mod.render_cover(profile, job, letter["paragraphs"],
-                                     letter["closing"], current_layout)
+                                     current_layout)
         return latex.compile_tex(tex, workdir, jobname="cover_letter")
 
     result = _compile(layout)
@@ -240,7 +278,7 @@ async def fit_cover(tailored: dict, profile: dict, ledger: dict,
             f"{json.dumps(letter, indent=1)}\n\n"
             "# Valid source_ids\n"
             + "\n".join(f"- {fid}: {e['text']}" for fid, e in ledger.items())
-            + "\n\nReturn the shortened paragraphs and closing."
+            + "\n\nReturn the shortened paragraphs."
         )
         condensed = await llm.structured(prompt, _CONDENSE_SCHEMA,
                                          task="repair",

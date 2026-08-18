@@ -89,6 +89,7 @@ CREATE TABLE IF NOT EXISTS packages (
     job_id          TEXT NOT NULL,
     profile_version INTEGER NOT NULL,
     jd_hash         TEXT NOT NULL,
+    page_limit      INTEGER NOT NULL DEFAULT 1,
     status          TEXT NOT NULL DEFAULT 'queued',
     stage_json      TEXT,
     error           TEXT,
@@ -97,7 +98,7 @@ CREATE TABLE IF NOT EXISTS packages (
     output_dir      TEXT,
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL,
-    UNIQUE (job_id, profile_version, jd_hash)
+    UNIQUE (job_id, profile_version, jd_hash, page_limit)
 );
 """
 
@@ -116,6 +117,14 @@ def init() -> None:
     DATA_DIR.mkdir(mode=0o700, exist_ok=True)
     os.chmod(DATA_DIR, 0o700)  # mkdir mode is subject to umask; enforce
     with _connect() as conn:
+        # The page limit joined package identity (and its UNIQUE
+        # constraint) after the table first shipped on this branch;
+        # SQLite cannot widen a table constraint in place, and no
+        # released build ever wrote package rows — rebuild.
+        cols = {row[1] for row in
+                conn.execute("PRAGMA table_info(packages)").fetchall()}
+        if cols and "page_limit" not in cols:
+            conn.execute("DROP TABLE packages")
         conn.executescript(_SCHEMA)
         for statement in _MIGRATIONS:
             try:
@@ -657,17 +666,20 @@ def get_action_count(day: str) -> int:
 
 # --- Packages (tailoring state machine, PLAN.md §4.5/§4.6) ------------------
 # A package is keyed by exactly the inputs its documents were built from:
-# (job_id, profile_version, jd_hash). Re-selecting the same job with the
-# same inputs returns the existing row — a completed package is never
-# regenerated. A new profile version or an edited posting (hash change)
-# is a different package. `stage_json` persists per-stage intermediate
-# data (tailored JSON, validation verdicts) so a restart resumes at the
-# stage boundary instead of re-spending LLM calls; `provenance_json`
-# records what actually built the artifacts (PLAN.md §4.6).
+# (job_id, profile_version, jd_hash, page_limit). Re-selecting the same
+# job with the same inputs returns the existing row — a completed
+# package is never regenerated. A new profile version, an edited posting
+# (hash change), or a different page limit is a different package; the
+# limit is pinned at creation so a later settings change can never make
+# the generation prompt and the fitter disagree. `stage_json` persists
+# per-stage intermediate data (tailored JSON, validation verdicts,
+# fitted documents) so a restart resumes at the stage boundary instead
+# of re-spending LLM calls; `provenance_json` records what actually
+# built the artifacts (PLAN.md §4.6).
 
 _PACKAGE_COLUMNS = (
-    "id", "job_id", "profile_version", "jd_hash", "status", "stage_json",
-    "error", "retry_count", "provenance_json", "output_dir",
+    "id", "job_id", "profile_version", "jd_hash", "page_limit", "status",
+    "stage_json", "error", "retry_count", "provenance_json", "output_dir",
     "created_at", "updated_at",
 )
 
@@ -681,23 +693,26 @@ def _package_row_to_dict(row) -> dict:
     return package
 
 
-def create_package(job_id: str, profile_version: int, jd_hash: str) -> tuple[int, bool]:
-    """(package id, created). Idempotent per (job, profile, hash): an
-    existing package — whatever its status — is returned, not duplicated."""
+def create_package(job_id: str, profile_version: int, jd_hash: str,
+                   page_limit: int = 1) -> tuple[int, bool]:
+    """(package id, created). Idempotent per (job, profile, hash, page
+    limit): an existing package — whatever its status — is returned, not
+    duplicated."""
     now = datetime.now(timezone.utc).isoformat()
     with _connect() as conn:
         cursor = conn.execute(
             "INSERT INTO packages (job_id, profile_version, jd_hash, "
-            "created_at, updated_at) VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(job_id, profile_version, jd_hash) DO NOTHING",
-            (job_id, profile_version, jd_hash, now, now),
+            "page_limit, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(job_id, profile_version, jd_hash, page_limit) "
+            "DO NOTHING",
+            (job_id, profile_version, jd_hash, page_limit, now, now),
         )
         if cursor.rowcount > 0:
             return cursor.lastrowid, True
         row = conn.execute(
             "SELECT id FROM packages WHERE job_id = ? AND profile_version = ? "
-            "AND jd_hash = ?",
-            (job_id, profile_version, jd_hash),
+            "AND jd_hash = ? AND page_limit = ?",
+            (job_id, profile_version, jd_hash, page_limit),
         ).fetchone()
         return row[0], False
 

@@ -220,9 +220,9 @@ async def test_logged_out_cli_envelope_routes_to_auth_required(engine):
 
 def test_max_effort_capped_until_m4_enables_it():
     assert llm.ALLOW_MAX_EFFORT is False
-    assert llm._effective_effort("layout_final") == "xhigh"
-    assert llm._effective_effort("repair") == "xhigh"
-    assert llm._effective_effort("extract") == "medium"
+    assert llm.effective_effort("layout_final") == "xhigh"
+    assert llm.effective_effort("repair") == "xhigh"
+    assert llm.effective_effort("extract") == "medium"
 
 
 async def test_unknown_task_tier_rejected(engine):

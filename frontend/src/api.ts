@@ -116,6 +116,7 @@ export interface Package {
   job_id: string
   profile_version: number
   jd_hash: string
+  page_limit: number
   status: string
   error: string | null
   retry_count: number

@@ -1,14 +1,24 @@
 """Cover letter LaTeX render (v1 template ported to structured input).
 
-The LLM supplies paragraphs + closing as validated JSON; everything else
-— contact header, greeting, signature — is rendered by this module from
-the profile and job rows, escaped. Layout knobs mirror template.Layout
-so page_limit.py can tighten within readability floors.
+The LLM supplies paragraphs as validated JSON; everything else —
+contact header, greeting, closing, signature — is rendered by this
+module from the profile and job rows, escaped. The closing is
+application-owned static text precisely so it never carries an
+unvalidated claim. Layout knobs mirror template.Layout so page_limit.py
+can tighten within readability floors.
 """
 
 from dataclasses import dataclass
 
 from backend.resume.template import latex_escape
+
+# Recorded in package provenance; bump when this deterministic
+# transformation changes the rendered output.
+TEMPLATE_VERSION = 1
+
+# The only closing the app ever renders — LLM output has no say in it,
+# so it bypasses nothing by skipping truth validation.
+CLOSING = "Sincerely,"
 
 
 @dataclass(frozen=True)
@@ -25,7 +35,7 @@ DEFAULT_COVER_LAYOUT = CoverLayout()
 
 
 def render_cover(profile: dict, job: dict, paragraphs: list[dict],
-                 closing: str, layout: CoverLayout = DEFAULT_COVER_LAYOUT) -> str:
+                 layout: CoverLayout = DEFAULT_COVER_LAYOUT) -> str:
     """Structured cover-letter content -> complete LaTeX document."""
     contact = profile.get("contact") or {}
     header_lines = [latex_escape(profile["name"])]
@@ -37,7 +47,7 @@ def render_cover(profile: dict, job: dict, paragraphs: list[dict],
     body = "\n\n".join(latex_escape(p["text"].strip()) for p in paragraphs)
     greeting = f"Dear {latex_escape(job.get('company') or 'Hiring')} Hiring Team,"
     signature = (
-        f"{latex_escape(closing.strip())} \\\\\n{latex_escape(profile['name'])}"
+        f"{latex_escape(CLOSING)} \\\\\n{latex_escape(profile['name'])}"
     )
 
     return rf"""\documentclass[{layout.font_pt}pt,letterpaper]{{article}}

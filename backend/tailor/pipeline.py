@@ -14,6 +14,7 @@ anything else fails only this package — failures are isolated.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -23,8 +24,9 @@ from pathlib import Path
 
 from backend.core import db, llm
 from backend.normalize.requirements import cache_key
-from backend.resume import facts
+from backend.resume import facts, template
 from backend.tailor import compile as latex
+from backend.tailor import cover as cover_mod
 from backend.tailor import page_limit
 from backend.tailor import resume as tailor_resume
 from backend.tailor import validate
@@ -50,8 +52,17 @@ def _slug(text: str) -> str:
     return "_".join(parts)[:40] or "package"
 
 
-def output_dir_for(job: dict) -> Path:
-    return OUTPUT_ROOT / f"{_slug(job['company'])}_{job['job_id']}"
+def output_dir_for(job: dict, package_id: int) -> Path:
+    """Immutable per-package directory: the package id keys the exact
+    input set (job, profile version, JD hash, page limit), so a new
+    package for the same job — new profile, edited posting — publishes
+    beside the old one, never over it."""
+    return OUTPUT_ROOT / f"{_slug(job['company'])}_{job['job_id']}_p{package_id}"
+
+
+def _content_sha(obj) -> str:
+    return hashlib.sha1(
+        json.dumps(obj, sort_keys=True).encode()).hexdigest()
 
 
 def _job_md(job: dict, snapshot: str, score: dict | None) -> str:
@@ -109,6 +120,12 @@ async def run_package(package_id: int) -> str:
     ledger = facts.build_ledger(profile)
     stage = pkg["stage"]
 
+    # The page limit is pinned at creation — part of package identity —
+    # so the generation prompt and the fitter can never target different
+    # limits, and a settings change never mutates an existing package.
+    limit = pkg["page_limit"]
+    workdir = db.DATA_DIR / "build" / f"pkg{package_id}"
+
     try:
         if "tailored" not in stage:
             # The package is pinned to the hash it was created for; a
@@ -119,18 +136,31 @@ async def run_package(package_id: int) -> str:
                             error="posting changed before generation; "
                                   "re-select the job to build a new package")
                 return "failed"
-            _transition(package_id, "generating")
+            # Generation quality depends on the derived inputs — a
+            # package selected before scoring finished waits (no gate:
+            # scoring completion resumes it) rather than permanently
+            # baking in requirements=None.
             requirements = db.get_requirements(cache_key(pkg["jd_hash"]))
             score = _score_if_current(pkg)
+            if requirements is None or score is None:
+                db.update_package(
+                    package_id,
+                    error="waiting for scoring to derive this job's "
+                          "requirements and score; resumes automatically")
+                return "waiting_inputs"
+            _transition(package_id, "generating", error=None)
             tailored = await tailor_resume.generate_tailored(
-                profile, ledger, job, requirements,
-                (score or {}).get("breakdown"), resume_page_limit(),
+                profile, ledger, job, requirements, score.get("breakdown"),
+                limit,
             )
             stage = {"tailored": tailored, "jd_snapshot": job["description"],
                      "entail_cache": {}}
             _transition(package_id, "validating", stage=stage)
 
-        if not stage.get("validated"):
+        # Validation is bound to the exact content it approved: the hash
+        # guard means repaired-or-edited JSON can never coast on a stale
+        # flag, and the asserting stage re-checks it before publish.
+        if stage.get("validated_sha") != _content_sha(stage["tailored"]):
             _transition(package_id, "validating")
             cache = stage.get("entail_cache", {})
             failures = await validate.validate(stage["tailored"], profile,
@@ -149,62 +179,81 @@ async def run_package(package_id: int) -> str:
                 _transition(package_id, "failed", stage=stage,
                             error=f"truth validation failed after repair: {detail}")
                 return "failed"
-            stage["validated"] = True
+            stage["validated_sha"] = _content_sha(stage["tailored"])
             _transition(package_id, "fitting", stage=stage)
 
-        # Fitting is deterministic given the validated JSON (the one LLM
-        # path — cover condense — revalidates internally), so a restart
-        # simply re-runs it; nothing partial is persisted.
-        _transition(package_id, "fitting")
-        workdir = db.DATA_DIR / "build" / f"pkg{package_id}"
+        # Each fit persists its result (fitted JSON + layout) before the
+        # next stage starts: the LLM-bearing fit paths (cover condense,
+        # trim revalidation) never re-run once their document is
+        # recorded — a restart recompiles the persisted state instead.
         cache = stage.get("entail_cache", {})
-        limit = resume_page_limit()
-        resume_fit = await page_limit.fit_resume(
-            stage["tailored"], profile, ledger, cache, limit,
-            workdir / "resume")
-        cover_fit = await page_limit.fit_cover(
-            stage["tailored"], profile, ledger, cache, job,
-            workdir / "cover")
-        stage["entail_cache"] = cache
+        if "resume_fit" not in stage:
+            _transition(package_id, "fitting")
+            resume_fit = await page_limit.fit_resume(
+                stage["tailored"], profile, ledger, cache, limit,
+                workdir / "resume")
+            stage["resume_fit"] = page_limit.fit_state(resume_fit)
+            stage["entail_cache"] = cache
+            db.update_package(package_id, stage=stage)
+        if "cover_fit" not in stage:
+            _transition(package_id, "fitting")
+            cover_fit = await page_limit.fit_cover(
+                stage["tailored"], profile, ledger, cache, job,
+                workdir / "cover")
+            stage["cover_fit"] = page_limit.fit_state(cover_fit)
+            stage["entail_cache"] = cache
+            db.update_package(package_id, stage=stage)
 
         _transition(package_id, "asserting", stage=stage)
-        # Hard assertions (PLAN.md §4.5 step 4) — the fit loops enforce
-        # these already; assert anyway so nothing unvalidated or
+        # Rebuild both PDFs from the persisted fitted state (pure
+        # template render + local compile, zero LLM) — the same path
+        # whether this process ran the fits or a previous one did — and
+        # hard-assert (PLAN.md §4.5 step 4) so nothing unvalidated or
         # oversized can ever ship even if a fit loop regresses.
-        if resume_fit.result.pages > limit or cover_fit.result.pages != 1:
+        resume_res = page_limit.compile_resume_state(
+            stage["resume_fit"], profile, workdir / "resume")
+        cover_res = page_limit.compile_cover_state(
+            stage["cover_fit"], profile, job, workdir / "cover")
+        if resume_res.pages > limit or cover_res.pages != 1:
             raise page_limit.FitError(
-                f"assertion failed: resume {resume_fit.result.pages}/{limit} "
-                f"pages, cover {cover_fit.result.pages}/1 pages")
-        if not stage.get("validated"):
+                f"assertion failed: resume {resume_res.pages}/{limit} "
+                f"pages, cover {cover_res.pages}/1 pages")
+        if stage.get("validated_sha") != _content_sha(stage["tailored"]):
             raise page_limit.ValidationFailed([])
 
         _transition(package_id, "publishing")
-        final_dir = output_dir_for(job)
+        final_dir = output_dir_for(job, package_id)
         tmp_dir = final_dir.with_name(final_dir.name + ".publishing")
-        if tmp_dir.exists():
-            shutil.rmtree(tmp_dir)
+        # Both names are exclusive to THIS package id — anything already
+        # there is this package's own interrupted publish, never another
+        # package's artifacts.
+        for leftover in (tmp_dir, final_dir):
+            if leftover.exists():
+                shutil.rmtree(leftover)
         tmp_dir.mkdir(parents=True)
-        shutil.copy2(resume_fit.result.pdf_path, tmp_dir / "resume.pdf")
-        shutil.copy2(cover_fit.result.pdf_path, tmp_dir / "cover_letter.pdf")
+        shutil.copy2(resume_res.pdf_path, tmp_dir / "resume.pdf")
+        shutil.copy2(cover_res.pdf_path, tmp_dir / "cover_letter.pdf")
         (tmp_dir / "job.md").write_text(
             _job_md(job, stage.get("jd_snapshot") or "", _score_if_current(pkg)))
-        if final_dir.exists():
-            shutil.rmtree(final_dir)
-        tmp_dir.rename(final_dir)  # single-step publish
+        tmp_dir.rename(final_dir)  # single-step publish into a fresh name
         shutil.rmtree(workdir, ignore_errors=True)
 
         provenance = {
             "model": db.get_state("pinned_model"),
-            "engine_resume": resume_fit.result.engine,
-            "engine_cover": cover_fit.result.engine,
+            "engine_resume": resume_res.engine,
+            "engine_cover": cover_res.engine,
+            "efforts": {task: llm.effective_effort(task)
+                        for task in ("tailor", "entail", "repair")},
             "prompt_version": tailor_resume.PROMPT_VERSION,
             "schema_version": tailor_resume.SCHEMA_VERSION,
+            "template_version": template.TEMPLATE_VERSION,
+            "cover_template_version": cover_mod.TEMPLATE_VERSION,
             "profile_version": pkg["profile_version"],
             "jd_hash": pkg["jd_hash"],
             "page_limit": limit,
-            "resume_pages": resume_fit.result.pages,
-            "cover_pages": cover_fit.result.pages,
-            "trimmed_bullets": len(resume_fit.trimmed),
+            "resume_pages": resume_res.pages,
+            "cover_pages": cover_res.pages,
+            "trimmed_bullets": len(stage["resume_fit"]["trimmed"]),
             "retry_count": db.get_package(package_id)["retry_count"],
         }
         _transition(package_id, "done", stage=stage, error=None,
@@ -237,8 +286,9 @@ async def run_package(package_id: int) -> str:
 async def run_batch() -> str:
     """Process every resumable package in batch order. Returns why the
     batch stopped: 'idle' (nothing left to do), 'waiting_usage' (durable
-    engine wait — caller arms the retry timer), or 'engine_blocked'
-    (caller resumes after engine recovery)."""
+    engine wait — caller arms the retry timer), 'engine_blocked' (caller
+    resumes after engine recovery), or 'waiting_inputs' (every remaining
+    package is queued behind scoring — its completion resumes them)."""
     while True:
         rows = [p for p in db.packages_to_resume()
                 if p["status"] != "waiting_usage"]
@@ -249,11 +299,18 @@ async def run_batch() -> str:
             rows = waiting
         if not rows:
             return "idle"
+        all_waiting_inputs = True
         for pkg in rows:
             status = await run_package(pkg["id"])
             if status == "waiting_usage":
                 return "waiting_usage"
             if status == "engine_blocked":
                 return "engine_blocked"
+            if status != "waiting_inputs":
+                all_waiting_inputs = False
+        if all_waiting_inputs:
+            # Every remaining package is input-blocked and stays queued —
+            # looping again would spin. Zero LLM was spent this pass.
+            return "waiting_inputs"
         # Loop again: a package parked back to queued mid-list, or new
         # selections queued while we ran, get picked up before exiting.

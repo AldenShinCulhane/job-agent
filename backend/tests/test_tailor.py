@@ -135,7 +135,6 @@ def _tailored(**overrides):
                 {"text": "I build backend tools in Python.", "source_ids": ["b-1"]},
                 {"text": "I would love to join your team.", "source_ids": []},
             ],
-            "closing": "Sincerely,",
         },
     }
     base.update(overrides)
@@ -149,6 +148,9 @@ def test_tailor_schema_is_valid_and_accepts_shape():
 
     Draft202012Validator.check_schema(tailor_resume.TAILOR_SCHEMA)
     Draft202012Validator(tailor_resume.TAILOR_SCHEMA).validate(_tailored())
+    # The closing is application-owned: no LLM schema may accept one.
+    letter = tailor_resume.TAILOR_SCHEMA["properties"]["cover_letter"]
+    assert "closing" not in letter["properties"]
 
 
 async def test_generate_tailored_calls_llm_with_ledger_and_rules(monkeypatch):
@@ -220,7 +222,6 @@ def test_cover_render_escapes_and_structures():
         PROFILE, JOB,
         paragraphs=[{"text": "I use C&C 100% of the time.", "source_ids": []},
                     {"text": r"No \textbf{injection} allowed.", "source_ids": []}],
-        closing="Sincerely,",
     )
     assert "Dear Sample Systems \\& Co Hiring Team," in tex
     assert r"C\&C 100\% of the time" in tex
@@ -228,6 +229,7 @@ def test_cover_render_escapes_and_structures():
     assert tex.count("Casey Example") == 2  # header + signature
     assert "casey@example.com" in tex
     assert "source_ids" not in tex  # internal metadata never rendered
+    assert cover.CLOSING in tex  # app-owned closing, not LLM output
 
 
 # --- Truth validation (deterministic + batched entailment) -------------------
@@ -401,7 +403,7 @@ def _fake_compiler(monkeypatch, pages_fn):
         calls.append((jobname, tex))
         workdir.mkdir(parents=True, exist_ok=True)
         pdf = workdir / f"{jobname}.pdf"
-        pdf.write_text("fake")
+        pdf.write_text(tex)  # content-bearing: byte comparisons see input
         return latex.CompileResult(pdf_path=pdf, pages=pages_fn(tex),
                                    engine="fake")
 
@@ -497,12 +499,49 @@ async def test_fit_resume_balances_sparse_last_page(tmp_path, monkeypatch):
     from backend.tailor import page_limit
 
     calls = _fake_compiler(monkeypatch, lambda tex: 2)
-    monkeypatch.setattr(page_limit, "last_page_fullness", lambda p: 0.1)
+    # Same page count, but the balanced layout measurably fills the last
+    # page better — adopted.
+    fullness = iter([0.1, 0.5])
+    monkeypatch.setattr(page_limit, "last_page_fullness",
+                        lambda p: next(fullness))
     tailored, ledger = _cited_tailored()
     fit = await page_limit.fit_resume(tailored, PROFILE, ledger, {}, 2, tmp_path)
     assert len(calls) == 2  # initial + one balance pass
     assert fit.layout.item_sep_pt == 0  # the balance pass tightened spacing
     assert fit.result.pages == 2
+
+
+async def test_sparse_balance_rejected_without_measured_improvement(
+    tmp_path, monkeypatch
+):
+    """Regression: tightening a sparse layout can make the last page even
+    emptier — same page count with lower fullness must be discarded."""
+    from backend.resume import template
+    from backend.tailor import page_limit
+
+    calls = _fake_compiler(monkeypatch, lambda tex: 2)
+    fullness = iter([0.1, 0.05])  # balanced compile came out SPARSER
+    monkeypatch.setattr(page_limit, "last_page_fullness",
+                        lambda p: next(fullness))
+    tailored, ledger = _cited_tailored()
+    fit = await page_limit.fit_resume(tailored, PROFILE, ledger, {}, 2, tmp_path)
+    assert fit.layout == template.DEFAULT_LAYOUT  # kept the original
+    # initial + balance attempt + recompile of the kept layout (the
+    # balanced pass overwrote the PDF at the same path).
+    assert len(calls) == 3
+    assert calls[0][1] == calls[2][1]  # shipped PDF is the kept layout's
+
+
+async def test_sparse_balance_accepts_page_count_reduction(tmp_path, monkeypatch):
+    from backend.tailor import page_limit
+
+    # Balance step (itemsep floor) actually removes the sparse page.
+    _fake_compiler(monkeypatch, lambda tex: 1 if "itemsep=0pt" in tex else 2)
+    monkeypatch.setattr(page_limit, "last_page_fullness", lambda p: 0.1)
+    tailored, ledger = _cited_tailored()
+    fit = await page_limit.fit_resume(tailored, PROFILE, ledger, {}, 2, tmp_path)
+    assert fit.layout.item_sep_pt == 0
+    assert fit.result.pages == 1
 
 
 async def test_fit_cover_ladder_then_condense_then_fail(tmp_path, monkeypatch):
@@ -515,8 +554,7 @@ async def test_fit_cover_ladder_then_condense_then_fail(tmp_path, monkeypatch):
     _fake_compiler(
         monkeypatch, lambda tex: 1 if "short" in tex else 2)
     condensed = {"paragraphs": [{"text": "A short letter.", "source_ids": []},
-                                {"text": "Thanks.", "source_ids": []}],
-                 "closing": "Sincerely,"}
+                                {"text": "Thanks.", "source_ids": []}]}
     llm_calls = []
 
     async def fake_structured(prompt, schema, task, system_prompt=""):
@@ -582,6 +620,18 @@ def _confirm_profile():
     return version
 
 
+def _seed_derived(job_id, version, jd_hash="hash-a", score=50.0,
+                  breakdown=None):
+    """The derived inputs generation waits for: cached requirements and a
+    current (profile, hash) score."""
+    from backend.normalize.requirements import cache_key
+
+    db.save_requirements(cache_key(jd_hash), {"required_skills": ["Python"]})
+    db.save_score(job_id, jd_hash, version, score,
+                  breakdown if breakdown is not None
+                  else {"match_reasons": [], "gap_reasons": []})
+
+
 def _tailor_env(monkeypatch, tmp_path, behavior=None):
     """Fake engine + generation for pipeline tests. `behavior(job)`
     returns tailored JSON or raises; defaults to a fully cited doc.
@@ -621,16 +671,16 @@ async def test_package_end_to_end_publishes_and_never_regenerates(
 
     version = _confirm_profile()
     _seed_job("p1")
-    db.save_score("p1", "hash-a", version, 79.8,
-                  {"match_reasons": ["Strong Python overlap"],
-                   "gap_reasons": []})
+    _seed_derived("p1", version, score=79.8,
+                  breakdown={"match_reasons": ["Strong Python overlap"],
+                             "gap_reasons": []})
     generate_calls, entail_calls = _tailor_env(monkeypatch, tmp_path)
     pkg, _ = db.create_package("p1", version, "hash-a")
 
     assert await tailor_pipeline.run_package(pkg) == "done"
     row = db.get_package(pkg)
     assert row["status"] == "done"
-    out = tmp_path / "output" / "Example_Widgets_Inc_p1"
+    out = tmp_path / "output" / f"Example_Widgets_Inc_p1_p{pkg}"
     assert row["output_dir"] == str(out)
     assert (out / "resume.pdf").is_file()
     assert (out / "cover_letter.pdf").is_file()
@@ -641,7 +691,10 @@ async def test_package_end_to_end_publishes_and_never_regenerates(
     assert "source_ids" not in job_md  # internal metadata stays internal
     prov = row["provenance"]
     assert prov["engine_resume"] == "fake" and prov["resume_pages"] == 1
-    assert prov["cover_pages"] == 1 and prov["prompt_version"] >= 1
+    assert prov["cover_pages"] == 1 and prov["prompt_version"] >= 2
+    assert prov["page_limit"] == 1  # the pinned limit, not a live read
+    assert prov["efforts"]["tailor"] == "high"
+    assert prov["template_version"] >= 1
     assert generate_calls == ["p1"] and entail_calls == ["entail"]
 
     # Completed packages are never redone: no state change, no LLM calls.
@@ -665,6 +718,7 @@ async def test_restart_mid_batch_completes_without_duplicate_generation(
     packages = []
     for i in (1, 2, 3):
         _seed_job(f"p{i}")
+        _seed_derived(f"p{i}", version)
         pkg, _ = db.create_package(f"p{i}", version, "hash-a")
         packages.append(pkg)
     generate_calls, _ = _tailor_env(monkeypatch, tmp_path)
@@ -711,6 +765,7 @@ async def test_batch_failure_is_isolated_to_its_package(
     packages = []
     for i in (1, 2, 3):
         _seed_job(f"p{i}")
+        _seed_derived(f"p{i}", version)
         pkg, _ = db.create_package(f"p{i}", version, "hash-a")
         packages.append(pkg)
 
@@ -736,6 +791,7 @@ async def test_usage_exhausted_is_durable_and_batch_resumes(
     packages = []
     for i in (1, 2, 3):
         _seed_job(f"p{i}")
+        _seed_derived(f"p{i}", version)
         pkg, _ = db.create_package(f"p{i}", version, "hash-a")
         packages.append(pkg)
     healed = False
@@ -766,6 +822,7 @@ async def test_engine_blocked_parks_package_queued_and_stops_batch(
     packages = []
     for i in (1, 2):
         _seed_job(f"p{i}")
+        _seed_derived(f"p{i}", version)
         pkg, _ = db.create_package(f"p{i}", version, "hash-a")
         packages.append(pkg)
 
@@ -789,6 +846,7 @@ async def test_validation_failure_after_repair_fails_package(
 
     version = _confirm_profile()
     _seed_job("p1")
+    _seed_derived("p1", version)
     pkg, _ = db.create_package("p1", version, "hash-a")
     _tailor_env(monkeypatch, tmp_path)
 
@@ -831,7 +889,7 @@ async def test_generate_endpoint_gates_and_creates(test_db, monkeypatch):
     from backend.api import routes
 
     spawned = []
-    monkeypatch.setattr(routes, "_spawn_package_worker",
+    monkeypatch.setattr(routes, "_maybe_resume_packages",
                         lambda: spawned.append(True) or True)
 
     with pytest.raises(HTTPException) as exc:
@@ -855,3 +913,327 @@ async def test_generate_endpoint_gates_and_creates(test_db, monkeypatch):
     assert len(result["package_ids"]) == 2
     assert spawned == [True]
     assert db.get_package(result["package_ids"][0])["profile_version"] == version
+
+
+# --- Review round 1: publish immutability, fit persistence, recovery ---------
+
+async def test_publish_dirs_are_immutable_per_package(
+    test_db, tmp_path, monkeypatch
+):
+    """A new package for the same job (here: edited posting) publishes
+    beside the old one — the first package's artifacts never change and
+    its row keeps serving exactly what it built."""
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    _tailor_env(monkeypatch, tmp_path)
+    pkg1, _ = db.create_package("p1", version, "hash-a")
+    assert await tailor_pipeline.run_package(pkg1) == "done"
+    dir1 = db.get_package(pkg1)["output_dir"]
+    from pathlib import Path
+    baseline = {name: (Path(dir1) / name).read_bytes()
+                for name in ("resume.pdf", "cover_letter.pdf", "job.md")}
+    assert b"We need Python." in baseline["job.md"]
+
+    # The posting is edited: new hash, new derived inputs, new package.
+    db.save_job_detail("p1", "New text.", "hash-b")
+    _seed_derived("p1", version, jd_hash="hash-b")
+    pkg2, created = db.create_package("p1", version, "hash-b")
+    assert created and pkg2 != pkg1
+    assert await tailor_pipeline.run_package(pkg2) == "done"
+    dir2 = db.get_package(pkg2)["output_dir"]
+
+    assert dir2 != dir1
+    assert b"New text." in (Path(dir2) / "job.md").read_bytes()
+    for name, before in baseline.items():
+        assert (Path(dir1) / name).read_bytes() == before  # untouched
+    assert db.get_package(pkg1)["output_dir"] == dir1
+
+
+async def test_restart_during_cover_condense_reuses_persisted_fits(
+    test_db, tmp_path, monkeypatch
+):
+    """A kill mid-condense resumes without repeating generation, the
+    resume fit, or any cached entailment — only the interrupted condense
+    runs again."""
+    import asyncio
+
+    from backend.core import llm
+    from backend.tailor import page_limit as pl
+    from backend.tailor import pipeline as tailor_pipeline
+    from backend.tailor import resume as tailor_resume
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    pkg, _ = db.create_package("p1", version, "hash-a")
+
+    def pages(tex):
+        if "Hiring Team" in tex:  # the cover letter
+            return 1 if "A short letter." in tex else 2
+        return 1  # the resume always fits
+    _fake_compiler(monkeypatch, pages)
+    monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
+
+    generate_calls, condense_calls = [], []
+    release = asyncio.Event()
+    condense_started = asyncio.Event()
+
+    async def fake_generate(profile, ledger, job, requirements, breakdown,
+                            page_limit):
+        generate_calls.append(job["job_id"])
+        return _cited_tailored()[0]
+
+    async def fake_structured(prompt, schema, task, system_prompt=""):
+        if task == "entail":
+            claim_ids = [json.loads(line)["claim_id"]
+                         for line in prompt.splitlines() if line.startswith("{")]
+            return {"verdicts": [{"claim_id": cid, "supported": True,
+                                  "reason": "ok"} for cid in claim_ids]}
+        assert task == "repair"  # the condense pass
+        condense_calls.append(1)
+        condense_started.set()
+        await release.wait()
+        return {"paragraphs": [{"text": "A short letter.", "source_ids": []},
+                               {"text": "Thanks.", "source_ids": []}]}
+
+    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
+    monkeypatch.setattr(llm, "structured", fake_structured)
+
+    resume_fit_calls = []
+    original_fit_resume = pl.fit_resume
+
+    async def counting_fit_resume(*args, **kwargs):
+        resume_fit_calls.append(1)
+        return await original_fit_resume(*args, **kwargs)
+
+    monkeypatch.setattr(pl, "fit_resume", counting_fit_resume)
+
+    worker = asyncio.create_task(tailor_pipeline.run_package(pkg))
+    await asyncio.wait_for(condense_started.wait(), timeout=5)
+    worker.cancel()  # the "kill": mid-condense
+    await asyncio.gather(worker, return_exceptions=True)
+
+    row = db.get_package(pkg)
+    assert row["status"] == "fitting"
+    assert "resume_fit" in row["stage"]  # persisted before the cover fit
+    assert "cover_fit" not in row["stage"]
+    assert generate_calls == ["p1"] and resume_fit_calls == [1]
+
+    # "Restart": only the interrupted condense re-runs.
+    release.set()
+    assert await tailor_pipeline.run_package(pkg) == "done"
+    assert generate_calls == ["p1"]  # generation never repeated
+    assert resume_fit_calls == [1]  # resume fit never repeated
+    assert len(condense_calls) == 2  # the interrupted one, once more
+    assert db.get_package(pkg)["provenance"]["cover_pages"] == 1
+
+
+@pytest.mark.parametrize("interrupt_at", ["asserting", "publishing"])
+async def test_restart_after_fitting_needs_no_llm(
+    test_db, tmp_path, monkeypatch, interrupt_at
+):
+    """Once both fits are persisted, a kill during asserting or
+    publishing resumes with ZERO LLM calls — pure recompile + publish."""
+    import asyncio
+    import shutil as shutil_mod
+
+    from backend.tailor import page_limit as pl
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    pkg, _ = db.create_package("p1", version, "hash-a")
+    generate_calls, entail_calls = _tailor_env(monkeypatch, tmp_path)
+
+    tripped = []
+    if interrupt_at == "asserting":
+        original = pl.compile_cover_state
+
+        def dying_compile(*args, **kwargs):
+            if not tripped:
+                tripped.append(1)
+                raise asyncio.CancelledError
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(pl, "compile_cover_state", dying_compile)
+    else:
+        original = shutil_mod.copy2
+
+        def dying_copy(*args, **kwargs):
+            if not tripped:
+                tripped.append(1)
+                raise asyncio.CancelledError
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(shutil_mod, "copy2", dying_copy)
+
+    with pytest.raises(asyncio.CancelledError):
+        await tailor_pipeline.run_package(pkg)
+    row = db.get_package(pkg)
+    assert row["status"] == interrupt_at
+    assert "resume_fit" in row["stage"] and "cover_fit" in row["stage"]
+    calls_before = (list(generate_calls), list(entail_calls))
+
+    assert await tailor_pipeline.run_package(pkg) == "done"
+    assert (generate_calls, entail_calls) == calls_before  # zero LLM spent
+    out = db.get_package(pkg)["output_dir"]
+    from pathlib import Path
+    assert (Path(out) / "resume.pdf").is_file()
+    assert (Path(out) / "cover_letter.pdf").is_file()
+
+
+async def test_package_pins_page_limit_at_creation(
+    test_db, tmp_path, monkeypatch
+):
+    """The page limit is package identity: pinned at gate 3, immune to a
+    later settings change, and a changed limit is a NEW package."""
+    from backend.api import routes
+    from backend.core import llm
+    from backend.tailor import pipeline as tailor_pipeline
+    from backend.tailor import resume as tailor_resume
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    monkeypatch.setattr(routes, "_maybe_resume_packages", lambda: True)
+
+    db.set_state(tailor_pipeline.PAGE_LIMIT_KEY, "2")
+    first = await routes.packages_generate({"job_ids": ["p1"]})
+    pkg = first["package_ids"][0]
+    assert db.get_package(pkg)["page_limit"] == 2
+
+    db.set_state(tailor_pipeline.PAGE_LIMIT_KEY, "1")
+    second = await routes.packages_generate({"job_ids": ["p1"]})
+    assert second["created"] == 1  # different limit = different package
+    assert second["package_ids"][0] != pkg
+
+    # The old package still generates and fits against ITS pinned limit.
+    _fake_compiler(monkeypatch, lambda tex: 1)
+    monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
+    seen_limits = []
+
+    async def fake_generate(profile, ledger, job, requirements, breakdown,
+                            page_limit):
+        seen_limits.append(page_limit)
+        return _cited_tailored()[0]
+
+    async def fake_structured(prompt, schema, task, system_prompt=""):
+        claim_ids = [json.loads(line)["claim_id"]
+                     for line in prompt.splitlines() if line.startswith("{")]
+        return {"verdicts": [{"claim_id": cid, "supported": True,
+                              "reason": "ok"} for cid in claim_ids]}
+
+    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
+    monkeypatch.setattr(llm, "structured", fake_structured)
+    assert await tailor_pipeline.run_package(pkg) == "done"
+    assert seen_limits == [2]  # pinned, not the current global (1)
+    assert db.get_package(pkg)["provenance"]["page_limit"] == 2
+
+
+async def test_package_waits_for_derived_inputs(test_db, tmp_path, monkeypatch):
+    """A package selected before scoring finished waits — zero LLM spend,
+    no permanent requirements=None package — and resumes once the
+    derived inputs exist."""
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    _seed_job("p1")  # description cached, but no requirements/score yet
+    pkg, _ = db.create_package("p1", version, "hash-a")
+    generate_calls, _ = _tailor_env(monkeypatch, tmp_path)
+
+    assert await tailor_pipeline.run_batch() == "waiting_inputs"
+    row = db.get_package(pkg)
+    assert row["status"] == "queued"
+    assert "waiting for scoring" in row["error"]
+    assert generate_calls == []  # nothing was spent on missing inputs
+
+    _seed_derived("p1", version)  # scoring finished deriving inputs
+    assert await tailor_pipeline.run_batch() == "idle"
+    row = db.get_package(pkg)
+    assert row["status"] == "done" and row["error"] is None
+    assert generate_calls == ["p1"]
+
+
+async def test_scoring_completion_resumes_waiting_packages(
+    test_db, monkeypatch
+):
+    from backend.api import routes
+
+    resumed = []
+    monkeypatch.setattr(routes, "_maybe_resume_packages",
+                        lambda: resumed.append(True) or True)
+
+    async def fake_run_pipeline(run_id):
+        return {"scored": 1, "failed": 0, "stopped": None, "detail": None}
+
+    monkeypatch.setattr(routes.scoring_pipeline, "run_pipeline",
+                        fake_run_pipeline)
+    monkeypatch.setattr(routes.scoring_pipeline, "pending_count",
+                        lambda run_id: 0)
+    await routes._pipeline_worker(1, 1)
+    assert resumed == [True]  # scoring completion kicks waiting packages
+
+
+async def test_engine_blocked_packages_recover_automatically(
+    test_db, tmp_path, monkeypatch
+):
+    """Finding 3: with scoring already finished, a package batch parked
+    on an auth failure still has an autonomous way back — the persisted
+    package stall polls auth, reprobes once healthy, and the SAME
+    package resumes to done with no manual action."""
+    import asyncio
+
+    from backend.api import routes
+    from backend.core import llm
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    pkg, _ = db.create_package("p1", version, "hash-a")
+
+    blocked = True
+
+    def behavior(job):
+        if blocked:
+            raise llm.AuthRequired("Not logged in")
+        return _cited_tailored()[0]
+
+    _tailor_env(monkeypatch, tmp_path, behavior=behavior)
+    monkeypatch.setattr(routes, "_STALL_AUTH_POLL_S", 0.01)
+    monkeypatch.setattr(routes.random, "uniform", lambda a, b: 0.0)
+    monkeypatch.setattr(routes, "_package_stall_task", None)
+    monkeypatch.setattr(routes, "_package_stall_token", None)
+    monkeypatch.setattr(routes, "_package_worker_task", None)
+    monkeypatch.setattr(routes.claude_cli, "subscription_problem",
+                        lambda: "Not logged in" if blocked else None)
+
+    async def ok_probe():
+        return "claude-fable-5"
+
+    monkeypatch.setattr(routes.llm, "probe", ok_probe)
+    monkeypatch.setattr(routes.llm, "reset_probe", lambda: None)
+
+    await routes._package_batch_worker()  # hits AuthRequired
+    stall = routes._read_stall(routes._PACKAGE_STALL_KEY)
+    assert stall is not None and stall["reason"] == "engine_blocked"
+    assert "AuthRequired" in (stall["detail"] or "")
+    assert routes._maybe_resume_packages() is False  # breaker holds
+    task = routes._package_stall_task
+    assert task is not None and not task.done()  # armed by the worker
+
+    # While auth stays broken the loop keeps polling, never clears.
+    await asyncio.sleep(0.05)
+    assert routes._read_stall(routes._PACKAGE_STALL_KEY) is not None
+    assert db.get_package(pkg)["status"] == "queued"
+
+    blocked = False  # the user logged back in
+    await asyncio.wait_for(task, timeout=5)  # poll → healthy → reprobe
+    assert routes._read_stall(routes._PACKAGE_STALL_KEY) is None
+    worker = routes._package_worker_task
+    assert worker is not None  # recovery respawned the batch
+    await asyncio.wait_for(worker, timeout=5)
+    assert db.get_package(pkg)["status"] == "done"
