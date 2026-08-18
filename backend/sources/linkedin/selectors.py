@@ -53,6 +53,10 @@ SELECTORS: dict[str, list[str]] = {
         "#job-details",
         ".jobs-description__content",
         ".jobs-box__html-content",
+        ".jobs-description-content__text",
+        "article.jobs-description__container",
+        ".show-more-less-html__markup",
+        "[class*='jobs-description']",
     ],
     # --- results-page state markers ---
     "results_list": [
