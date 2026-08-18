@@ -146,7 +146,14 @@ async def profile_preview(version: int):
         pdf_path = _ensure_preview(version, profile)
     except latex.CompileError as exc:
         raise HTTPException(status_code=500, detail=f"{exc} | {exc.log_tail[-500:]}")
-    return FileResponse(pdf_path, media_type="application/pdf", filename="resume-preview.pdf")
+    return FileResponse(
+        pdf_path,
+        media_type="application/pdf",
+        filename="resume-preview.pdf",
+        # inline, or the iframe preview triggers a download instead of
+        # rendering the PDF in the pane
+        content_disposition_type="inline",
+    )
 
 
 @router.post("/profile/confirm")
