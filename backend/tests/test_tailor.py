@@ -572,3 +572,286 @@ def test_packages_to_resume_excludes_terminal_states(test_db):
         db.update_package(pkg, status=status)
     resumable = db.packages_to_resume()
     assert [p["job_id"] for p in resumable] == ["p3", "p4", "p5"]
+
+
+# --- Package pipeline (state machine, restart, isolation) --------------------
+
+def _confirm_profile():
+    version = db.save_profile(PROFILE)
+    db.confirm_profile(version)
+    return version
+
+
+def _tailor_env(monkeypatch, tmp_path, behavior=None):
+    """Fake engine + generation for pipeline tests. `behavior(job)`
+    returns tailored JSON or raises; defaults to a fully cited doc.
+    Entailment supports everything. Returns (generate_calls, entail_calls)."""
+    from backend.core import llm
+    from backend.tailor import pipeline as tailor_pipeline
+    from backend.tailor import resume as tailor_resume
+
+    _fake_compiler(monkeypatch, lambda tex: 1)
+    monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
+    generate_calls, entail_calls = [], []
+
+    async def fake_generate(profile, ledger, job, requirements, breakdown,
+                            page_limit):
+        generate_calls.append(job["job_id"])
+        if behavior is not None:
+            return behavior(job)
+        return _cited_tailored()[0]
+
+    async def fake_structured(prompt, schema, task, system_prompt=""):
+        assert task == "entail"  # only validation should reach the LLM here
+        entail_calls.append(task)
+        claim_ids = [json.loads(line)["claim_id"]
+                     for line in prompt.splitlines() if line.startswith("{")]
+        return {"verdicts": [{"claim_id": cid, "supported": True,
+                              "reason": "ok"} for cid in claim_ids]}
+
+    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
+    monkeypatch.setattr(llm, "structured", fake_structured)
+    return generate_calls, entail_calls
+
+
+async def test_package_end_to_end_publishes_and_never_regenerates(
+    test_db, tmp_path, monkeypatch
+):
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    db.save_score("p1", "hash-a", version, 79.8,
+                  {"match_reasons": ["Strong Python overlap"],
+                   "gap_reasons": []})
+    generate_calls, entail_calls = _tailor_env(monkeypatch, tmp_path)
+    pkg, _ = db.create_package("p1", version, "hash-a")
+
+    assert await tailor_pipeline.run_package(pkg) == "done"
+    row = db.get_package(pkg)
+    assert row["status"] == "done"
+    out = tmp_path / "output" / "Example_Widgets_Inc_p1"
+    assert row["output_dir"] == str(out)
+    assert (out / "resume.pdf").is_file()
+    assert (out / "cover_letter.pdf").is_file()
+    job_md = (out / "job.md").read_text()
+    assert "We need Python." in job_md  # pinned posting snapshot
+    assert "linkedin.com/jobs/view/p1" in job_md
+    assert "79.8" in job_md and "Strong Python overlap" in job_md
+    assert "source_ids" not in job_md  # internal metadata stays internal
+    prov = row["provenance"]
+    assert prov["engine_resume"] == "fake" and prov["resume_pages"] == 1
+    assert prov["cover_pages"] == 1 and prov["prompt_version"] >= 1
+    assert generate_calls == ["p1"] and entail_calls == ["entail"]
+
+    # Completed packages are never redone: no state change, no LLM calls.
+    assert await tailor_pipeline.run_package(pkg) == "done"
+    assert generate_calls == ["p1"] and entail_calls == ["entail"]
+
+
+async def test_restart_mid_batch_completes_without_duplicate_generation(
+    test_db, tmp_path, monkeypatch
+):
+    """M4 criterion: kill the app mid-generation, restart, batch
+    completes with no duplicated work. The kill lands between stages
+    (generation persisted, validation in flight), so every job is
+    generated exactly once across both processes."""
+    import asyncio
+
+    from backend.core import llm
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    packages = []
+    for i in (1, 2, 3):
+        _seed_job(f"p{i}")
+        pkg, _ = db.create_package(f"p{i}", version, "hash-a")
+        packages.append(pkg)
+    generate_calls, _ = _tailor_env(monkeypatch, tmp_path)
+
+    # Block the SECOND package's entailment call: package 1 completes,
+    # package 2 dies mid-validation with its generation already persisted.
+    release = asyncio.Event()
+    entail_started = asyncio.Event()
+    original_structured = llm.structured
+
+    async def gated_structured(prompt, schema, task, system_prompt=""):
+        if task == "entail" and db.get_package(packages[1])["status"] == "validating":
+            entail_started.set()
+            await release.wait()
+        return await original_structured(prompt, schema, task,
+                                         system_prompt=system_prompt)
+
+    monkeypatch.setattr(llm, "structured", gated_structured)
+    batch = asyncio.create_task(tailor_pipeline.run_batch())
+    await asyncio.wait_for(entail_started.wait(), timeout=5)
+    batch.cancel()  # the "kill": mid-batch, mid-validation
+    await asyncio.gather(batch, return_exceptions=True)
+
+    assert db.get_package(packages[0])["status"] == "done"
+    interrupted = db.get_package(packages[1])
+    assert interrupted["status"] == "validating"  # mid-flight, persisted
+    assert "tailored" in interrupted["stage"]  # generation survived the kill
+    assert db.get_package(packages[2])["status"] == "queued"
+
+    # "Restart": a fresh batch over packages_to_resume().
+    release.set()
+    assert await tailor_pipeline.run_batch() == "idle"
+    assert [db.get_package(p)["status"] for p in packages] == ["done"] * 3
+    # No duplicated work: each job generated exactly once across restarts.
+    assert generate_calls == ["p1", "p2", "p3"]
+
+
+async def test_batch_failure_is_isolated_to_its_package(
+    test_db, tmp_path, monkeypatch
+):
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    packages = []
+    for i in (1, 2, 3):
+        _seed_job(f"p{i}")
+        pkg, _ = db.create_package(f"p{i}", version, "hash-a")
+        packages.append(pkg)
+
+    def behavior(job):
+        if job["job_id"] == "p2":
+            raise ValueError("induced generation failure")
+        return _cited_tailored()[0]
+
+    _tailor_env(monkeypatch, tmp_path, behavior=behavior)
+    assert await tailor_pipeline.run_batch() == "idle"
+    statuses = [db.get_package(p)["status"] for p in packages]
+    assert statuses == ["done", "failed", "done"]
+    assert "induced generation failure" in db.get_package(packages[1])["error"]
+
+
+async def test_usage_exhausted_is_durable_and_batch_resumes(
+    test_db, tmp_path, monkeypatch
+):
+    from backend.core import llm
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    packages = []
+    for i in (1, 2, 3):
+        _seed_job(f"p{i}")
+        pkg, _ = db.create_package(f"p{i}", version, "hash-a")
+        packages.append(pkg)
+    healed = False
+
+    def behavior(job):
+        if job["job_id"] == "p2" and not healed:
+            raise llm.UsageExhausted("weekly limit reached")
+        return _cited_tailored()[0]
+
+    _tailor_env(monkeypatch, tmp_path, behavior=behavior)
+    assert await tailor_pipeline.run_batch() == "waiting_usage"
+    assert db.get_package(packages[0])["status"] == "done"
+    assert db.get_package(packages[1])["status"] == "waiting_usage"
+    assert db.get_package(packages[2])["status"] == "queued"  # batch stopped
+
+    healed = True  # cooldown passed — the retry timer re-runs the batch
+    assert await tailor_pipeline.run_batch() == "idle"
+    assert [db.get_package(p)["status"] for p in packages] == ["done"] * 3
+
+
+async def test_engine_blocked_parks_package_queued_and_stops_batch(
+    test_db, tmp_path, monkeypatch
+):
+    from backend.core import llm
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    packages = []
+    for i in (1, 2):
+        _seed_job(f"p{i}")
+        pkg, _ = db.create_package(f"p{i}", version, "hash-a")
+        packages.append(pkg)
+
+    def behavior(job):
+        raise llm.AuthRequired("Not logged in")
+
+    generate_calls, _ = _tailor_env(monkeypatch, tmp_path, behavior=behavior)
+    assert await tailor_pipeline.run_batch() == "engine_blocked"
+    parked = db.get_package(packages[0])
+    assert parked["status"] == "queued"  # nothing this package did wrong
+    assert "AuthRequired" in parked["error"]
+    assert db.get_package(packages[1])["status"] == "queued"
+    assert generate_calls == ["p1"]  # batch stopped at the first hit
+
+
+async def test_validation_failure_after_repair_fails_package(
+    test_db, tmp_path, monkeypatch
+):
+    from backend.tailor import pipeline as tailor_pipeline
+    from backend.tailor import validate as validate_mod
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    pkg, _ = db.create_package("p1", version, "hash-a")
+    _tailor_env(monkeypatch, tmp_path)
+
+    async def always_failing(tailored, profile, ledger, cache):
+        return [{"claim_id": "exp0:b0", "reason": "fabricated metric"}]
+
+    repairs = []
+
+    async def fake_repair(tailored, failures, profile, ledger):
+        repairs.append(1)
+        return tailored
+
+    monkeypatch.setattr(validate_mod, "validate", always_failing)
+    monkeypatch.setattr(validate_mod, "repair", fake_repair)
+    assert await tailor_pipeline.run_package(pkg) == "failed"
+    row = db.get_package(pkg)
+    assert repairs == [1]  # exactly one repair round
+    assert "truth validation failed after repair" in row["error"]
+    assert "fabricated metric" in row["error"]
+
+
+async def test_package_fails_when_posting_changed_before_generation(
+    test_db, tmp_path, monkeypatch
+):
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    pkg, _ = db.create_package("p1", version, "hash-a")
+    db.save_job_detail("p1", "Rewritten posting.", "hash-new")  # edited
+    generate_calls, _ = _tailor_env(monkeypatch, tmp_path)
+    assert await tailor_pipeline.run_package(pkg) == "failed"
+    assert generate_calls == []  # no LLM spend on stale inputs
+    assert "posting changed" in db.get_package(pkg)["error"]
+
+
+async def test_generate_endpoint_gates_and_creates(test_db, monkeypatch):
+    from fastapi import HTTPException
+
+    from backend.api import routes
+
+    spawned = []
+    monkeypatch.setattr(routes, "_spawn_package_worker",
+                        lambda: spawned.append(True) or True)
+
+    with pytest.raises(HTTPException) as exc:
+        await routes.packages_generate({"job_ids": ["p1"]})
+    assert exc.value.status_code == 409  # no confirmed profile
+
+    version = _confirm_profile()
+    with pytest.raises(HTTPException) as exc:
+        await routes.packages_generate({"job_ids": ["ghost"]})
+    assert exc.value.status_code == 404
+
+    db.upsert_job({"job_id": "nodesc", "title": "T", "company": "C",
+                   "url": "https://example.invalid/x"})
+    with pytest.raises(HTTPException) as exc:
+        await routes.packages_generate({"job_ids": ["nodesc"]})
+    assert exc.value.status_code == 409  # no cached description yet
+
+    _seed_job("p1")
+    result = await routes.packages_generate({"job_ids": ["p1", "p1"]})
+    assert result["created"] == 1  # duplicate selection dedupes
+    assert len(result["package_ids"]) == 2
+    assert spawned == [True]
+    assert db.get_package(result["package_ids"][0])["profile_version"] == version

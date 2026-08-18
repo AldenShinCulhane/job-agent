@@ -19,6 +19,7 @@ from backend.resume.schema import PROFILE_SCHEMA
 from backend.scoring import llm_layer
 from backend.scoring import pipeline as scoring_pipeline
 from backend.tailor import compile as latex
+from backend.tailor import pipeline as tailor_pipeline
 
 log = logging.getLogger(__name__)
 
@@ -370,11 +371,13 @@ async def _pipeline_worker(run_id: int, profile_version: int) -> None:
 
 def _on_engine_recovered() -> None:
     """A successful probe/reprobe proves the LLM engine works again:
-    drop the stall banner, reset the circuit breaker, resume scoring."""
+    drop the stall banner, reset the circuit breaker, resume scoring —
+    and any package batch that was parked on an engine problem."""
     global _pipeline_retry_attempts
     _pipeline_retry_attempts = 0
     _clear_scoring_stall()
     _maybe_resume_scoring()
+    _maybe_resume_packages()
 
 
 # A persisted stall must never dead-end: this shutdown-owned loop is the
@@ -526,6 +529,66 @@ def _maybe_resume_scoring() -> bool:
     if scoring_pipeline.pending_count(run["id"]) == 0:
         return False
     return _spawn_pipeline(run["id"])
+
+
+# --- Package batch (tailoring pipeline, PLAN.md §4.5/§4.6) ------------------
+# One sequential batch worker; the batch loop re-reads resumable rows so
+# selections queued mid-run are picked up. UsageExhausted arms a durable
+# retry timer; auth/config problems park packages 'queued' and the batch
+# resumes from engine recovery (probe/reprobe) — no user gate anywhere.
+
+_package_worker_task: asyncio.Task | None = None
+_package_retry_task: asyncio.Task | None = None
+
+
+def _spawn_package_worker() -> bool:
+    global _package_worker_task
+    current = _package_worker_task
+    if (current is not None and not current.done()
+            and current is not asyncio.current_task()):
+        return False  # running worker re-reads the queue before exiting
+    # (An exiting worker may spawn its own replacement — see the
+    # last-gap respawn in _package_batch_worker.)
+    _package_worker_task = asyncio.create_task(_package_batch_worker())
+    return True
+
+
+async def _package_batch_worker() -> None:
+    try:
+        outcome = await tailor_pipeline.run_batch()
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — worker death must not strand the queue
+        log.exception("package batch worker crashed")
+        return
+    if outcome == "waiting_usage":
+        _arm_package_retry(max(llm.seconds_until_retry(), 60.0))
+    elif outcome == "idle" and db.packages_to_resume():
+        # A selection landed in the gap between the final queue check and
+        # task exit — run again rather than strand it. engine_blocked is
+        # deliberately NOT respawned here: its packages sit 'queued' until
+        # engine recovery, and an immediate respawn would hot-loop.
+        _maybe_resume_packages()
+
+
+def _arm_package_retry(delay: float) -> None:
+    global _package_retry_task
+    if _package_retry_task is not None and not _package_retry_task.done():
+        return
+    _package_retry_task = asyncio.create_task(_package_retry_after(delay))
+
+
+async def _package_retry_after(delay: float) -> None:
+    jittered = delay + random.uniform(5, 30)
+    log.info("package batch retries in %.0f s", jittered)
+    await asyncio.sleep(jittered)
+    _maybe_resume_packages()
+
+
+def _maybe_resume_packages() -> bool:
+    if not db.packages_to_resume():
+        return False
+    return _spawn_package_worker()
 
 
 def _spawn_search(run_id: int) -> bool:
@@ -688,6 +751,9 @@ def recover_search_runs() -> list[int]:
         # A previous process may have died mid-scoring: the run is done
         # but jobs remain unscored. Same auto-resume rule as search.
         _maybe_resume_scoring()
+    # Mid-flight packages from a previous process resume too — completed
+    # stages are persisted, so nothing is regenerated (PLAN.md §4.6).
+    _maybe_resume_packages()
     return claimed
 
 
@@ -701,6 +767,7 @@ async def shutdown_background_tasks() -> None:
         t
         for t in [_connect_task, _cap_retry_task, _pipeline_task,
                   _pipeline_retry_task, _stall_recovery_task,
+                  _package_worker_task, _package_retry_task,
                   *_search_tasks.values()]
         # Completed tasks may belong to a previous event loop (an earlier
         # lifespan in the same process); awaiting them there raises.
@@ -852,6 +919,62 @@ async def retry_scoring():
     _pipeline_retry_attempts = 0
     _clear_scoring_stall()
     return {"resumed": _maybe_resume_scoring()}
+
+
+@router.post("/packages/generate")
+async def packages_generate(body: dict):
+    """Gate 3: the user's job selection. Everything after this click is
+    autonomous — generation, validation, fitting, publish."""
+    job_ids = body.get("job_ids") or []
+    if not isinstance(job_ids, list) or not job_ids:
+        raise HTTPException(status_code=422, detail="Select at least one job.")
+    try:
+        version, _ = scoring_pipeline.confirmed_profile()
+    except scoring_pipeline.NoConfirmedProfile as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    jobs = []
+    for job_id in job_ids:
+        job = db.get_job(str(job_id))
+        if job is None:
+            raise HTTPException(status_code=404, detail=f"Unknown job {job_id}")
+        if not job.get("description_hash"):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Job {job_id} has no cached description yet — "
+                       "wait for scoring or open its details first.",
+            )
+        jobs.append(job)
+    created = 0
+    package_ids = []
+    for job in jobs:
+        package_id, was_created = db.create_package(
+            job["job_id"], version, job["description_hash"])
+        package_ids.append(package_id)
+        created += int(was_created)
+    _spawn_package_worker()
+    return {"package_ids": package_ids, "created": created}
+
+
+@router.get("/packages")
+async def packages_list():
+    return {"packages": db.list_packages(),
+            "page_limit": tailor_pipeline.resume_page_limit()}
+
+
+_PACKAGE_FILES = ("resume.pdf", "cover_letter.pdf", "job.md")
+
+
+@router.get("/packages/{package_id}/file/{name}")
+async def package_file(package_id: int, name: str):
+    if name not in _PACKAGE_FILES:
+        raise HTTPException(status_code=404, detail="Unknown package file.")
+    package = db.get_package(package_id)
+    if package is None or package["status"] != "done" or not package["output_dir"]:
+        raise HTTPException(status_code=404, detail="Package not published.")
+    path = Path(package["output_dir"]) / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Artifact missing on disk.")
+    return FileResponse(path, filename=name)
 
 
 @router.post("/search/rerank")
