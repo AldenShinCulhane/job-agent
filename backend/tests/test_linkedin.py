@@ -757,12 +757,15 @@ async def test_challenge_injected_midscroll_stops_before_next_scroll(
 
 
 class FakeDetailPage:
-    """Signed-in job-detail page: description renders on selector wait."""
+    """Signed-in job-detail page: description TEXT renders on the
+    hydration wait — the container id alone appears long before the
+    text does (observed live), so detail mode waits on a JS predicate
+    over the description's innerText, never on bare selector presence."""
 
     def __init__(self, html: str | None = None):
         self.url = "https://www.linkedin.com/jobs/view/9000000001/"
         self.scrolls = 0
-        self.waited_selectors: list[str] = []
+        self.waited_predicates: list[tuple[str, str]] = []
         self._html = html or (
             '<html><body><header class="global-nav">x</header>'
             '<div id="JobDetails_AboutTheJob_1">About the job … text</div>'
@@ -781,11 +784,11 @@ class FakeDetailPage:
     async def evaluate(self, script):
         self.scrolls += 1
 
-    async def wait_for_selector(self, selector, timeout=None):
-        self.waited_selectors.append(selector)
+    async def wait_for_function(self, expression, arg=None, timeout=None):
+        self.waited_predicates.append((expression, arg))
 
 
-async def test_detail_mode_waits_for_selector_and_never_scrolls(test_db):
+async def test_detail_mode_waits_for_rendered_text_and_never_scrolls(test_db):
     sup = LinkedInSupervisor()
     sup.state = "ready"
     page = FakeDetailPage()
@@ -793,8 +796,10 @@ async def test_detail_mode_waits_for_selector_and_never_scrolls(test_db):
     html = await sup.fetch_page(page.url, mode="detail")
     assert "About the job" in html
     assert page.scrolls == 0
-    assert len(page.waited_selectors) == 1
-    assert "JobDetails_AboutTheJob" in page.waited_selectors[0]
+    assert len(page.waited_predicates) == 1
+    expression, arg = page.waited_predicates[0]
+    assert "innerText" in expression  # waits for text, not bare presence
+    assert "JobDetails_AboutTheJob" in arg
 
 
 async def test_detail_mode_still_latches_checkpoint(test_db):

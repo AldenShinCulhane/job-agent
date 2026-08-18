@@ -31,7 +31,7 @@ _SCROLL_STEPS = 8
 # Detail pages render the description without lazy-load scrolling; wait
 # for the description container instead of scrolling (M3 reviewer
 # directive — cuts ~10-15s per detail fetch).
-_DETAIL_WAIT_MS = 10_000
+_DETAIL_WAIT_MS = 20_000  # text hydrates ~10-15 s after load (observed live)
 
 
 class SupervisorError(Exception):
@@ -217,8 +217,15 @@ class LinkedInSupervisor:
             )
             if mode == "detail":
                 try:
-                    await page.wait_for_selector(
-                        ", ".join(selectors.SELECTORS["detail_description"]),
+                    # The container id appears well before LinkedIn hydrates
+                    # its text (observed live: ~10-15 s), so waiting for the
+                    # selector alone captures an empty shell. Wait for the
+                    # description to actually carry substantial text.
+                    await page.wait_for_function(
+                        "sel => { const el = document.querySelector(sel);"
+                        " return !!el && el.innerText"
+                        " && el.innerText.trim().length > 200; }",
+                        arg=", ".join(selectors.SELECTORS["detail_description"]),
                         timeout=_DETAIL_WAIT_MS,
                     )
                 except Exception:  # noqa: BLE001 — best-effort wait; the
