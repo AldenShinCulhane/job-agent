@@ -185,7 +185,14 @@ def _spawn_search(run_id: int) -> bool:
         return False
     task = asyncio.create_task(_connect_then_search(run_id))
     _search_tasks[run_id] = task
-    task.add_done_callback(lambda t: _search_tasks.pop(run_id, None))
+
+    def _cleanup(finished: asyncio.Task, run_id: int = run_id) -> None:
+        # Only remove our own registration — a replacement worker may
+        # already occupy the slot by the time this callback runs.
+        if _search_tasks.get(run_id) is finished:
+            _search_tasks.pop(run_id, None)
+
+    task.add_done_callback(_cleanup)
     return True
 
 
@@ -199,43 +206,77 @@ def _spawn_connect() -> None:
 async def _connect_then_search(run_id: int) -> None:
     """Background driver for a search run: establish the session (waiting
     for the user's sign-in if needed), then collect. Every failure lands
-    in a terminal run status — the task never dies silently."""
+    in a terminal run status — the task never dies silently. Cancellation
+    (shutdown) is the one exception: the run stays 'running' on purpose
+    so startup recovery reclaims it."""
     try:
-        await sources.source.connect()
-    except sources.CaptchaStop as exc:
-        db.update_search_run(run_id, status="stopped_captcha", message=str(exc))
-        return
-    except sources.AuthRequired as exc:
-        db.update_search_run(run_id, status="stopped_auth", message=str(exc))
-        return
+        try:
+            await sources.source.connect()
+        except sources.CaptchaStop as exc:
+            db.update_search_run(run_id, status="stopped_captcha", message=str(exc))
+            return
+        except sources.AuthRequired as exc:
+            db.update_search_run(run_id, status="stopped_auth", message=str(exc))
+            return
+        await sources.source.resume(run_id)
+    except asyncio.CancelledError:
+        raise  # shutdown: leave the run 'running' for recovery
     except Exception as exc:  # noqa: BLE001 — terminal state over silent death
-        log.exception("LinkedIn connect failed for run %s", run_id)
+        log.exception("search driver failed for run %s", run_id)
         db.update_search_run(
             run_id, status="stopped_error", message=f"{type(exc).__name__}: {exc}"
         )
-        return
-    await sources.source.resume(run_id)
 
 
 async def _connect_only() -> None:
     try:
         await sources.source.connect()
     except (sources.AuthRequired, sources.CaptchaStop):
-        pass  # state is already persisted and bannered by the supervisor
+        return  # state is already persisted and bannered by the supervisor
+    except asyncio.CancelledError:
+        raise
     except Exception:  # noqa: BLE001
         log.exception("LinkedIn connect failed")
+        return
+    # Session is good again — automatically reclaim the work that was
+    # blocked on it (gate 2 rule: the user performs an action, never
+    # approves one; no extra Resume click).
+    _reclaim_runs(("running", "stopped_auth", "stopped_captcha"))
+
+
+def _reclaim_runs(statuses: tuple[str, ...]) -> list[int]:
+    claimed = []
+    for run in db.search_runs_by_status(statuses):
+        if run["status"] != "running":
+            db.update_search_run(run["id"], status="running", message=None)
+        if _spawn_search(run["id"]):
+            claimed.append(run["id"])
+            log.info("reclaimed search run %s (was %s)", run["id"], run["status"])
+    return claimed
 
 
 def recover_search_runs() -> list[int]:
-    """Startup recovery: runs left in 'running' by a previous process are
-    orphans — reclaim each with a fresh worker so an interrupted search
-    resumes across restarts without user action. Returns claimed ids."""
-    claimed = []
-    for run in db.running_search_runs():
-        if _spawn_search(run["id"]):
-            claimed.append(run["id"])
-            log.info("recovered interrupted search run %s", run["id"])
-    return claimed
+    """Startup recovery: reclaim runs left 'running' by a previous
+    process. If a persisted captcha stop was restored, defer — restarting
+    navigation against a checkpoint is a bypass-shaped move; the work is
+    reclaimed when the user resolves it and connects."""
+    if sources.source.current_state() == "captcha_stop":
+        log.info("captcha stop persisted — deferring search recovery until resolved")
+        return []
+    return _reclaim_runs(("running",))
+
+
+async def shutdown_background_tasks() -> None:
+    """Cancel and await every background worker before the browser
+    closes. connect() can hold the supervisor lock for up to 15 minutes
+    of login polling — close() would deadlock behind it, and an
+    un-cancelled search task could reopen the browser after close.
+    Interrupted runs stay 'running' for startup recovery."""
+    tasks = [t for t in [_connect_task, *_search_tasks.values()] if t is not None]
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 @router.get("/linkedin/status")
@@ -257,13 +298,19 @@ async def search_start(body: dict):
     keywords = (body.get("keywords") or "").strip()
     if not keywords:
         raise HTTPException(status_code=422, detail="Search needs keywords.")
+    cap = body.get("cap")
+    if cap is not None:
+        if not isinstance(cap, int) or isinstance(cap, bool) or not 1 <= cap <= 1000:
+            raise HTTPException(
+                status_code=422, detail="cap must be an integer between 1 and 1000."
+            )
     config = {
         "keywords": keywords,
         "location": (body.get("location") or "").strip() or None,
         "date_posted": body.get("date_posted"),
         "workplace": body.get("workplace") or [],
         "experience": body.get("experience") or [],
-        "cap": body.get("cap"),
+        "cap": cap,
     }
     run_id = db.create_search_run(config)
     _spawn_search(run_id)

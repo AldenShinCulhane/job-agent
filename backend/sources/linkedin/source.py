@@ -33,6 +33,10 @@ class LinkedInSource(JobSource):
     def mark_connecting(self) -> None:
         self._supervisor.mark_connecting()
 
+    def current_state(self) -> str:
+        """Synchronous state read for startup recovery decisions."""
+        return self._supervisor.state
+
     def restore_state(self) -> None:
         self._supervisor.restore_state()
 

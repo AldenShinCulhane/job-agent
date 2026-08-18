@@ -29,8 +29,12 @@ async def _lifespan(app: FastAPI):
     sources.source.restore_state()
     api_routes.recover_search_runs()
     yield
-    # Close the LinkedIn browser context cleanly so the persistent
+    # Cancel background workers FIRST — connect() can hold the supervisor
+    # lock for minutes of login polling, and close() would deadlock
+    # behind it. Interrupted runs stay 'running' for the next startup's
+    # recovery. Then close the browser context cleanly so the persistent
     # profile in .data/browser/ isn't left mid-write.
+    await api_routes.shutdown_background_tasks()
     await sources.source.close()
 
 

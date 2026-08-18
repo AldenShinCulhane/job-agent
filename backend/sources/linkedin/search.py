@@ -121,7 +121,6 @@ async def run_search(supervisor, run_id: int) -> dict:
     if run is None:
         raise ValueError(f"no search run {run_id}")
     config = run["config"]
-    cap = int(config.get("cap") or DEFAULT_RESULT_CAP)
     start, collected = run["next_start"], run["collected"]
 
     def progress(**extra) -> None:
@@ -129,6 +128,9 @@ async def run_search(supervisor, run_id: int) -> dict:
 
     status, message = "done", None
     try:
+        # Inside the guard: a malformed stored cap must terminate the run
+        # as stopped_error, never kill the driver and strand it 'running'.
+        cap = int(config.get("cap") or DEFAULT_RESULT_CAP)
         while collected < cap and start < pacing.SEARCH_PAGE_CAP * PAGE_SIZE:
             html = await supervisor.fetch_page(build_search_url(config, start))
             cards = parse_results(html)

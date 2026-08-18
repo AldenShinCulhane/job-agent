@@ -202,13 +202,12 @@ class LinkedInSupervisor:
             if self.state != "ready":
                 await self._ensure_logged_in(page, wait_for_user=False)
             await page.goto(url, wait_until="domcontentloaded")
-            if selectors.is_checkpoint_url(page.url or ""):
-                self._set_state(
-                    "captcha_stop",
-                    "LinkedIn is showing a security checkpoint. Complete it in "
-                    "the browser window; automation stays stopped.",
-                )
-                raise CaptchaStop(self.detail)
+            # Classify BEFORE any scripted interaction: a checkpoint or a
+            # login redirect must stop us immediately — scrolling around
+            # on a challenge page is exactly what we promised never to do.
+            self._raise_for_page_state(
+                selectors.classify_page(page.url or "", await page.content())
+            )
             for _ in range(_SCROLL_STEPS):
                 # The jobs list is its own scroll container; nudge it and
                 # the window so lazy cards render either way.
@@ -219,25 +218,26 @@ class LinkedInSupervisor:
                 )
                 await pacing.scroll_delay()
             html = await page.content()
-            # Classify what actually came back — a redirect to login (the
-            # session expired mid-run) or a checkpoint rendered on this
-            # URL must surface as its real state, never as page content.
-            verdict = selectors.classify_page(page.url or "", html)
-            if verdict == "captcha_stop":
-                self._set_state(
-                    "captcha_stop",
-                    "LinkedIn is showing a security checkpoint. Complete it in "
-                    "the browser window; automation stays stopped.",
-                )
-                raise CaptchaStop(self.detail)
-            if verdict == "logged_out":
-                self._set_state(
-                    "logged_out",
-                    "Your LinkedIn session expired — sign in again in the "
-                    "browser window.",
-                )
-                raise AuthRequired(self.detail)
+            # Re-classify what we ended up with — a challenge can also be
+            # injected while the page sits open.
+            self._raise_for_page_state(selectors.classify_page(page.url or "", html))
             return html
+
+    def _raise_for_page_state(self, verdict: str) -> None:
+        if verdict == "captcha_stop":
+            self._set_state(
+                "captcha_stop",
+                "LinkedIn is showing a security checkpoint. Complete it in "
+                "the browser window; automation stays stopped.",
+            )
+            raise CaptchaStop(self.detail)
+        if verdict == "logged_out":
+            self._set_state(
+                "logged_out",
+                "Your LinkedIn session expired — sign in again in the "
+                "browser window.",
+            )
+            raise AuthRequired(self.detail)
 
     def status(self) -> dict:
         return {"state": self.state, "detail": self.detail}

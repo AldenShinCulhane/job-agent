@@ -336,6 +336,9 @@ async def test_startup_recovery_resumes_interrupted_run(
     fake_browser = FakeSupervisor([SEARCH_FALLBACK_HTML, NO_RESULTS_HTML])
 
     class FakeSource:
+        def current_state(self):
+            return "idle"
+
         async def connect(self):
             return {"state": "ready"}
 
@@ -351,6 +354,197 @@ async def test_startup_recovery_resumes_interrupted_run(
     assert run["status"] == "done"
     assert run["collected"] == 4
     assert f"start={search.PAGE_SIZE}" in fake_browser.urls[0]  # resumed at offset
+
+
+class FakeLifecycleSource:
+    """Full JobSource stand-in for lifespan tests — no browser, but the
+    real run_search drives the real DB through FakeSupervisor pages."""
+
+    def __init__(self, browser_pages=None, connect_blocks=False, state="idle"):
+        self.state = state
+        self.connects = 0
+        self.browser = FakeSupervisor(browser_pages or [])
+        self.connect_blocks = connect_blocks
+
+    def restore_state(self):
+        pass
+
+    def current_state(self):
+        return self.state
+
+    def mark_connecting(self):
+        pass
+
+    async def connect(self, wait_for_user=True):
+        self.connects += 1
+        if self.connect_blocks:
+            await asyncio.Event().wait()  # a user who never signs in
+        return {"state": "ready", "detail": None}
+
+    async def resume(self, rid):
+        db.update_search_run(rid, status="running")
+        return await search.run_search(self.browser, rid)
+
+    async def health(self):
+        return {"state": self.state, "detail": None}
+
+    async def close(self):
+        pass
+
+
+def _lifespan_app(monkeypatch, tmp_path, fake_source):
+    """Wire the real create_app() (real lifespan startup/shutdown) to a
+    temp DB and the fake source."""
+    from backend import sources as sources_pkg
+    from backend.main import create_app
+
+    monkeypatch.setattr(db, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "test.sqlite3")
+    monkeypatch.setattr(sources_pkg, "source", fake_source)
+    return create_app()
+
+
+def _seed_orphaned_run() -> int:
+    """A run mid-flight when its process died: one page checkpointed,
+    status still 'running', no task holding it."""
+    run_id = db.create_search_run({"keywords": "engineer", "cap": 50})
+    db.record_search_page(
+        run_id, search.parse_results(SEARCH_HTML), search.PAGE_SIZE, cap=50
+    )
+    return run_id
+
+
+def test_lifespan_recovers_run_and_shuts_down(tmp_path, monkeypatch, no_delays):
+    import time
+
+    from fastapi.testclient import TestClient
+
+    fake = FakeLifecycleSource(browser_pages=[SEARCH_FALLBACK_HTML, NO_RESULTS_HTML])
+    app = _lifespan_app(monkeypatch, tmp_path, fake)
+    run_id = _seed_orphaned_run()
+
+    with TestClient(app):  # lifespan startup fires real recovery
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if db.get_search_run(run_id)["status"] == "done":
+                break
+            time.sleep(0.05)
+    run = db.get_search_run(run_id)
+    assert run["status"] == "done"
+    assert run["collected"] == 4
+    assert f"start={search.PAGE_SIZE}" in fake.browser.urls[0]  # resumed at offset
+
+
+def test_lifespan_shutdown_cancels_stuck_connect(tmp_path, monkeypatch, no_delays):
+    """Shutdown must cancel a worker parked in connect()'s login polling
+    instead of hanging behind it, and leave the run 'running' so the next
+    startup recovers it."""
+    import time
+
+    from fastapi.testclient import TestClient
+
+    fake = FakeLifecycleSource(connect_blocks=True)
+    app = _lifespan_app(monkeypatch, tmp_path, fake)
+    run_id = _seed_orphaned_run()
+
+    with TestClient(app):
+        deadline = time.time() + 5
+        while time.time() < deadline and fake.connects == 0:
+            time.sleep(0.05)
+        assert fake.connects == 1  # recovery claimed the run, then blocked
+    # Context exit returned => shutdown didn't hang. Run stays claimable.
+    assert db.get_search_run(run_id)["status"] == "running"
+
+
+def test_startup_recovery_defers_while_captcha_stopped(
+    tmp_path, monkeypatch, no_delays
+):
+    """A persisted captcha stop must gate recovery — restarting
+    navigation against a checkpoint is a bypass-shaped move."""
+    import time
+
+    from fastapi.testclient import TestClient
+
+    fake = FakeLifecycleSource(state="captcha_stop")
+    app = _lifespan_app(monkeypatch, tmp_path, fake)
+    run_id = _seed_orphaned_run()
+
+    with TestClient(app):
+        time.sleep(0.3)
+        assert fake.connects == 0  # nothing touched the browser
+    assert db.get_search_run(run_id)["status"] == "running"  # deferred, not lost
+
+
+async def test_connect_success_reclaims_stopped_auth_run(
+    test_db, no_delays, monkeypatch
+):
+    """Gate 2 rule: after the user signs back in via Connect, the
+    auth-stopped search resumes with no extra Resume click."""
+    from backend.api import routes
+
+    run_id = _seed_orphaned_run()
+    db.update_search_run(run_id, status="stopped_auth", message="expired")
+
+    fake = FakeLifecycleSource(browser_pages=[SEARCH_FALLBACK_HTML, NO_RESULTS_HTML])
+    monkeypatch.setattr(routes.sources, "source", fake)
+    await routes._connect_only()
+    task = routes._search_tasks.get(run_id)
+    assert task is not None  # reclaimed automatically
+    await task
+
+    run = db.get_search_run(run_id)
+    assert run["status"] == "done"
+    assert run["collected"] == 4
+    assert run["message"] is None  # stale auth error cleared
+
+
+async def test_search_start_rejects_bad_cap(test_db):
+    from fastapi import HTTPException
+
+    from backend.api import routes
+
+    for bad in ("lots", 0, -5, 1001, True):
+        with pytest.raises(HTTPException):
+            await routes.search_start({"keywords": "x", "cap": bad})
+
+
+class FakeCheckpointPage:
+    """Playwright page stand-in that lands on a challenge after goto."""
+
+    def __init__(self, landing_url: str, html: str):
+        self.url = ""
+        self._landing_url = landing_url
+        self._html = html
+        self.scrolls = 0
+
+    def is_closed(self):
+        return False
+
+    async def goto(self, url, wait_until=None):
+        self.url = self._landing_url
+
+    async def content(self):
+        return self._html
+
+    async def evaluate(self, script):
+        self.scrolls += 1
+
+
+async def test_checkpoint_detected_before_any_scroll(test_db):
+    """The latch must fire on the DOM immediately after navigation —
+    scripted scrolling on a challenge page is exactly what we promised
+    never to do."""
+    sup = LinkedInSupervisor()
+    sup.state = "ready"
+    page = FakeCheckpointPage(
+        "https://www.linkedin.com/jobs/search/?keywords=x",  # URL looks fine
+        '<html><body><form id="challenge-form"></form></body></html>',
+    )
+    sup._page = page
+    with pytest.raises(CaptchaStop):
+        await sup.fetch_page("https://www.linkedin.com/jobs/search/?keywords=x")
+    assert page.scrolls == 0
+    assert sup.state == "captcha_stop"
 
 
 async def test_duplicate_resume_spawns_single_worker(test_db, monkeypatch):

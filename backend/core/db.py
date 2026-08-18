@@ -360,15 +360,18 @@ def latest_search_run() -> dict | None:
     return _search_run_query("ORDER BY id DESC LIMIT 1", ())
 
 
-def running_search_runs() -> list[dict]:
-    """Runs left in 'running' — after a restart these are orphans (no
-    task holds them) and must be reclaimed by startup recovery."""
+def search_runs_by_status(statuses: tuple[str, ...]) -> list[dict]:
+    """Runs in any of `statuses`. 'running' rows after a restart are
+    orphans (no task holds them) awaiting recovery; stopped_auth /
+    stopped_captcha rows are reclaimed when a connect succeeds."""
     import json
 
+    placeholders = ", ".join("?" for _ in statuses)
     with _connect() as conn:
         rows = conn.execute(
             "SELECT id, config_json, status, next_start, collected, message, "
-            "started_at, updated_at FROM search_runs WHERE status = 'running'"
+            f"started_at, updated_at FROM search_runs WHERE status IN ({placeholders})",
+            statuses,
         ).fetchall()
     return [
         {
