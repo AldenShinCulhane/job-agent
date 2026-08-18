@@ -405,17 +405,41 @@ def save_score(
         )
 
 
-def set_llm_rerank(job_id: str, rerank: float | None, explanation: dict | None) -> None:
+def set_llm_rerank(job_id: str, rerank: float | None) -> None:
+    """LLM layer only — never touches the deterministic baseline."""
+    with _connect() as conn:
+        conn.execute(
+            "UPDATE job_scores SET llm_rerank = ? WHERE job_id = ?",
+            (rerank, job_id),
+        )
+
+
+def set_explanation(job_id: str, explanation: dict | None) -> None:
     """LLM layer only — never touches the deterministic baseline."""
     import json
 
     with _connect() as conn:
         conn.execute(
-            "UPDATE job_scores SET llm_rerank = ?, explanation_json = ? "
-            "WHERE job_id = ?",
-            (rerank, json.dumps(explanation) if explanation is not None else None,
-             job_id),
+            "UPDATE job_scores SET explanation_json = ? WHERE job_id = ?",
+            (json.dumps(explanation) if explanation is not None else None, job_id),
         )
+
+
+def scoring_pending(run_id: int, profile_version: int) -> int:
+    """How many of the run's jobs still lack a score computed from the
+    CURRENT description hash and profile version — the pipeline's
+    remaining-work count (0 = fully scored)."""
+    with _connect() as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM search_run_jobs "
+            "JOIN jobs ON jobs.job_id = search_run_jobs.job_id "
+            "LEFT JOIN job_scores ON job_scores.job_id = jobs.job_id "
+            "WHERE search_run_jobs.run_id = ? AND ("
+            "  job_scores.job_id IS NULL "
+            "  OR job_scores.profile_version != ? "
+            "  OR job_scores.jd_hash IS NOT jobs.description_hash)",
+            (run_id, profile_version),
+        ).fetchone()[0]
 
 
 def get_score(job_id: str) -> dict | None:

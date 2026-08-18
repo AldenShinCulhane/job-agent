@@ -13,6 +13,8 @@ from backend.core import db, llm
 from backend.core.events import broker
 from backend.resume import facts, ingest, template
 from backend.resume.schema import PROFILE_SCHEMA
+from backend.scoring import llm_layer
+from backend.scoring import pipeline as scoring_pipeline
 from backend.tailor import compile as latex
 
 log = logging.getLogger(__name__)
@@ -179,6 +181,10 @@ async def confirm_profile(body: dict):
         )
     db.confirm_profile(version)
     broker.publish("profile", {"version": version, "event": "confirmed"})
+    # Existing scores were computed against the previous profile version;
+    # re-score the current run (deterministic-only when requirements are
+    # already cached — cheap, no LLM).
+    _maybe_resume_scoring()
     return {"ok": True, "version": version}
 
 
@@ -187,6 +193,46 @@ async def confirm_profile(body: dict):
 _search_tasks: dict[int, asyncio.Task] = {}
 _connect_task: asyncio.Task | None = None
 _cap_retry_task: asyncio.Task | None = None
+_pipeline_task: asyncio.Task | None = None
+_pipeline_run_id: int | None = None
+
+
+def _spawn_pipeline(run_id: int) -> bool:
+    """One scoring pipeline at a time, always for the current run. A
+    pass for an older run is cancelled — its data-derived progress is
+    kept, so nothing is lost."""
+    global _pipeline_task, _pipeline_run_id
+    if _pipeline_task is not None and not _pipeline_task.done():
+        if _pipeline_run_id == run_id:
+            return False
+        _pipeline_task.cancel()
+    _pipeline_run_id = run_id
+    _pipeline_task = asyncio.create_task(_pipeline_worker(run_id))
+    return True
+
+
+async def _pipeline_worker(run_id: int) -> None:
+    try:
+        summary = await scoring_pipeline.run_pipeline(run_id)
+        if summary["stopped"] == "cap":
+            _arm_cap_retry()  # the reset callback re-triggers scoring too
+    except asyncio.CancelledError:
+        raise
+    except scoring_pipeline.NoConfirmedProfile:
+        log.info("scoring skipped for run %s: no confirmed profile", run_id)
+    except Exception:  # noqa: BLE001 — idempotent; next trigger retries
+        log.exception("scoring pipeline failed for run %s", run_id)
+
+
+def _maybe_resume_scoring() -> bool:
+    """Kick the pipeline when the current run is done collecting but has
+    jobs the (current) profile hasn't been scored against."""
+    run = db.latest_search_run()
+    if run is None or run["status"] != "done":
+        return False
+    if scoring_pipeline.pending_count(run["id"]) == 0:
+        return False
+    return _spawn_pipeline(run["id"])
 
 
 def _spawn_search(run_id: int) -> bool:
@@ -233,6 +279,8 @@ async def _connect_then_search(run_id: int) -> None:
         result = await sources.source.resume(run_id)
         if result and result.get("status") == "stopped_cap":
             _arm_cap_retry()  # resumes by itself when the UTC budget resets
+        elif result and result.get("status") == "done":
+            _spawn_pipeline(run_id)  # scoring runs automatically — no gate
     except asyncio.CancelledError:
         raise  # shutdown: leave the run 'running' for recovery
     except Exception as exc:  # noqa: BLE001 — terminal state over silent death
@@ -258,7 +306,10 @@ async def _connect_only() -> None:
     # blocked, the current run may still be cap-stopped (captcha and cap
     # can stack): hand it to cap recovery so its retry gets armed.
     if not _reclaim_latest(("running", "stopped_auth", "stopped_captcha")):
-        _maybe_resume_capped()
+        if not _maybe_resume_capped():
+            # Collection is complete — but scoring may have been the
+            # thing the dead session interrupted.
+            _maybe_resume_scoring()
 
 
 def _reclaim_latest(statuses: tuple[str, ...]) -> list[int]:
@@ -299,7 +350,9 @@ async def _cap_retry_after_reset() -> None:
     delay = sources.seconds_until_cap_reset() + random.uniform(60, 300)
     log.info("daily action cap spent — search auto-resumes in %.0f min", delay / 60)
     await asyncio.sleep(delay)
-    _reclaim_latest(("stopped_cap",))
+    if not _reclaim_latest(("stopped_cap",)):
+        # Collection already finished — the cap interrupted scoring.
+        _maybe_resume_scoring()
 
 
 def _supersede_stale_running(except_id: int | None) -> None:
@@ -329,6 +382,10 @@ def recover_search_runs() -> list[int]:
     claimed = _reclaim_latest(("running",))
     if not claimed:
         claimed = _maybe_resume_capped()
+    if not claimed:
+        # A previous process may have died mid-scoring: the run is done
+        # but jobs remain unscored. Same auto-resume rule as search.
+        _maybe_resume_scoring()
     return claimed
 
 
@@ -340,8 +397,11 @@ async def shutdown_background_tasks() -> None:
     Interrupted runs stay 'running' for startup recovery."""
     tasks = [
         t
-        for t in [_connect_task, _cap_retry_task, *_search_tasks.values()]
-        if t is not None
+        for t in [_connect_task, _cap_retry_task, _pipeline_task,
+                  *_search_tasks.values()]
+        # Completed tasks may belong to a previous event loop (an earlier
+        # lifespan in the same process); awaiting them there raises.
+        if t is not None and not t.done()
     ]
     for task in tasks:
         task.cancel()
@@ -419,9 +479,14 @@ async def jobs_list(run_id: int | None = None):
     if run_id is None:
         latest = db.latest_search_run()
         if latest is None:
-            return {"jobs": [], "run_id": None}
+            return {"jobs": [], "run_id": None, "scoring_pending": 0}
         run_id = latest["id"]
-    return {"jobs": db.list_jobs(run_id), "run_id": run_id}
+    return {
+        "jobs": db.list_jobs(run_id),
+        "run_id": run_id,
+        # Remaining pipeline work — the UI shows "Scoring…" while > 0.
+        "scoring_pending": scoring_pipeline.pending_count(run_id),
+    }
 
 
 @router.post("/jobs/{job_id}/detail")
@@ -436,3 +501,33 @@ async def job_detail_fetch(job_id: str, force: bool = False):
         raise HTTPException(status_code=409, detail=str(exc))
     except sources.DetailParseError as exc:
         raise HTTPException(status_code=502, detail=str(exc))
+
+
+@router.post("/jobs/{job_id}/explain")
+async def job_explain(job_id: str):
+    """On-demand LLM explanation (strengths/gaps/pitch) for a scored job."""
+    try:
+        return await llm_layer.explain_job(job_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail=f"Unknown job {job_id}")
+    except (ValueError, scoring_pipeline.NoConfirmedProfile) as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except llm.EngineError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+@router.post("/search/rerank")
+async def search_rerank():
+    """LLM-order the close matches (within the band of the top score) of
+    the latest run. The deterministic baseline is never overwritten."""
+    run = db.latest_search_run()
+    if run is None:
+        raise HTTPException(status_code=404, detail="No search run to rerank.")
+    try:
+        return await llm_layer.rerank_close_matches(run["id"])
+    except scoring_pipeline.NoConfirmedProfile as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    except llm.EngineError as exc:
+        raise HTTPException(status_code=503, detail=str(exc))

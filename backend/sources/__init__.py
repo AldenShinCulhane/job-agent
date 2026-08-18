@@ -6,6 +6,7 @@ from backend.sources.linkedin.job_detail import DetailParseError
 from backend.sources.linkedin.pacing import (
     DailyCapReached,
     budget_remaining,
+    page_delay,
     seconds_until_cap_reset,
 )
 from backend.sources.linkedin.source import LinkedInSource
@@ -20,6 +21,7 @@ __all__ = [
     "DetailParseError",
     "LinkedInSource",
     "budget_remaining",
+    "page_delay",
     "seconds_until_cap_reset",
     "source",
 ]
