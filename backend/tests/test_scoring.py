@@ -644,10 +644,12 @@ async def test_pipeline_worker_arms_bounded_retry(test_db, monkeypatch):
     assert delays == [60.0, 120.0, 240.0]  # bounded backoff, then break
     # The open circuit is user-visible AND owned: it names the exact
     # (run, profile) it blocks, so restarts keep it enforced.
-    assert routes._get_scoring_stall() == {
-        "reason": "retry_exhausted", "detail": "engine hiccup",
-        "run_id": 1, "profile_version": 1,
-    }
+    stall = routes._get_scoring_stall()
+    assert stall["reason"] == "retry_exhausted"
+    assert stall["detail"] == "engine hiccup"
+    assert (stall["run_id"], stall["profile_version"]) == (1, 1)
+    assert stall["token"]  # recovery ownership travels with the stall
+    assert stall["next_attempt_at"] > 0  # durable schedule persisted
 
 
 async def test_pipeline_reprocesses_jd_refresh_during_normalization(
@@ -713,10 +715,10 @@ async def test_worker_persists_blocked_stall_without_timer(test_db, monkeypatch)
     monkeypatch.setattr(routes, "_pipeline_retry_attempts", 0)
     await routes._pipeline_worker(1, 1)
     assert armed == []
-    assert routes._get_scoring_stall() == {
-        "reason": "engine_blocked", "detail": "Not logged in",
-        "run_id": 1, "profile_version": 1,
-    }
+    stall = routes._get_scoring_stall()
+    assert stall["reason"] == "engine_blocked"
+    assert stall["detail"] == "Not logged in"
+    assert (stall["run_id"], stall["profile_version"]) == (1, 1)
 
 
 async def test_probe_success_clears_stall_and_resumes(test_db, monkeypatch):
@@ -848,9 +850,9 @@ async def test_stall_recovery_engine_blocked_polls_auth_then_reprobes(
     from backend.api import routes
     from backend.core import claude_cli, llm
 
-    routes._set_scoring_stall("engine_blocked", "Not logged in", 1, 1)
     monkeypatch.setattr(routes, "_STALL_AUTH_POLL_S", 0.0)
     monkeypatch.setattr(random_mod, "uniform", lambda a, b: 0.0)
+    token = routes._set_scoring_stall("engine_blocked", "Not logged in", 1, 1)
     problems = ["Not logged in", None]  # heals on the second poll
     monkeypatch.setattr(claude_cli, "subscription_problem",
                         lambda: problems.pop(0))
@@ -864,7 +866,7 @@ async def test_stall_recovery_engine_blocked_polls_auth_then_reprobes(
     monkeypatch.setattr(routes, "_maybe_resume_scoring",
                         lambda: resumed.append(True) or True)
 
-    await routes._stall_recovery_loop()
+    await routes._stall_recovery_loop(token)
     assert routes._get_scoring_stall() is None
     assert resumed == [True]
     assert problems == []  # first poll saw the problem, kept waiting
@@ -875,17 +877,210 @@ async def test_stall_recovery_retry_exhausted_long_cooldown(test_db, monkeypatch
 
     from backend.api import routes
 
-    routes._set_scoring_stall("retry_exhausted", "boom", 1, 1)
     monkeypatch.setattr(routes, "_STALL_RETRY_COOLDOWN_S", 0.0)
     monkeypatch.setattr(random_mod, "uniform", lambda a, b: 0.0)
+    token = routes._set_scoring_stall("retry_exhausted", "boom", 1, 1)
     monkeypatch.setattr(routes, "_pipeline_retry_attempts", 3)
     resumed = []
     monkeypatch.setattr(routes, "_maybe_resume_scoring",
                         lambda: resumed.append(True) or True)
 
-    await routes._stall_recovery_loop()
+    await routes._stall_recovery_loop(token)
     assert routes._get_scoring_stall() is None
     assert routes._pipeline_retry_attempts == 0  # breaker re-armed fresh
+    assert resumed == [True]
+
+
+async def test_stale_recovery_timer_cannot_touch_replacement_stall(
+    test_db, monkeypatch
+):
+    """A recovery pass armed for one stall must go inert when another
+    stall replaces it — an old retry_exhausted wake-up clearing a fresh
+    engine_blocked stall would resume scoring into a broken engine."""
+    from backend.api import routes
+
+    resumed = []
+    monkeypatch.setattr(routes, "_maybe_resume_scoring",
+                        lambda: resumed.append(True) or True)
+
+    # Replacement already landed by the time the old pass looks.
+    old_token = routes._set_scoring_stall("retry_exhausted", "boom", 1, 1)
+    routes._set_scoring_stall("engine_blocked", "Not logged in", 1, 1)
+    await routes._stall_recovery_loop(old_token)
+    stall = routes._get_scoring_stall()
+    assert stall is not None and stall["reason"] == "engine_blocked"
+    assert resumed == []  # the new stall was not cleared, nothing resumed
+
+    # Replacement lands DURING the old timer's sleep.
+    token_c = routes._set_scoring_stall("retry_exhausted", "boom", 1, 1)
+
+    async def swapping_sleep(seconds):
+        routes._set_scoring_stall("engine_blocked", "Not logged in", 1, 1)
+
+    monkeypatch.setattr(routes.asyncio, "sleep", swapping_sleep)
+    await routes._stall_recovery_loop(token_c)
+    stall = routes._get_scoring_stall()
+    assert stall is not None and stall["reason"] == "engine_blocked"
+    assert resumed == []
+
+
+async def test_arm_stall_recovery_replaces_superseded_task(test_db, monkeypatch):
+    """A live recovery task serving an OLD stall is not a reason to skip
+    arming: the task is swapped whenever the persisted stall changed."""
+    from backend.api import routes
+
+    monkeypatch.setattr(routes, "_stall_recovery_task", None)
+    monkeypatch.setattr(routes, "_stall_recovery_token", None)
+
+    token_a = routes._set_scoring_stall("retry_exhausted", "boom", 1, 1)
+    routes._arm_stall_recovery()
+    task_a = routes._stall_recovery_task
+    assert task_a is not None and routes._stall_recovery_token == token_a
+    routes._arm_stall_recovery()  # same stall — no churn
+    assert routes._stall_recovery_task is task_a
+
+    token_b = routes._set_scoring_stall("engine_blocked", "Not logged in", 1, 1)
+    routes._arm_stall_recovery()
+    task_b = routes._stall_recovery_task
+    assert task_b is not task_a
+    assert routes._stall_recovery_token == token_b
+    task_b.cancel()
+    await asyncio.gather(task_a, task_b, return_exceptions=True)
+    assert task_a.cancelled()  # the superseded timer can never fire
+
+
+async def test_retry_cooldown_is_durable_across_restarts(test_db, monkeypatch):
+    """The cooldown deadline lives in the stall payload: a restart waits
+    only the remaining time, never a fresh full hour."""
+    import time as time_mod
+
+    from backend.api import routes
+
+    token = routes._set_scoring_stall("retry_exhausted", "boom", 1, 1)
+    # Simulate a restart landing 42 s before the persisted deadline.
+    routes._update_stall_schedule(token, next_attempt_at=time_mod.time() + 42.0)
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(routes.asyncio, "sleep", fake_sleep)
+    resumed = []
+    monkeypatch.setattr(routes, "_maybe_resume_scoring",
+                        lambda: resumed.append(True) or True)
+
+    await routes._stall_recovery_loop(token)
+    assert len(sleeps) == 1 and 0 < sleeps[0] <= 42.0  # remaining, not 3600
+    assert routes._get_scoring_stall() is None
+    assert resumed == [True]
+
+
+async def test_engine_blocked_reprobe_backoff_is_persisted(test_db, monkeypatch):
+    """A failed reprobe doubles a PERSISTED backoff and reschedules from
+    it — a restart resumes the schedule instead of resetting it."""
+    import random as random_mod
+
+    from backend.api import routes
+    from backend.core import claude_cli, llm
+
+    monkeypatch.setattr(routes, "_STALL_AUTH_POLL_S", 100.0)
+    monkeypatch.setattr(random_mod, "uniform", lambda a, b: 0.0)
+    token = routes._set_scoring_stall("engine_blocked", "Not logged in", 1, 1)
+    routes._update_stall_schedule(token, next_attempt_at=0.0)  # due now
+    monkeypatch.setattr(claude_cli, "subscription_problem", lambda: None)
+    monkeypatch.setattr(llm, "reset_probe", lambda: None)
+    probes = []
+
+    async def flaky_probe():
+        probes.append(1)
+        if len(probes) == 1:
+            raise llm.TransientFailure("engine hiccup")
+        return "claude-fable-5"
+
+    monkeypatch.setattr(llm, "probe", flaky_probe)
+    sleeps, persisted = [], []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        persisted.append(routes._get_scoring_stall()["backoff_s"])
+
+    monkeypatch.setattr(routes.asyncio, "sleep", fake_sleep)
+    resumed = []
+    monkeypatch.setattr(routes, "_maybe_resume_scoring",
+                        lambda: resumed.append(True) or True)
+
+    await routes._stall_recovery_loop(token)
+    assert len(probes) == 2  # failed once, then recovered
+    assert len(sleeps) == 1 and 199.0 < sleeps[0] <= 200.0  # doubled wait
+    assert persisted == [200.0]  # ...and the doubled backoff is on disk
+    assert routes._get_scoring_stall() is None
+    assert resumed == [True]
+
+
+async def test_startup_arms_stall_recovery_despite_captcha_stop(
+    test_db, monkeypatch
+):
+    """Captcha stop and engine stall can stack: the startup captcha
+    deferral must not swallow the stall's recovery loop."""
+    from backend import sources
+    from backend.api import routes
+
+    routes._set_scoring_stall("engine_blocked", "Not logged in", 1, 1)
+    monkeypatch.setattr(routes, "_stall_recovery_task", None)
+    monkeypatch.setattr(routes, "_stall_recovery_token", None)
+    monkeypatch.setattr(sources.source, "current_state", lambda: "captcha_stop")
+
+    assert routes.recover_search_runs() == []  # search recovery deferred
+    task = routes._stall_recovery_task
+    assert task is not None and not task.done()  # recovery armed anyway
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_auth_status_failure_does_not_kill_recovery(test_db, monkeypatch):
+    """subscription_problem() raising (CLI timeout, missing binary) must
+    not end automatic recovery: logged, bounded persisted backoff, and
+    the next attempt still happens."""
+    import random as random_mod
+
+    from backend.api import routes
+    from backend.core import claude_cli, llm
+
+    monkeypatch.setattr(routes, "_STALL_AUTH_POLL_S", 100.0)
+    monkeypatch.setattr(random_mod, "uniform", lambda a, b: 0.0)
+    token = routes._set_scoring_stall("engine_blocked", "Not logged in", 1, 1)
+    routes._update_stall_schedule(token, next_attempt_at=0.0)  # due now
+    calls = []
+
+    def flaky_status():
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError("cli exploded")
+        return None  # healthy on the retry
+
+    monkeypatch.setattr(claude_cli, "subscription_problem", flaky_status)
+    monkeypatch.setattr(llm, "reset_probe", lambda: None)
+
+    async def fake_probe():
+        return "claude-fable-5"
+
+    monkeypatch.setattr(llm, "probe", fake_probe)
+    sleeps, persisted = [], []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        persisted.append(routes._get_scoring_stall()["backoff_s"])
+
+    monkeypatch.setattr(routes.asyncio, "sleep", fake_sleep)
+    resumed = []
+    monkeypatch.setattr(routes, "_maybe_resume_scoring",
+                        lambda: resumed.append(True) or True)
+
+    await routes._stall_recovery_loop(token)
+    assert len(calls) == 2  # the task survived the exception and retried
+    assert len(sleeps) == 1 and 199.0 < sleeps[0] <= 200.0  # bounded backoff
+    assert persisted == [200.0]  # backoff survives a restart too
+    assert routes._get_scoring_stall() is None
     assert resumed == [True]
 
 

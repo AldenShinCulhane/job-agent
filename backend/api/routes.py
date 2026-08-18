@@ -3,6 +3,8 @@ import json
 import logging
 import random
 import tempfile
+import time
+import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, UploadFile
@@ -238,12 +240,40 @@ _SCORING_STALL_KEY = "scoring_stall"
 
 
 def _set_scoring_stall(reason: str, detail: str | None,
-                       run_id: int, profile_version: int) -> None:
+                       run_id: int, profile_version: int) -> str:
+    """Persist a stall with its recovery schedule. `token` is the stall's
+    identity: the recovery loop acts only on the exact stall it was armed
+    for, so a stale timer can never clear a replacement stall.
+    `next_attempt_at`/`backoff_s` persist the schedule — after a restart
+    the loop sleeps only the remaining time, never a fresh full interval."""
+    if reason == "engine_blocked":
+        delay = _STALL_AUTH_POLL_S + random.uniform(5, 30)
+    else:
+        delay = _STALL_RETRY_COOLDOWN_S + random.uniform(30, 120)
+    token = uuid.uuid4().hex
     db.set_state(
         _SCORING_STALL_KEY,
         json.dumps({"reason": reason, "detail": detail,
-                    "run_id": run_id, "profile_version": profile_version}),
+                    "run_id": run_id, "profile_version": profile_version,
+                    "token": token,
+                    "next_attempt_at": time.time() + delay,
+                    "backoff_s": _STALL_AUTH_POLL_S}),
     )
+    return token
+
+
+def _update_stall_schedule(token: str, *, next_attempt_at: float,
+                           backoff_s: float | None = None) -> bool:
+    """Reschedule the stall's next automatic attempt — only if it is
+    still the same stall the caller was working on."""
+    stall = _get_scoring_stall()
+    if stall is None or stall.get("token") != token:
+        return False
+    stall["next_attempt_at"] = next_attempt_at
+    if backoff_s is not None:
+        stall["backoff_s"] = backoff_s
+    db.set_state(_SCORING_STALL_KEY, json.dumps(stall))
+    return True
 
 
 def _clear_scoring_stall() -> None:
@@ -351,36 +381,85 @@ def _on_engine_recovered() -> None:
 # automatic way out. engine_blocked polls the CLI auth status (free, no
 # LLM spend) and only performs a live reprobe once auth looks healthy —
 # with backoff on failed reprobes so a broken config can't drip-spend
-# requests. retry_exhausted sleeps one long durable cooldown, then
-# re-opens the breaker for a fresh pass. The user can always shortcut
-# both with POST /search/retry-scoring (no gate — it's error recovery).
+# requests. retry_exhausted waits out one long cooldown, then re-opens
+# the breaker for a fresh pass. The schedule lives in the stall payload
+# (next_attempt_at + backoff_s), so restarts wait only the remaining
+# time. The task is generation-owned: it serves exactly one stall token
+# and goes inert the moment that stall is cleared or replaced. The user
+# can always shortcut both with POST /search/retry-scoring (no gate —
+# it's error recovery).
 _stall_recovery_task: asyncio.Task | None = None
+_stall_recovery_token: str | None = None
 _STALL_AUTH_POLL_S = 300.0
 _STALL_RETRY_COOLDOWN_S = 3600.0
 
 
 def _arm_stall_recovery() -> None:
-    global _stall_recovery_task
+    global _stall_recovery_task, _stall_recovery_token
+    stall = _get_scoring_stall()
+    if stall is None:
+        return
+    token = stall.get("token")
     if _stall_recovery_task is not None and not _stall_recovery_task.done():
-        return
-    if _get_scoring_stall() is None:
-        return
-    _stall_recovery_task = asyncio.create_task(_stall_recovery_loop())
+        if _stall_recovery_token == token:
+            return  # already serving exactly this stall
+        # Serving a superseded stall — its timer must not fire against
+        # the new one (an old retry_exhausted wake-up would clear a
+        # fresh engine_blocked stall and resume into a broken engine).
+        _stall_recovery_task.cancel()
+    _stall_recovery_token = token
+    _stall_recovery_task = asyncio.create_task(_stall_recovery_loop(token))
 
 
-async def _stall_recovery_loop() -> None:
-    reprobe_delay = _STALL_AUTH_POLL_S
+def _stall_if_still(token: str) -> dict | None:
+    """The persisted stall, but only while it is still the one this
+    recovery pass owns — None means resolved or replaced, stop."""
+    stall = _get_scoring_stall()
+    if stall is None or stall.get("token") != token:
+        return None
+    return stall
+
+
+async def _stall_recovery_loop(token: str) -> None:
     while True:
-        stall = _get_scoring_stall()
+        stall = _stall_if_still(token)
         if stall is None:
-            return  # cleared elsewhere (progress, manual retry, probe)
-        if stall.get("reason") == "engine_blocked":
-            await asyncio.sleep(_STALL_AUTH_POLL_S + random.uniform(5, 30))
-            if _get_scoring_stall() is None:
+            return
+        remaining = float(stall.get("next_attempt_at", 0.0)) - time.time()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+            stall = _stall_if_still(token)
+            if stall is None:
                 return
-            problem = await asyncio.to_thread(claude_cli.subscription_problem)
+        backoff = float(stall.get("backoff_s", _STALL_AUTH_POLL_S))
+        if stall.get("reason") == "engine_blocked":
+            try:
+                problem = await asyncio.to_thread(claude_cli.subscription_problem)
+            except asyncio.CancelledError:
+                raise
+            except (Exception, SystemExit) as exc:  # noqa: BLE001
+                # A hung/broken CLI must not kill the recovery task —
+                # log, back off (bounded, persisted), keep trying.
+                log.warning("stall recovery: auth status check failed: %s: %s",
+                            type(exc).__name__, exc)
+                backoff = min(backoff * 2, 3600.0)
+                _update_stall_schedule(
+                    token,
+                    next_attempt_at=time.time() + backoff + random.uniform(5, 30),
+                    backoff_s=backoff,
+                )
+                continue
+            if _stall_if_still(token) is None:
+                return
             if problem is not None:
-                continue  # still logged out / wrong auth — keep polling free
+                # Still logged out / wrong auth — keep polling on the
+                # free fixed cadence.
+                _update_stall_schedule(
+                    token,
+                    next_attempt_at=(time.time() + _STALL_AUTH_POLL_S
+                                     + random.uniform(5, 30)),
+                )
+                continue
             # Auth looks healthy: one live reprobe proves it (or doesn't —
             # config errors and the like back off so retries can't
             # drip-spend the subscription).
@@ -390,15 +469,19 @@ async def _stall_recovery_loop() -> None:
             except asyncio.CancelledError:
                 raise
             except llm.EngineError:
-                await asyncio.sleep(reprobe_delay + random.uniform(5, 30))
-                reprobe_delay = min(reprobe_delay * 2, 3600.0)
+                backoff = min(backoff * 2, 3600.0)
+                _update_stall_schedule(
+                    token,
+                    next_attempt_at=time.time() + backoff + random.uniform(5, 30),
+                    backoff_s=backoff,
+                )
                 continue
+            if _stall_if_still(token) is None:
+                # Replaced while probing — the newer stall owns recovery.
+                return
             _on_engine_recovered()
             return
-        else:  # retry_exhausted: durable long cooldown, then one fresh pass
-            await asyncio.sleep(_STALL_RETRY_COOLDOWN_S + random.uniform(30, 120))
-            if _get_scoring_stall() is None:
-                return
+        else:  # retry_exhausted: cooldown elapsed — one fresh pass
             global _pipeline_retry_attempts
             _pipeline_retry_attempts = 0
             _clear_scoring_stall()
@@ -590,6 +673,11 @@ def recover_search_runs() -> list[int]:
     and connects."""
     latest = db.latest_search_run()
     _supersede_stale_running(latest["id"] if latest else None)
+    # A stall persisted from a previous process must not dead-end:
+    # restart its recovery loop before ANY early return — a captcha stop
+    # must not silently swallow engine recovery (they can stack). No-op
+    # when there is no stall.
+    _arm_stall_recovery()
     if sources.source.current_state() == "captcha_stop":
         log.info("captcha stop persisted — deferring search recovery until resolved")
         return []
@@ -600,9 +688,6 @@ def recover_search_runs() -> list[int]:
         # A previous process may have died mid-scoring: the run is done
         # but jobs remain unscored. Same auto-resume rule as search.
         _maybe_resume_scoring()
-    # A stall persisted from a previous process must not dead-end:
-    # restart its recovery loop too (no-op when there is no stall).
-    _arm_stall_recovery()
     return claimed
 
 
@@ -722,8 +807,12 @@ async def jobs_list(run_id: int | None = None):
         # Remaining pipeline work — the UI shows "Scoring…" while > 0.
         "scoring_pending": scoring_pipeline.pending_count(run_id),
         # Why scoring is NOT progressing, when it isn't (engine login or
-        # config problem, or the automatic retry budget ran dry).
-        "scoring_stall": stall,
+        # config problem, or the automatic retry budget ran dry). The
+        # recovery bookkeeping (token/schedule) is internal — not UI.
+        "scoring_stall": (
+            None if stall is None
+            else {"reason": stall.get("reason"), "detail": stall.get("detail")}
+        ),
     }
 
 
