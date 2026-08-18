@@ -111,6 +111,23 @@ export interface JobDetail extends Job {
   changed: boolean
 }
 
+export interface Package {
+  id: number
+  job_id: string
+  profile_version: number
+  jd_hash: string
+  status: string
+  error: string | null
+  retry_count: number
+  output_dir: string | null
+  created_at: string
+  updated_at: string
+  title: string
+  company: string
+  url: string
+  provenance: Record<string, unknown>
+}
+
 export interface SearchConfig {
   keywords: string
   location?: string | null
@@ -204,4 +221,17 @@ export const api = {
     fetch('/api/search/retry-scoring', { method: 'POST' }).then(
       toJson<{ resumed: boolean }>,
     ),
+  packages: () =>
+    fetch('/api/packages').then(
+      toJson<{ packages: Package[]; page_limit: number }>,
+    ),
+  packagesGenerate: (jobIds: string[]) =>
+    fetch('/api/packages/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ job_ids: jobIds }),
+    }).then(toJson<{ package_ids: number[]; created: number }>),
 }
+
+export const packageFileUrl = (packageId: number, name: string) =>
+  `/api/packages/${packageId}/file/${name}`

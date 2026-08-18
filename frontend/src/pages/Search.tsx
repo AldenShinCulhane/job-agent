@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { KeyboardEvent } from 'react'
-import { api } from '../api'
-import type { Explanation, Job, LinkedInStatus, SearchRun } from '../api'
+import { api, packageFileUrl } from '../api'
+import type { Explanation, Job, LinkedInStatus, Package, SearchRun } from '../api'
 
 const inputCls =
   'w-full rounded-md border border-slate-300 px-2 py-1 text-sm focus:border-slate-500 focus:outline-none'
@@ -25,6 +25,25 @@ const RUN_LABELS: Record<string, string> = {
   stopped_error: 'Stopped on an error',
   superseded: 'Replaced by a newer search',
 }
+
+const PACKAGE_STATES: Record<string, { label: string; tone: string }> = {
+  queued: { label: 'Queued', tone: 'bg-slate-100 text-slate-600' },
+  generating: { label: 'Generating…', tone: 'bg-sky-100 text-sky-800' },
+  validating: { label: 'Validating…', tone: 'bg-sky-100 text-sky-800' },
+  fitting: { label: 'Fitting pages…', tone: 'bg-sky-100 text-sky-800' },
+  asserting: { label: 'Final checks…', tone: 'bg-sky-100 text-sky-800' },
+  publishing: { label: 'Publishing…', tone: 'bg-sky-100 text-sky-800' },
+  done: { label: 'Ready', tone: 'bg-emerald-100 text-emerald-800' },
+  failed: { label: 'Failed', tone: 'bg-rose-100 text-rose-800' },
+  waiting_usage: {
+    label: 'Waiting — usage limit',
+    tone: 'bg-amber-100 text-amber-800',
+  },
+}
+
+const PACKAGE_ACTIVE = new Set([
+  'queued', 'generating', 'validating', 'fitting', 'asserting', 'publishing',
+])
 
 const WORKPLACE_OPTIONS = ['remote', 'hybrid', 'onsite'] as const
 
@@ -63,6 +82,8 @@ export default function Search() {
   const [busyRerank, setBusyRerank] = useState(false)
   const [explanations, setExplanations] = useState<Record<string, Explanation>>({})
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [packages, setPackages] = useState<Package[]>([])
+  const [busyGenerate, setBusyGenerate] = useState(false)
   const [sortBy, setSortBy] = useState<'score' | 'date'>('score')
   const [hideExceeds, setHideExceeds] = useState(false)
   const [easyOnly, setEasyOnly] = useState(false)
@@ -78,16 +99,18 @@ export default function Search() {
 
   const refresh = useCallback(async () => {
     try {
-      const [status, latest, jobList] = await Promise.all([
+      const [status, latest, jobList, packageList] = await Promise.all([
         api.linkedinStatus(),
         api.searchLatest(),
         api.jobs(),
+        api.packages(),
       ])
       setLinkedin(status)
       setRun(latest.id === null ? null : latest)
       setJobs(jobList.jobs)
       setScoringPending(jobList.scoring_pending ?? 0)
       setScoringStall(jobList.scoring_stall ?? null)
+      setPackages(packageList.packages)
     } catch (e) {
       setError(String(e))
     }
@@ -109,9 +132,11 @@ export default function Search() {
   // Fast poll while a run is active or the session is mid-transition;
   // slow poll while a stop will self-resume (cap reset, auth/captcha
   // recovery) so the UI catches the backend's automatic restart.
+  const packagesActive = packages.some((p) => PACKAGE_ACTIVE.has(p.status))
   const fastPoll =
     run?.status === 'running' ||
     (run?.status === 'done' && scoringPending > 0 && !scoringStall) || // pipeline working
+    packagesActive || // tailoring batch in flight
     linkedin?.state === 'connecting' ||
     linkedin?.state === 'logged_out' ||
     linkedin?.state === 'captcha_stop'
@@ -120,6 +145,7 @@ export default function Search() {
     (run?.status === 'stopped_cap' ||
       run?.status === 'stopped_auth' ||
       run?.status === 'stopped_captcha' ||
+      packages.some((p) => p.status === 'waiting_usage') || // resumes itself
       (scoringPending > 0 && scoringStall !== null)) // stalled — watch lazily
   useEffect(() => {
     if (!fastPoll && !slowPoll) return
@@ -205,6 +231,22 @@ export default function Search() {
       setError(String(e))
     } finally {
       setBusyRerank(false)
+    }
+  }
+
+  // Gate 3: generating packages IS the job-selection gate — everything
+  // after this click runs unattended.
+  const generatePackages = async () => {
+    setBusyGenerate(true)
+    setError(null)
+    try {
+      await api.packagesGenerate([...selected])
+      setSelected(new Set())
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setBusyGenerate(false)
     }
   }
 
@@ -429,9 +471,16 @@ export default function Search() {
               </>
             )}
             {selected.size > 0 && (
-              <span className="rounded-full bg-slate-900 px-3 py-1 text-xs font-medium text-white">
-                {selected.size} selected
-              </span>
+              <button
+                className="rounded-full bg-slate-900 px-3 py-1 text-xs font-medium text-white hover:bg-slate-700 disabled:opacity-40"
+                disabled={busyGenerate}
+                onClick={generatePackages}
+                title="Tailored resume + cover letter PDFs for each selected job"
+              >
+                {busyGenerate
+                  ? 'Queueing…'
+                  : `Generate packages (${selected.size})`}
+              </button>
             )}
             <label className="flex items-center gap-1">
               Sort
@@ -620,6 +669,81 @@ export default function Search() {
           </ul>
         )}
       </section>
+
+      {packages.length > 0 && (
+        <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+          <h2 className="mb-4 text-lg font-semibold">Packages</h2>
+          <ul className="divide-y divide-slate-100">
+            {packages.map((pkg) => {
+              const state = PACKAGE_STATES[pkg.status] ?? {
+                label: pkg.status,
+                tone: 'bg-slate-100 text-slate-600',
+              }
+              return (
+                <li
+                  key={pkg.id}
+                  className="flex flex-wrap items-center justify-between gap-3 py-3"
+                >
+                  <div className="min-w-0">
+                    <p className="truncate font-medium text-slate-800">
+                      {pkg.title}{' '}
+                      <span className="font-normal text-slate-500">
+                        — {pkg.company}
+                      </span>
+                    </p>
+                    {pkg.error && pkg.status !== 'done' && (
+                      <p className="mt-0.5 text-xs text-rose-600">{pkg.error}</p>
+                    )}
+                  </div>
+                  <div className="flex shrink-0 items-center gap-3 text-sm">
+                    <span
+                      className={`rounded-full px-3 py-1 text-xs font-medium ${state.tone}`}
+                    >
+                      {state.label}
+                    </span>
+                    {pkg.status === 'done' && (
+                      <>
+                        <a
+                          className="text-slate-600 underline hover:text-slate-900"
+                          href={packageFileUrl(pkg.id, 'resume.pdf')}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          Resume
+                        </a>
+                        <a
+                          className="text-slate-600 underline hover:text-slate-900"
+                          href={packageFileUrl(pkg.id, 'cover_letter.pdf')}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          Cover letter
+                        </a>
+                        <a
+                          className="text-slate-600 underline hover:text-slate-900"
+                          href={packageFileUrl(pkg.id, 'job.md')}
+                          target="_blank"
+                          rel="noreferrer"
+                        >
+                          Posting
+                        </a>
+                      </>
+                    )}
+                    <a
+                      className="text-slate-400 underline hover:text-slate-600"
+                      href={pkg.url}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      LinkedIn
+                    </a>
+                  </div>
+                </li>
+              )
+            })}
+          </ul>
+        </section>
+      )}
     </div>
   )
 }
