@@ -403,14 +403,30 @@ export default function Search() {
               </span>
             )}
             {scoringPending > 0 && scoringStall && (
-              <span
-                className="rounded-full bg-amber-100 px-3 py-1 text-xs font-medium text-amber-800"
-                title={scoringStall.detail ?? undefined}
-              >
-                {scoringStall.reason === 'engine_blocked'
-                  ? 'Scoring paused — Claude engine needs attention (see Status)'
-                  : 'Scoring paused — automatic retries exhausted'}
-              </span>
+              <>
+                <span
+                  className="rounded-full bg-amber-100 px-3 py-1 text-xs font-medium text-amber-800"
+                  title={scoringStall.detail ?? undefined}
+                >
+                  {scoringStall.reason === 'engine_blocked'
+                    ? 'Scoring paused — Claude engine needs attention'
+                    : 'Scoring paused — automatic retries exhausted'}
+                </span>
+                <button
+                  className="rounded-md border border-amber-300 px-2 py-1 text-xs text-amber-800 hover:bg-amber-50"
+                  onClick={async () => {
+                    setError(null)
+                    try {
+                      await api.retryScoring()
+                      await refresh()
+                    } catch (e) {
+                      setError(String(e))
+                    }
+                  }}
+                >
+                  Retry scoring
+                </button>
+              </>
             )}
             {selected.size > 0 && (
               <span className="rounded-full bg-slate-900 px-3 py-1 text-xs font-medium text-white">

@@ -10,7 +10,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from jsonschema import Draft202012Validator
 
 from backend import sources
-from backend.core import db, llm
+from backend.core import claude_cli, db, llm
 from backend.core.events import broker
 from backend.resume import facts, ingest, template
 from backend.resume.schema import PROFILE_SCHEMA
@@ -51,24 +51,39 @@ async def status():
 @router.post("/engine/probe")
 async def probe_engine():
     # With a model already pinned, probe() just echoes the pin — that is
-    # NOT a health check and must not clear a scoring stall. Only an
-    # unpinned probe (fresh start, or /engine/reprobe which resets the
-    # pin first) actually exercises the engine.
+    # NOT a health check: report the cached state honestly (ok:false
+    # when the persisted engine state says the engine is unhealthy) and
+    # never clear a scoring stall from here. Only an unpinned probe
+    # (fresh start, or /engine/reprobe which resets the pin first)
+    # actually exercises the engine and earns verified:true.
     live = db.get_state("pinned_model") is None
+    if not live:
+        engine = llm.engine_status()
+        unhealthy = engine["status"] in ("auth_required", "config_error")
+        response = {
+            "ok": not unhealthy,
+            "verified": False,  # cached pin — nothing was exercised
+            "model": engine["model"],
+            "engine": engine,
+        }
+        if unhealthy:
+            response["error"] = engine["status"]
+            response["detail"] = engine["last_error"]
+        return response
     try:
         model = await llm.probe()
     except llm.EngineError as exc:
         return {
             "ok": False,
+            "verified": True,
             "error": type(exc).__name__,
             "detail": str(exc),
             "engine": llm.engine_status(),
         }
-    if live:
-        # Engine verified healthy for real: clear the stall/breaker and
-        # resume scoring without any user gate.
-        _on_engine_recovered()
-    return {"ok": True, "model": model}
+    # Engine verified healthy for real: clear the stall/breaker and
+    # resume scoring without any user gate.
+    _on_engine_recovered()
+    return {"ok": True, "verified": True, "model": model}
 
 
 @router.post("/engine/reprobe")
@@ -300,6 +315,7 @@ async def _pipeline_worker(run_id: int, profile_version: int) -> None:
         # (reprobe after the user acts) resumes automatically.
         _set_scoring_stall("engine_blocked", summary["detail"],
                            run_id, profile_version)
+        _arm_stall_recovery()
     elif stopped == "engine" or (stopped is None and summary["failed"] > 0):
         # Transient engine trouble or isolated per-job failures: bounded
         # backoff, circuit-broken so a persistent failure can't loop the
@@ -311,6 +327,7 @@ async def _pipeline_worker(run_id: int, profile_version: int) -> None:
         else:
             _set_scoring_stall("retry_exhausted", summary["detail"],
                                run_id, profile_version)
+            _arm_stall_recovery()
             log.error(
                 "scoring run %s: giving up automatic retries after %d attempts",
                 run_id, _PIPELINE_MAX_RETRIES,
@@ -328,6 +345,65 @@ def _on_engine_recovered() -> None:
     _pipeline_retry_attempts = 0
     _clear_scoring_stall()
     _maybe_resume_scoring()
+
+
+# A persisted stall must never dead-end: this shutdown-owned loop is the
+# automatic way out. engine_blocked polls the CLI auth status (free, no
+# LLM spend) and only performs a live reprobe once auth looks healthy —
+# with backoff on failed reprobes so a broken config can't drip-spend
+# requests. retry_exhausted sleeps one long durable cooldown, then
+# re-opens the breaker for a fresh pass. The user can always shortcut
+# both with POST /search/retry-scoring (no gate — it's error recovery).
+_stall_recovery_task: asyncio.Task | None = None
+_STALL_AUTH_POLL_S = 300.0
+_STALL_RETRY_COOLDOWN_S = 3600.0
+
+
+def _arm_stall_recovery() -> None:
+    global _stall_recovery_task
+    if _stall_recovery_task is not None and not _stall_recovery_task.done():
+        return
+    if _get_scoring_stall() is None:
+        return
+    _stall_recovery_task = asyncio.create_task(_stall_recovery_loop())
+
+
+async def _stall_recovery_loop() -> None:
+    reprobe_delay = _STALL_AUTH_POLL_S
+    while True:
+        stall = _get_scoring_stall()
+        if stall is None:
+            return  # cleared elsewhere (progress, manual retry, probe)
+        if stall.get("reason") == "engine_blocked":
+            await asyncio.sleep(_STALL_AUTH_POLL_S + random.uniform(5, 30))
+            if _get_scoring_stall() is None:
+                return
+            problem = await asyncio.to_thread(claude_cli.subscription_problem)
+            if problem is not None:
+                continue  # still logged out / wrong auth — keep polling free
+            # Auth looks healthy: one live reprobe proves it (or doesn't —
+            # config errors and the like back off so retries can't
+            # drip-spend the subscription).
+            llm.reset_probe()
+            try:
+                await llm.probe()
+            except asyncio.CancelledError:
+                raise
+            except llm.EngineError:
+                await asyncio.sleep(reprobe_delay + random.uniform(5, 30))
+                reprobe_delay = min(reprobe_delay * 2, 3600.0)
+                continue
+            _on_engine_recovered()
+            return
+        else:  # retry_exhausted: durable long cooldown, then one fresh pass
+            await asyncio.sleep(_STALL_RETRY_COOLDOWN_S + random.uniform(30, 120))
+            if _get_scoring_stall() is None:
+                return
+            global _pipeline_retry_attempts
+            _pipeline_retry_attempts = 0
+            _clear_scoring_stall()
+            _maybe_resume_scoring()
+            return
 
 
 def _arm_pipeline_retry(delay: float) -> None:
@@ -524,6 +600,9 @@ def recover_search_runs() -> list[int]:
         # A previous process may have died mid-scoring: the run is done
         # but jobs remain unscored. Same auto-resume rule as search.
         _maybe_resume_scoring()
+    # A stall persisted from a previous process must not dead-end:
+    # restart its recovery loop too (no-op when there is no stall).
+    _arm_stall_recovery()
     return claimed
 
 
@@ -536,7 +615,8 @@ async def shutdown_background_tasks() -> None:
     tasks = [
         t
         for t in [_connect_task, _cap_retry_task, _pipeline_task,
-                  _pipeline_retry_task, *_search_tasks.values()]
+                  _pipeline_retry_task, _stall_recovery_task,
+                  *_search_tasks.values()]
         # Completed tasks may belong to a previous event loop (an earlier
         # lifespan in the same process); awaiting them there raises.
         if t is not None and not t.done()
@@ -581,8 +661,10 @@ async def search_start(body: dict):
         "cap": cap,
     }
     # Starting a search supersedes whatever was active — one active run
-    # is an invariant, not an assumption.
+    # is an invariant, not an assumption. Any scoring stall described
+    # the superseded run and would only mislabel the new one.
     _supersede_stale_running(except_id=None)
+    _clear_scoring_stall()
     run_id = db.create_search_run(config)
     _spawn_search(run_id)
     return {"run_id": run_id, "status": "running"}
@@ -624,6 +706,14 @@ async def jobs_list(run_id: int | None = None):
         profile_version = scoring_pipeline.confirmed_profile()[0]
     except scoring_pipeline.NoConfirmedProfile:
         profile_version = None
+    # A stall only describes THIS run under the CURRENT profile —
+    # anything else is stale ownership and must not label new results.
+    stall = _get_scoring_stall()
+    if stall is not None and (
+        stall.get("run_id") != run_id
+        or stall.get("profile_version") != profile_version
+    ):
+        stall = None
     return {
         # Scores join only against the current profile version + JD hash
         # — mid-rescore the UI sees "unscored", never stale numbers.
@@ -633,7 +723,7 @@ async def jobs_list(run_id: int | None = None):
         "scoring_pending": scoring_pipeline.pending_count(run_id),
         # Why scoring is NOT progressing, when it isn't (engine login or
         # config problem, or the automatic retry budget ran dry).
-        "scoring_stall": _get_scoring_stall(),
+        "scoring_stall": stall,
     }
 
 
@@ -662,6 +752,17 @@ async def job_explain(job_id: str):
         raise HTTPException(status_code=409, detail=str(exc))
     except llm.EngineError as exc:
         raise HTTPException(status_code=503, detail=str(exc))
+
+
+@router.post("/search/retry-scoring")
+async def retry_scoring():
+    """Explicit error recovery for a stalled scoring pipeline: clear the
+    stall, reset the circuit breaker, resume. Not a gate — recovering
+    from an error state, like the search Resume button."""
+    global _pipeline_retry_attempts
+    _pipeline_retry_attempts = 0
+    _clear_scoring_stall()
+    return {"resumed": _maybe_resume_scoring()}
 
 
 @router.post("/search/rerank")

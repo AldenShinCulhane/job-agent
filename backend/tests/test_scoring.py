@@ -637,6 +637,7 @@ async def test_pipeline_worker_arms_bounded_retry(test_db, monkeypatch):
 
     monkeypatch.setattr(pipeline, "run_pipeline", fake_run)
     monkeypatch.setattr(routes, "_arm_pipeline_retry", fake_arm)
+    monkeypatch.setattr(routes, "_arm_stall_recovery", lambda: None)
     monkeypatch.setattr(routes, "_pipeline_retry_attempts", 0)
     for _ in range(routes._PIPELINE_MAX_RETRIES + 2):
         await routes._pipeline_worker(1, 1)
@@ -708,6 +709,7 @@ async def test_worker_persists_blocked_stall_without_timer(test_db, monkeypatch)
 
     monkeypatch.setattr(pipeline, "run_pipeline", fake_run)
     monkeypatch.setattr(routes, "_arm_pipeline_retry", lambda d: armed.append(d))
+    monkeypatch.setattr(routes, "_arm_stall_recovery", lambda: None)
     monkeypatch.setattr(routes, "_pipeline_retry_attempts", 0)
     await routes._pipeline_worker(1, 1)
     assert armed == []
@@ -801,6 +803,116 @@ async def test_probe_with_pinned_model_does_not_clear_stall(test_db, monkeypatch
     assert result["ok"] is True
     assert routes._get_scoring_stall() is None
     assert resumed == [True]
+
+
+async def test_new_search_clears_old_stall_and_jobs_never_mislabels(
+    test_db, monkeypatch
+):
+    """An old run's stall must not label a new search: starting one
+    clears the stale ownership, and /jobs filters any stall that doesn't
+    match the run/profile it is reporting on."""
+    from backend.api import routes
+
+    _confirm_profile()
+    version = db.latest_profile()[0]
+    old_run = _seed_run(["p1"])
+    routes._set_scoring_stall("retry_exhausted", "boom", old_run, version)
+
+    spawned = []
+    monkeypatch.setattr(routes, "_spawn_search", lambda rid: spawned.append(rid))
+    await routes.search_start({"keywords": "new search"})
+    assert len(spawned) == 1
+    assert routes._get_scoring_stall() is None  # cleared at start
+
+    # Belt and braces: even a stall that somehow survives (e.g. written
+    # by a dying worker after the clear) is filtered out of /jobs while
+    # the new run collects.
+    new_run = db.latest_search_run()["id"]
+    routes._set_scoring_stall("retry_exhausted", "boom", old_run, version)
+    payload = await routes.jobs_list()
+    assert payload["run_id"] == new_run
+    assert payload["scoring_stall"] is None
+    # And a stall that DOES belong to the reported run passes through.
+    routes._set_scoring_stall("engine_blocked", "x", new_run, version)
+    payload = await routes.jobs_list()
+    assert payload["scoring_stall"]["reason"] == "engine_blocked"
+
+
+async def test_stall_recovery_engine_blocked_polls_auth_then_reprobes(
+    test_db, monkeypatch
+):
+    """The engine_blocked stall recovers by itself: free auth polling
+    until login looks healthy, then one live reprobe, then resume."""
+    import random as random_mod
+
+    from backend.api import routes
+    from backend.core import claude_cli, llm
+
+    routes._set_scoring_stall("engine_blocked", "Not logged in", 1, 1)
+    monkeypatch.setattr(routes, "_STALL_AUTH_POLL_S", 0.0)
+    monkeypatch.setattr(random_mod, "uniform", lambda a, b: 0.0)
+    problems = ["Not logged in", None]  # heals on the second poll
+    monkeypatch.setattr(claude_cli, "subscription_problem",
+                        lambda: problems.pop(0))
+    monkeypatch.setattr(llm, "reset_probe", lambda: None)
+
+    async def fake_probe():
+        return "claude-fable-5"
+
+    monkeypatch.setattr(llm, "probe", fake_probe)
+    resumed = []
+    monkeypatch.setattr(routes, "_maybe_resume_scoring",
+                        lambda: resumed.append(True) or True)
+
+    await routes._stall_recovery_loop()
+    assert routes._get_scoring_stall() is None
+    assert resumed == [True]
+    assert problems == []  # first poll saw the problem, kept waiting
+
+
+async def test_stall_recovery_retry_exhausted_long_cooldown(test_db, monkeypatch):
+    import random as random_mod
+
+    from backend.api import routes
+
+    routes._set_scoring_stall("retry_exhausted", "boom", 1, 1)
+    monkeypatch.setattr(routes, "_STALL_RETRY_COOLDOWN_S", 0.0)
+    monkeypatch.setattr(random_mod, "uniform", lambda a, b: 0.0)
+    monkeypatch.setattr(routes, "_pipeline_retry_attempts", 3)
+    resumed = []
+    monkeypatch.setattr(routes, "_maybe_resume_scoring",
+                        lambda: resumed.append(True) or True)
+
+    await routes._stall_recovery_loop()
+    assert routes._get_scoring_stall() is None
+    assert routes._pipeline_retry_attempts == 0  # breaker re-armed fresh
+    assert resumed == [True]
+
+
+async def test_probe_pinned_reports_cached_unhealthy_state(test_db):
+    """ok:true must not be claimed off a cached pin while the persisted
+    engine state says the engine is broken."""
+    from backend.api import routes
+
+    db.set_state("pinned_model", "claude-fable-5")
+    db.set_state("engine_status", "auth_required")
+    db.set_state("last_error", "Not logged in")
+    result = await routes.probe_engine()
+    assert result["ok"] is False
+    assert result["verified"] is False
+    assert result["error"] == "auth_required"
+    assert result["detail"] == "Not logged in"
+
+
+async def test_retry_scoring_endpoint_clears_stall_and_breaker(test_db, monkeypatch):
+    from backend.api import routes
+
+    routes._set_scoring_stall("retry_exhausted", "boom", 1, 1)
+    monkeypatch.setattr(routes, "_pipeline_retry_attempts", 3)
+    result = await routes.retry_scoring()
+    assert routes._get_scoring_stall() is None
+    assert routes._pipeline_retry_attempts == 0
+    assert result == {"resumed": False}  # no done run in this db — fine
 
 
 async def test_isolated_failure_detail_names_job_and_cause(test_db, monkeypatch):

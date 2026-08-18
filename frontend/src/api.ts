@@ -200,4 +200,8 @@ export const api = {
     fetch('/api/search/rerank', { method: 'POST' }).then(
       toJson<{ reranked: number }>,
     ),
+  retryScoring: () =>
+    fetch('/api/search/retry-scoring', { method: 'POST' }).then(
+      toJson<{ resumed: boolean }>,
+    ),
 }
