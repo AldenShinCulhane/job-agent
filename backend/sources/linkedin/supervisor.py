@@ -28,6 +28,10 @@ _NAV_TIMEOUT_MS = 45_000
 _LOGIN_POLL_S = 3.0
 _LOGIN_WAIT_S = 15 * 60  # gate 2: how long we wait for the user to sign in
 _SCROLL_STEPS = 8
+# Detail pages render the description without lazy-load scrolling; wait
+# for the description container instead of scrolling (M3 reviewer
+# directive — cuts ~10-15s per detail fetch).
+_DETAIL_WAIT_MS = 10_000
 
 
 class SupervisorError(Exception):
@@ -193,9 +197,12 @@ class LinkedInSupervisor:
             await self._ensure_logged_in(page, wait_for_user=wait_for_user)
             return self.status()
 
-    async def fetch_page(self, url: str) -> str:
-        """Navigate to `url` (logged in, paced, capped), scroll to load
-        lazy content, and return the full HTML."""
+    async def fetch_page(self, url: str, *, mode: str = "results") -> str:
+        """Navigate to `url` (logged in, paced, capped) and return the
+        full HTML. mode='results' scrolls to load lazy result cards;
+        mode='detail' waits for the description container and never
+        scrolls — detail pages don't lazy-load, and both modes keep the
+        pre- and post-interaction captcha/auth classification."""
         async with self._lock:
             pacing.check_daily_cap()
             page = await self._ensure_context()
@@ -208,6 +215,19 @@ class LinkedInSupervisor:
             self._raise_for_page_state(
                 selectors.classify_page(page.url or "", await page.content())
             )
+            if mode == "detail":
+                try:
+                    await page.wait_for_selector(
+                        ", ".join(selectors.SELECTORS["detail_description"]),
+                        timeout=_DETAIL_WAIT_MS,
+                    )
+                except Exception:  # noqa: BLE001 — best-effort wait; the
+                    pass  # parser fallback + classification below still guard
+                html = await page.content()
+                self._raise_for_page_state(
+                    selectors.classify_page(page.url or "", html)
+                )
+                return html
             html = ""
             for _ in range(_SCROLL_STEPS):
                 # The jobs list is its own scroll container; nudge it and

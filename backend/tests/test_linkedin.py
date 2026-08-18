@@ -41,9 +41,11 @@ class FakeSupervisor:
     def __init__(self, pages):
         self.pages = list(pages)
         self.urls: list[str] = []
+        self.modes: list[str] = []
 
-    async def fetch_page(self, url: str) -> str:
+    async def fetch_page(self, url: str, *, mode: str = "results") -> str:
         self.urls.append(url)
+        self.modes.append(mode)
         item = self.pages.pop(0) if self.pages else ""
         if isinstance(item, Exception):
             raise item
@@ -752,6 +754,80 @@ async def test_challenge_injected_midscroll_stops_before_next_scroll(
         await sup.fetch_page(page.url)
     assert page.scrolls == 3  # detected right after injection, well before 8
     assert sup.state == "captcha_stop"
+
+
+class FakeDetailPage:
+    """Signed-in job-detail page: description renders on selector wait."""
+
+    def __init__(self, html: str | None = None):
+        self.url = "https://www.linkedin.com/jobs/view/9000000001/"
+        self.scrolls = 0
+        self.waited_selectors: list[str] = []
+        self._html = html or (
+            '<html><body><header class="global-nav">x</header>'
+            '<div id="JobDetails_AboutTheJob_1">About the job … text</div>'
+            "</body></html>"
+        )
+
+    def is_closed(self):
+        return False
+
+    async def goto(self, url, wait_until=None):
+        pass
+
+    async def content(self):
+        return self._html
+
+    async def evaluate(self, script):
+        self.scrolls += 1
+
+    async def wait_for_selector(self, selector, timeout=None):
+        self.waited_selectors.append(selector)
+
+
+async def test_detail_mode_waits_for_selector_and_never_scrolls(test_db):
+    sup = LinkedInSupervisor()
+    sup.state = "ready"
+    page = FakeDetailPage()
+    sup._page = page
+    html = await sup.fetch_page(page.url, mode="detail")
+    assert "About the job" in html
+    assert page.scrolls == 0
+    assert len(page.waited_selectors) == 1
+    assert "JobDetails_AboutTheJob" in page.waited_selectors[0]
+
+
+async def test_detail_mode_still_latches_checkpoint(test_db):
+    """Detail mode keeps the pre-interaction captcha latch."""
+    sup = LinkedInSupervisor()
+    sup.state = "ready"
+    page = FakeCheckpointPage(
+        "https://www.linkedin.com/jobs/view/9000000001/",
+        '<html><body><form id="challenge-form"></form></body></html>',
+    )
+    sup._page = page
+    with pytest.raises(CaptchaStop):
+        await sup.fetch_page(page.url, mode="detail")
+    assert page.scrolls == 0
+    assert sup.state == "captcha_stop"
+
+
+async def test_detail_fetch_uses_detail_mode(test_db):
+    db.upsert_job(
+        {
+            "job_id": "d1",
+            "title": "Backend Engineer",
+            "company": "Example Widgets Inc.",
+            "location": "Toronto, ON",
+            "posted_text": None,
+            "workplace": None,
+            "easy_apply": False,
+            "url": "https://www.linkedin.com/jobs/view/d1/",
+        }
+    )
+    sup = FakeSupervisor([DETAIL_HTML])
+    await job_detail.fetch_detail(sup, "d1")
+    assert sup.modes == ["detail"]
 
 
 async def test_duplicate_resume_spawns_single_worker(test_db, monkeypatch):

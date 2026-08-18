@@ -71,7 +71,7 @@ async def fetch_detail(supervisor, job_id: str, force: bool = False) -> dict:
     if not force and not is_stale(job):
         return {**job, "refetched": False, "changed": False}
 
-    html = await supervisor.fetch_page(job["url"])
+    html = await supervisor.fetch_page(job["url"], mode="detail")
     try:
         description = parse_detail(html)
     except DetailParseError:
