@@ -244,8 +244,11 @@ async def _connect_only() -> None:
         return
     # Session is good again — automatically reclaim the work that was
     # blocked on it (gate 2 rule: the user performs an action, never
-    # approves one; no extra Resume click).
-    _reclaim_latest(("running", "stopped_auth", "stopped_captcha"))
+    # approves one; no extra Resume click). If nothing was session-
+    # blocked, the current run may still be cap-stopped (captcha and cap
+    # can stack): hand it to cap recovery so its retry gets armed.
+    if not _reclaim_latest(("running", "stopped_auth", "stopped_captcha")):
+        _maybe_resume_capped()
 
 
 def _reclaim_latest(statuses: tuple[str, ...]) -> list[int]:
@@ -289,12 +292,27 @@ async def _cap_retry_after_reset() -> None:
     _reclaim_latest(("stopped_cap",))
 
 
+def _supersede_stale_running(except_id: int | None) -> None:
+    """One active search, ever: retire other 'running' rows (cancelling
+    any worker they still have) so latest-only recovery can't strand
+    them."""
+    for run_id in db.supersede_running_runs(except_id):
+        task = _search_tasks.get(run_id)
+        if task is not None:
+            task.cancel()
+        log.info("superseded stale search run %s", run_id)
+
+
 def recover_search_runs() -> list[int]:
     """Startup recovery for the current run: reclaim it if a previous
-    process left it 'running', or arm/resume a cap-stopped one. If a
-    persisted captcha stop was restored, defer — restarting navigation
-    against a checkpoint is a bypass-shaped move; the work is reclaimed
-    when the user resolves it and connects."""
+    process left it 'running', or arm/resume a cap-stopped one. Older
+    'running' rows are retired — they would otherwise stay stranded
+    forever under latest-only recovery. If a persisted captcha stop was
+    restored, defer — restarting navigation against a checkpoint is a
+    bypass-shaped move; the work is reclaimed when the user resolves it
+    and connects."""
+    latest = db.latest_search_run()
+    _supersede_stale_running(latest["id"] if latest else None)
     if sources.source.current_state() == "captcha_stop":
         log.info("captcha stop persisted — deferring search recovery until resolved")
         return []
@@ -354,6 +372,9 @@ async def search_start(body: dict):
         "experience": body.get("experience") or [],
         "cap": cap,
     }
+    # Starting a search supersedes whatever was active — one active run
+    # is an invariant, not an assumption.
+    _supersede_stale_running(except_id=None)
     run_id = db.create_search_run(config)
     _spawn_search(run_id)
     return {"run_id": run_id, "status": "running"}

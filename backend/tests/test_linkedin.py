@@ -572,6 +572,75 @@ async def test_driver_arms_cap_retry_when_run_caps(test_db, monkeypatch):
     routes._cap_retry_task.cancel()
 
 
+async def test_double_start_supersedes_previous_run(test_db, monkeypatch):
+    """One active search is enforced, not assumed: a second Start retires
+    the first run (terminal 'superseded') and cancels its worker."""
+    from backend.api import routes
+
+    release = asyncio.Event()
+
+    class SlowSource:
+        def current_state(self):
+            return "idle"
+
+        async def connect(self, wait_for_user=True):
+            await release.wait()
+
+        async def resume(self, rid):
+            db.update_search_run(rid, status="done")
+            return db.get_search_run(rid)
+
+    monkeypatch.setattr(routes.sources, "source", SlowSource())
+    first = await routes.search_start({"keywords": "a"})
+    task1 = routes._search_tasks[first["run_id"]]
+    second = await routes.search_start({"keywords": "b"})
+
+    assert db.get_search_run(first["run_id"])["status"] == "superseded"
+    await asyncio.gather(task1, return_exceptions=True)
+    assert task1.cancelled()
+
+    release.set()
+    await routes._search_tasks[second["run_id"]]
+    assert db.get_search_run(second["run_id"])["status"] == "done"
+
+
+async def test_recovery_retires_stale_running_rows(test_db, no_delays, monkeypatch):
+    """Restart with two 'running' rows: only the latest is reclaimed and
+    the older one is superseded, never stranded."""
+    from backend.api import routes
+
+    old_run = _seed_orphaned_run()
+    new_run = _seed_orphaned_run()
+
+    fake = FakeLifecycleSource(browser_pages=[SEARCH_FALLBACK_HTML, NO_RESULTS_HTML])
+    monkeypatch.setattr(routes.sources, "source", fake)
+    assert routes.recover_search_runs() == [new_run]
+    await routes._search_tasks[new_run]
+
+    assert db.get_search_run(old_run)["status"] == "superseded"
+    assert db.get_search_run(new_run)["status"] == "done"
+
+
+async def test_connect_arms_cap_retry_when_current_run_capped(test_db, monkeypatch):
+    """Captcha + cap can stack: once the checkpoint is resolved via
+    Connect and nothing is session-blocked, the cap-stopped run must
+    still get its retry timer."""
+    from backend.api import routes
+
+    run_id = _seed_orphaned_run()
+    db.update_search_run(run_id, status="stopped_cap", message="cap")
+
+    fake = FakeLifecycleSource()
+    monkeypatch.setattr(routes.sources, "source", fake)
+    monkeypatch.setattr(routes.sources, "budget_remaining", lambda: 0)
+    monkeypatch.setattr(routes, "_cap_retry_task", None)
+    await routes._connect_only()
+
+    assert routes._cap_retry_task is not None
+    routes._cap_retry_task.cancel()
+    assert db.get_search_run(run_id)["status"] == "stopped_cap"
+
+
 async def test_search_start_rejects_bad_cap(test_db):
     from fastapi import HTTPException
 

@@ -22,6 +22,7 @@ const RUN_LABELS: Record<string, string> = {
   stopped_auth: 'Stopped — sign in via Connect and the search resumes automatically',
   stopped_cap: 'Daily action cap reached — resumes automatically when it resets',
   stopped_error: 'Stopped on an error',
+  superseded: 'Replaced by a newer search',
 }
 
 const WORKPLACE_OPTIONS = ['remote', 'hybrid', 'onsite'] as const
@@ -69,17 +70,24 @@ export default function Search() {
     refresh()
   }, [refresh])
 
-  // Poll while a run is active or the session is mid-transition.
-  const active =
+  // Fast poll while a run is active or the session is mid-transition;
+  // slow poll while a stop will self-resume (cap reset, auth/captcha
+  // recovery) so the UI catches the backend's automatic restart.
+  const fastPoll =
     run?.status === 'running' ||
     linkedin?.state === 'connecting' ||
     linkedin?.state === 'logged_out' ||
     linkedin?.state === 'captcha_stop'
+  const slowPoll =
+    !fastPoll &&
+    (run?.status === 'stopped_cap' ||
+      run?.status === 'stopped_auth' ||
+      run?.status === 'stopped_captcha')
   useEffect(() => {
-    if (!active) return
-    const timer = setInterval(refresh, 2500)
+    if (!fastPoll && !slowPoll) return
+    const timer = setInterval(refresh, fastPoll ? 2500 : 30000)
     return () => clearInterval(timer)
-  }, [active, refresh])
+  }, [fastPoll, slowPoll, refresh])
 
   const connect = async () => {
     setError(null)

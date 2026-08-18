@@ -360,6 +360,27 @@ def latest_search_run() -> dict | None:
     return _search_run_query("ORDER BY id DESC LIMIT 1", ())
 
 
+def supersede_running_runs(except_id: int | None = None) -> list[int]:
+    """Mark every 'running' run other than `except_id` as superseded —
+    a terminal state recovery never reclaims. Enforces the one-active-
+    search invariant that latest-only recovery depends on."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id FROM search_runs WHERE status = 'running' AND id != ?",
+            (except_id if except_id is not None else -1,),
+        ).fetchall()
+        ids = [r[0] for r in rows]
+        if ids:
+            conn.execute(
+                "UPDATE search_runs SET status = 'superseded', "
+                "message = 'Superseded by a newer search.', updated_at = ? "
+                f"WHERE id IN ({', '.join('?' for _ in ids)})",
+                (now, *ids),
+            )
+    return ids
+
+
 
 
 def _search_run_query(clause: str, params: tuple) -> dict | None:
