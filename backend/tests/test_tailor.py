@@ -84,6 +84,150 @@ def test_list_packages_carries_job_display_fields(test_db):
     assert rows[0]["title"] == "Backend Engineer"
 
 
+# --- Generation pass (schema, prompt, merge) ---------------------------------
+
+PROFILE = {
+    "name": "Casey Example",
+    "headline": "Software Engineer",
+    "contact": {"phone": None, "email": "casey@example.com", "linkedin": None,
+                "github": None, "website": None, "location": "Toronto, ON"},
+    "experiences": [
+        {"title": "Software Engineer", "company": "Example Widgets Inc.",
+         "location": None, "start": "Jun 2024", "end": "Present",
+         "bullets": ["Built internal tools with Python", "Ran deployments"]},
+    ],
+    "projects": [
+        {"name": "Sample Project", "technologies": ["Python"], "date": None,
+         "link": None, "bullets": ["Wrote a CLI tool"]},
+    ],
+    "education": [
+        {"institution": "Example University", "location": None,
+         "degree": "BSc Computer Science", "start": None, "end": "2024",
+         "details": []},
+    ],
+    "skills": [
+        {"category": "Languages", "items": ["Python", "TypeScript"]},
+        {"category": "Tools", "items": ["Docker"]},
+    ],
+}
+
+JOB = {"job_id": "p1", "title": "Backend Engineer",
+       "company": "Sample Systems & Co", "url": "https://example.invalid/p1",
+       "description": "We need Python."}
+
+
+def _tailored(**overrides):
+    base = {
+        "headline": None,
+        "section_order": ["experience", "projects", "skills", "education"],
+        "skills_order": ["Tools", "Languages"],
+        "experiences": [{"index": 0, "bullets": [
+            {"text": "Built internal tools with Python",
+             "source_ids": ["b-1"], "relevance": 90},
+        ]}],
+        "projects": [{"index": 0, "bullets": [
+            {"text": "Wrote a CLI tool", "source_ids": ["b-2"], "relevance": 40},
+        ]}],
+        "cover_letter": {
+            "paragraphs": [
+                {"text": "I build backend tools in Python.", "source_ids": ["b-1"]},
+                {"text": "I would love to join your team.", "source_ids": []},
+            ],
+            "closing": "Sincerely,",
+        },
+    }
+    base.update(overrides)
+    return base
+
+
+def test_tailor_schema_is_valid_and_accepts_shape():
+    from jsonschema import Draft202012Validator
+
+    from backend.tailor import resume as tailor_resume
+
+    Draft202012Validator.check_schema(tailor_resume.TAILOR_SCHEMA)
+    Draft202012Validator(tailor_resume.TAILOR_SCHEMA).validate(_tailored())
+
+
+async def test_generate_tailored_calls_llm_with_ledger_and_rules(monkeypatch):
+    from backend.core import llm
+    from backend.resume import facts
+    from backend.tailor import resume as tailor_resume
+
+    seen = {}
+
+    async def fake_structured(prompt, schema, task, system_prompt=""):
+        seen.update(prompt=prompt, schema=schema, task=task,
+                    system_prompt=system_prompt)
+        return _tailored()
+
+    monkeypatch.setattr(llm, "structured", fake_structured)
+    ledger = facts.build_ledger(PROFILE)
+    result = await tailor_resume.generate_tailored(
+        PROFILE, ledger, JOB, {"required_skills": ["Python"]},
+        {"matched_skills": ["Python"]}, page_limit=1,
+    )
+    assert result == _tailored()
+    assert seen["task"] == "tailor"
+    assert seen["schema"] is tailor_resume.TAILOR_SCHEMA
+    assert "never invent" in seen["system_prompt"].lower()
+    assert "We need Python." in seen["prompt"]
+    for fact_id in ledger:  # every valid source_id is offered to the model
+        assert fact_id in seen["prompt"]
+
+
+def test_tailored_profile_merges_only_llm_owned_fields():
+    from backend.tailor import resume as tailor_resume
+
+    merged = tailor_resume.tailored_profile(PROFILE, _tailored())
+    # Structure the LLM cannot touch is verbatim from the profile.
+    assert merged["experiences"][0]["company"] == "Example Widgets Inc."
+    assert merged["education"] == PROFILE["education"]
+    assert merged["contact"] == PROFILE["contact"]
+    # LLM-owned: bullets replaced, skills reordered, headline kept (null).
+    assert merged["experiences"][0]["bullets"] == [
+        "Built internal tools with Python"]
+    assert [g["category"] for g in merged["skills"]] == ["Tools", "Languages"]
+    assert merged["headline"] == "Software Engineer"
+    # And the original profile object is never mutated.
+    assert PROFILE["skills"][0]["category"] == "Languages"
+
+    with_headline = tailor_resume.tailored_profile(
+        PROFILE,
+        _tailored(headline={"text": "Backend Engineer", "source_ids": ["h-1"]}),
+    )
+    assert with_headline["headline"] == "Backend Engineer"
+
+
+def test_render_honors_section_order_and_ignores_unknown():
+    from backend.resume import template
+
+    tex = template.render(PROFILE, section_order=["skills", "experience",
+                                                  "bogus", "education",
+                                                  "projects"])
+    positions = [tex.index(marker) for marker in
+                 ("Technical Skills", "Experience", "Education",
+                  "Personal Projects")]
+    assert positions == sorted(positions)
+
+
+def test_cover_render_escapes_and_structures():
+    from backend.tailor import cover
+
+    tex = cover.render_cover(
+        PROFILE, JOB,
+        paragraphs=[{"text": "I use C&C 100% of the time.", "source_ids": []},
+                    {"text": r"No \textbf{injection} allowed.", "source_ids": []}],
+        closing="Sincerely,",
+    )
+    assert "Dear Sample Systems \\& Co Hiring Team," in tex
+    assert r"C\&C 100\% of the time" in tex
+    assert r"\textbackslash{}textbf" in tex  # LLM LaTeX stays literal text
+    assert tex.count("Casey Example") == 2  # header + signature
+    assert "casey@example.com" in tex
+    assert "source_ids" not in tex  # internal metadata never rendered
+
+
 def test_packages_to_resume_excludes_terminal_states(test_db):
     """Restart recovery picks up mid-flight packages in batch order and
     never a done/failed one (PLAN §4.6: completed work is never redone)."""

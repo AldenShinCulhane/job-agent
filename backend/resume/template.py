@@ -256,16 +256,27 @@ def _skills_section(skills: list[dict]) -> str:
     )
 
 
-def render(profile: dict, layout: Layout = DEFAULT_LAYOUT) -> str:
-    """Profile JSON -> complete LaTeX document."""
+_SECTION_RENDERERS = {
+    "experience": ("experiences", _experience_section),
+    "projects": ("projects", _projects_section),
+    "education": ("education", _education_section),
+    "skills": ("skills", _skills_section),
+}
+
+DEFAULT_SECTION_ORDER = ("experience", "projects", "education", "skills")
+
+
+def render(profile: dict, layout: Layout = DEFAULT_LAYOUT,
+           section_order: tuple[str, ...] | list[str] = DEFAULT_SECTION_ORDER) -> str:
+    """Profile JSON -> complete LaTeX document. `section_order` is a
+    tailoring layout preference; unknown names are ignored and sections
+    with no content are skipped either way."""
     sections = [_heading(profile)]
-    if profile.get("experiences"):
-        sections.append(_experience_section(profile["experiences"]))
-    if profile.get("projects"):
-        sections.append(_projects_section(profile["projects"]))
-    if profile.get("education"):
-        sections.append(_education_section(profile["education"]))
-    if profile.get("skills"):
-        sections.append(_skills_section(profile["skills"]))
+    for name in section_order:
+        if name not in _SECTION_RENDERERS:
+            continue
+        key, renderer = _SECTION_RENDERERS[name]
+        if profile.get(key):
+            sections.append(renderer(profile[key]))
     body = "\n\n".join(sections)
     return f"{_preamble(layout)}\n\\begin{{document}}\n\n{body}\n\n\\end{{document}}\n"
