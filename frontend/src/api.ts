@@ -68,6 +68,18 @@ export interface LinkedInStatus {
   detail: string | null
 }
 
+export interface ScoreBreakdown {
+  skills: number
+  experience: number
+  education: number
+  matched_skills: string[]
+  missing_skills: string[]
+  match_reasons: string[]
+  gap_reasons: string[]
+  exceeds_experience: boolean
+  user_years: number | null
+}
+
 export interface Job {
   job_id: string
   title: string
@@ -82,6 +94,15 @@ export interface Job {
   description: string | null
   description_hash: string | null
   detail_fetched_at: string | null
+  deterministic_score: number | null
+  llm_rerank: number | null
+  score_breakdown: ScoreBreakdown | null
+}
+
+export interface Explanation {
+  strengths: string[]
+  gaps: string[]
+  pitch: string
 }
 
 export interface JobDetail extends Job {
@@ -161,7 +182,16 @@ export const api = {
       body: JSON.stringify({}),
     }).then(toJson<SearchRun>),
   searchLatest: () => fetch('/api/search/latest').then(toJson<SearchRun>),
-  jobs: () => fetch('/api/jobs').then(toJson<{ jobs: Job[] }>),
+  jobs: () =>
+    fetch('/api/jobs').then(
+      toJson<{ jobs: Job[]; run_id: number | null; scoring_pending: number }>,
+    ),
   jobDetail: (jobId: string) =>
     fetch(`/api/jobs/${jobId}/detail`, { method: 'POST' }).then(toJson<JobDetail>),
+  jobExplain: (jobId: string) =>
+    fetch(`/api/jobs/${jobId}/explain`, { method: 'POST' }).then(toJson<Explanation>),
+  searchRerank: () =>
+    fetch('/api/search/rerank', { method: 'POST' }).then(
+      toJson<{ reranked: number }>,
+    ),
 }

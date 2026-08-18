@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { api } from '../api'
-import type { Job, LinkedInStatus, SearchRun } from '../api'
+import type { Explanation, Job, LinkedInStatus, SearchRun } from '../api'
 
 const inputCls =
   'w-full rounded-md border border-slate-300 px-2 py-1 text-sm focus:border-slate-500 focus:outline-none'
@@ -52,8 +52,16 @@ export default function Search() {
   const [linkedin, setLinkedin] = useState<LinkedInStatus | null>(null)
   const [run, setRun] = useState<SearchRun | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
+  const [scoringPending, setScoringPending] = useState(0)
   const [expanded, setExpanded] = useState<string | null>(null)
   const [busyDetail, setBusyDetail] = useState<string | null>(null)
+  const [busyExplain, setBusyExplain] = useState<string | null>(null)
+  const [busyRerank, setBusyRerank] = useState(false)
+  const [explanations, setExplanations] = useState<Record<string, Explanation>>({})
+  const [selected, setSelected] = useState<Set<string>>(new Set())
+  const [sortBy, setSortBy] = useState<'score' | 'date'>('score')
+  const [hideExceeds, setHideExceeds] = useState(false)
+  const [easyOnly, setEasyOnly] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [profileLocation, setProfileLocation] = useState<string | null>(null)
 
@@ -74,6 +82,7 @@ export default function Search() {
       setLinkedin(status)
       setRun(latest.id === null ? null : latest)
       setJobs(jobList.jobs)
+      setScoringPending(jobList.scoring_pending ?? 0)
     } catch (e) {
       setError(String(e))
     }
@@ -97,6 +106,7 @@ export default function Search() {
   // recovery) so the UI catches the backend's automatic restart.
   const fastPoll =
     run?.status === 'running' ||
+    (run?.status === 'done' && scoringPending > 0) || // pipeline working
     linkedin?.state === 'connecting' ||
     linkedin?.state === 'logged_out' ||
     linkedin?.state === 'captcha_stop'
@@ -160,6 +170,62 @@ export default function Search() {
       setBusyDetail(null)
     }
   }
+
+  const explain = async (jobId: string) => {
+    setBusyExplain(jobId)
+    setError(null)
+    try {
+      const explanation = await api.jobExplain(jobId)
+      setExplanations((all) => ({ ...all, [jobId]: explanation }))
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setBusyExplain(null)
+    }
+  }
+
+  const rerank = async () => {
+    setBusyRerank(true)
+    setError(null)
+    try {
+      await api.searchRerank()
+      await refresh()
+    } catch (e) {
+      setError(String(e))
+    } finally {
+      setBusyRerank(false)
+    }
+  }
+
+  const toggleSelected = (jobId: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(jobId)) next.delete(jobId)
+      else next.add(jobId)
+      return next
+    })
+
+  // llm_rerank (when present) refines ordering within its band; the
+  // deterministic score stays visible as the backbone.
+  const displayScore = (j: Job) => j.llm_rerank ?? j.deterministic_score
+
+  const visibleJobs = useMemo(() => {
+    let list = jobs
+    if (hideExceeds)
+      list = list.filter((j) => !j.score_breakdown?.exceeds_experience)
+    if (easyOnly) list = list.filter((j) => j.easy_apply)
+    if (sortBy === 'score')
+      list = [...list].sort(
+        (a, b) => (displayScore(b) ?? -1) - (displayScore(a) ?? -1),
+      )
+    else
+      list = [...list].sort((a, b) =>
+        (b.first_seen_at ?? '').localeCompare(a.first_seen_at ?? ''),
+      )
+    return list
+  }, [jobs, hideExceeds, easyOnly, sortBy])
+
+  const scoredCount = jobs.filter((j) => j.deterministic_score !== null).length
 
   const badge = linkedin
     ? (LINKEDIN_STATES[linkedin.state] ?? { label: linkedin.state, tone: 'bg-slate-100 text-slate-600' })
@@ -305,61 +371,206 @@ export default function Search() {
       </section>
 
       <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
-        <h2 className="mb-4 text-lg font-semibold">Jobs ({jobs.length})</h2>
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <h2 className="text-lg font-semibold">
+            Jobs ({visibleJobs.length}
+            {visibleJobs.length !== jobs.length ? ` of ${jobs.length}` : ''})
+          </h2>
+          <div className="flex flex-wrap items-center gap-3 text-sm">
+            {scoringPending > 0 && (
+              <span className="rounded-full bg-sky-100 px-3 py-1 text-xs font-medium text-sky-800">
+                Scoring… {jobs.length - scoringPending}/{jobs.length}
+              </span>
+            )}
+            {selected.size > 0 && (
+              <span className="rounded-full bg-slate-900 px-3 py-1 text-xs font-medium text-white">
+                {selected.size} selected
+              </span>
+            )}
+            <label className="flex items-center gap-1">
+              Sort
+              <select
+                className="rounded-md border border-slate-300 px-1 py-0.5 text-sm"
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as 'score' | 'date')}
+              >
+                <option value="score">Score</option>
+                <option value="date">Newest</option>
+              </select>
+            </label>
+            <label className="flex items-center gap-1">
+              <input
+                type="checkbox"
+                checked={hideExceeds}
+                onChange={(e) => setHideExceeds(e.target.checked)}
+              />
+              Hide over-experience
+            </label>
+            <label className="flex items-center gap-1">
+              <input
+                type="checkbox"
+                checked={easyOnly}
+                onChange={(e) => setEasyOnly(e.target.checked)}
+              />
+              Easy Apply only
+            </label>
+            {scoredCount >= 2 && scoringPending === 0 && (
+              <button
+                className="rounded-md border border-slate-300 px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-40"
+                disabled={busyRerank}
+                onClick={rerank}
+                title="LLM-order the jobs scored within a few points of the top"
+              >
+                {busyRerank ? 'Reranking…' : 'Rerank close matches'}
+              </button>
+            )}
+          </div>
+        </div>
         {jobs.length === 0 ? (
           <p className="text-sm text-slate-400">No jobs collected yet.</p>
         ) : (
           <ul className="divide-y divide-slate-100">
-            {jobs.map((job) => (
-              <li key={job.job_id} className="py-3">
-                <div className="flex items-start justify-between gap-4">
-                  <div>
-                    <a
-                      href={job.url}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="font-medium text-slate-900 hover:underline"
-                    >
-                      {job.title}
-                    </a>
-                    <p className="text-sm text-slate-500">
-                      {job.company}
-                      {job.location ? ` · ${job.location}` : ''}
-                      {job.posted_text ? ` · ${job.posted_text}` : ''}
-                    </p>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-2">
-                    {job.easy_apply && (
-                      <span className="rounded-full bg-sky-100 px-2 py-0.5 text-xs font-medium text-sky-800">
-                        Easy Apply
-                      </span>
-                    )}
-                    <button
-                      className="rounded-md border border-slate-300 px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-40"
-                      disabled={busyDetail === job.job_id}
-                      onClick={() =>
-                        job.description && expanded !== job.job_id
-                          ? setExpanded(job.job_id)
+            {visibleJobs.map((job) => {
+              const score = displayScore(job)
+              const breakdown = job.score_breakdown
+              const explanation = explanations[job.job_id]
+              return (
+                <li key={job.job_id} className="py-3">
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="flex items-start gap-3">
+                      <input
+                        type="checkbox"
+                        className="mt-1.5"
+                        checked={selected.has(job.job_id)}
+                        onChange={() => toggleSelected(job.job_id)}
+                      />
+                      {score !== null && (
+                        <span
+                          className={`mt-0.5 w-12 shrink-0 rounded-md px-1.5 py-0.5 text-center text-sm font-semibold ${
+                            score >= 75
+                              ? 'bg-emerald-100 text-emerald-800'
+                              : score >= 50
+                                ? 'bg-amber-100 text-amber-800'
+                                : 'bg-slate-100 text-slate-600'
+                          }`}
+                          title={
+                            job.llm_rerank !== null
+                              ? `LLM rerank ${job.llm_rerank} (deterministic ${job.deterministic_score})`
+                              : `Deterministic score ${job.deterministic_score}`
+                          }
+                        >
+                          {Math.round(score)}
+                        </span>
+                      )}
+                      <div>
+                        <a
+                          href={job.url}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="font-medium text-slate-900 hover:underline"
+                        >
+                          {job.title}
+                        </a>
+                        <p className="text-sm text-slate-500">
+                          {job.company}
+                          {job.location ? ` · ${job.location}` : ''}
+                          {job.posted_text ? ` · ${job.posted_text}` : ''}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {breakdown?.exceeds_experience && (
+                        <span
+                          className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800"
+                          title="Demands more experience than the profile shows"
+                        >
+                          Over-exp
+                        </span>
+                      )}
+                      {job.easy_apply && (
+                        <span className="rounded-full bg-sky-100 px-2 py-0.5 text-xs font-medium text-sky-800">
+                          Easy Apply
+                        </span>
+                      )}
+                      <button
+                        className="rounded-md border border-slate-300 px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-40"
+                        disabled={busyDetail === job.job_id}
+                        onClick={() =>
+                          job.description && expanded !== job.job_id
+                            ? setExpanded(job.job_id)
+                            : expanded === job.job_id
+                              ? setExpanded(null)
+                              : fetchDetail(job.job_id)
+                        }
+                      >
+                        {busyDetail === job.job_id
+                          ? 'Fetching…'
                           : expanded === job.job_id
-                            ? setExpanded(null)
-                            : fetchDetail(job.job_id)
-                      }
-                    >
-                      {busyDetail === job.job_id
-                        ? 'Fetching…'
-                        : expanded === job.job_id
-                          ? 'Hide description'
-                          : 'Description'}
-                    </button>
+                            ? 'Hide'
+                            : 'Details'}
+                      </button>
+                    </div>
                   </div>
-                </div>
-                {expanded === job.job_id && job.description && (
-                  <p className="mt-2 whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-sm text-slate-700">
-                    {job.description}
-                  </p>
-                )}
-              </li>
-            ))}
+                  {expanded === job.job_id && (
+                    <div className="mt-2 space-y-2">
+                      {breakdown && (
+                        <div className="rounded-lg bg-slate-50 p-3 text-sm text-slate-700">
+                          <p className="text-xs uppercase tracking-wide text-slate-400">
+                            Skills {breakdown.skills} · Experience{' '}
+                            {breakdown.experience} · Education {breakdown.education}
+                          </p>
+                          {breakdown.match_reasons.map((r) => (
+                            <p key={r} className="mt-1 text-emerald-700">
+                              ✓ {r}
+                            </p>
+                          ))}
+                          {breakdown.gap_reasons.map((r) => (
+                            <p key={r} className="mt-1 text-amber-700">
+                              ✗ {r}
+                            </p>
+                          ))}
+                          {job.deterministic_score !== null && (
+                            <button
+                              className="mt-2 rounded-md border border-slate-300 px-2 py-1 text-xs hover:bg-white disabled:opacity-40"
+                              disabled={busyExplain === job.job_id}
+                              onClick={() => explain(job.job_id)}
+                            >
+                              {busyExplain === job.job_id
+                                ? 'Explaining…'
+                                : explanation
+                                  ? 'Refresh explanation'
+                                  : 'Explain fit'}
+                            </button>
+                          )}
+                          {explanation && (
+                            <div className="mt-2 border-t border-slate-200 pt-2">
+                              <p className="font-medium text-slate-800">
+                                {explanation.pitch}
+                              </p>
+                              {explanation.strengths.map((s) => (
+                                <p key={s} className="mt-1 text-emerald-700">
+                                  + {s}
+                                </p>
+                              ))}
+                              {explanation.gaps.map((g) => (
+                                <p key={g} className="mt-1 text-amber-700">
+                                  – {g}
+                                </p>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {job.description && (
+                        <p className="whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-sm text-slate-700">
+                          {job.description}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </li>
+              )
+            })}
           </ul>
         )}
       </section>
