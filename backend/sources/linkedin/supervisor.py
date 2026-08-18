@@ -12,6 +12,7 @@ surface a banner — never any bypass attempt (PLAN.md §4.3).
 """
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 
@@ -45,8 +46,15 @@ class BrowserUnavailable(SupervisorError):
     """Playwright/Chromium not installed or failed to launch."""
 
 
+# States that survive a restart: the user still has something to resolve,
+# so the banner must not silently reset to idle (PLAN.md §4.3: stop
+# cleanly, persist state).
+_DURABLE_STATES = ("captcha_stop", "error")
+_STATE_KEY = "linkedin_supervisor"
+
+
 class LinkedInSupervisor:
-    """States: idle -> ready | logged_out | captcha_stop | error."""
+    """States: idle -> connecting -> ready | logged_out | captcha_stop | error."""
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -55,6 +63,19 @@ class LinkedInSupervisor:
         self._page = None
         self.state = "idle"
         self.detail: str | None = None
+
+    def restore_state(self) -> None:
+        """Reload a persisted captcha/error banner after a restart. Call
+        once at startup, after db.init()."""
+        raw = db.get_state(_STATE_KEY)
+        if not raw:
+            return
+        try:
+            saved = json.loads(raw)
+        except ValueError:
+            return
+        if saved.get("state") in _DURABLE_STATES:
+            self.state, self.detail = saved["state"], saved.get("detail")
 
     # --- lifecycle ----------------------------------------------------------
 
@@ -107,21 +128,20 @@ class LinkedInSupervisor:
     def _set_state(self, state: str, detail: str | None) -> None:
         if (state, detail) != (self.state, self.detail):
             self.state, self.detail = state, detail
+            db.set_state(_STATE_KEY, json.dumps({"state": state, "detail": detail}))
             broker.publish("linkedin", {"state": state, "detail": detail})
+
+    def mark_connecting(self) -> None:
+        """Synchronous pre-flight for the connect endpoint: the UI must
+        see 'connecting' immediately, not a stale 'idle', while the
+        background task opens the browser."""
+        if self.state not in ("ready", "captcha_stop"):
+            self._set_state("connecting", "Opening the LinkedIn browser window…")
 
     # --- session ------------------------------------------------------------
 
     async def _classify_current_page(self, page) -> str:
-        url = page.url or ""
-        if selectors.is_checkpoint_url(url):
-            return "captcha_stop"
-        html = await page.content()
-        soup = selectors.parse_html(html)
-        if selectors.select_first(soup, "logged_in_marker") is not None:
-            return "ready"
-        if selectors.select_first(soup, "login_form") is not None or "/login" in url:
-            return "logged_out"
-        return "unknown"
+        return selectors.classify_page(page.url or "", await page.content())
 
     async def _ensure_logged_in(self, page, wait_for_user: bool) -> None:
         """Navigate to the feed and verify the session. When logged out
@@ -167,6 +187,7 @@ class LinkedInSupervisor:
     async def connect(self, wait_for_user: bool = True) -> dict:
         """Gate 2 entry point: open the window and verify/establish the
         session."""
+        self.mark_connecting()
         async with self._lock:
             page = await self._ensure_context()
             await self._ensure_logged_in(page, wait_for_user=wait_for_user)
@@ -197,7 +218,26 @@ class LinkedInSupervisor:
                     " if (el) el.scrollBy(0, 800); window.scrollBy(0, 800); }"
                 )
                 await pacing.scroll_delay()
-            return await page.content()
+            html = await page.content()
+            # Classify what actually came back — a redirect to login (the
+            # session expired mid-run) or a checkpoint rendered on this
+            # URL must surface as its real state, never as page content.
+            verdict = selectors.classify_page(page.url or "", html)
+            if verdict == "captcha_stop":
+                self._set_state(
+                    "captcha_stop",
+                    "LinkedIn is showing a security checkpoint. Complete it in "
+                    "the browser window; automation stays stopped.",
+                )
+                raise CaptchaStop(self.detail)
+            if verdict == "logged_out":
+                self._set_state(
+                    "logged_out",
+                    "Your LinkedIn session expired — sign in again in the "
+                    "browser window.",
+                )
+                raise AuthRequired(self.detail)
+            return html
 
     def status(self) -> dict:
         return {"state": self.state, "detail": self.detail}

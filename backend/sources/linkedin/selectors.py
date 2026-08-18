@@ -54,6 +54,17 @@ SELECTORS: dict[str, list[str]] = {
         ".jobs-description__content",
         ".jobs-box__html-content",
     ],
+    # --- results-page state markers ---
+    "results_list": [
+        "ul.jobs-search-results__list",
+        ".jobs-search-results-list",
+        ".scaffold-layout__list",
+    ],
+    "no_results_banner": [
+        ".jobs-search-no-results-banner",
+        ".jobs-search-two-pane__no-results-banner",
+        "section.jobs-search-no-results",
+    ],
     # --- session state probes ---
     "logged_in_marker": [
         "header.global-nav",
@@ -65,14 +76,22 @@ SELECTORS: dict[str, list[str]] = {
         "input#username",
         "form[action*='login']",
     ],
+    "checkpoint_marker": [
+        "#captcha-internal",
+        ".challenge-dialog",
+        "form#challenge-form",
+        "main.checkpoint",
+    ],
 }
 
 # URL substrings that mean LinkedIn is challenging or blocking the
 # session. On any of these we stop cleanly — never any bypass attempt.
+# (Plain login URLs are NOT here — an expired session classifies as
+# logged_out, which asks the user to sign in rather than bannering a
+# checkpoint.)
 CHECKPOINT_URL_MARKERS = (
     "/checkpoint/",
     "/authwall",
-    "/uas/login",
     "captcha",
     "/security/challenge",
 )
@@ -108,3 +127,32 @@ def text_of(node: Tag | None) -> str | None:
         return None
     text = " ".join(node.get_text(separator=" ").split())
     return text or None
+
+
+def classify_page(url: str, html: str) -> str:
+    """(url, html) -> 'captcha_stop' | 'ready' | 'logged_out' | 'unknown'.
+
+    Pure function over strings so tests exercise the exact production
+    classification without a browser."""
+    if is_checkpoint_url(url):
+        return "captcha_stop"
+    soup = parse_html(html)
+    if select_first(soup, "checkpoint_marker") is not None:
+        return "captcha_stop"
+    if select_first(soup, "login_form") is not None or "/login" in url.lower():
+        return "logged_out"
+    if select_first(soup, "logged_in_marker") is not None:
+        return "ready"
+    return "unknown"
+
+
+def classify_empty_results(html: str) -> str:
+    """Why did a results page parse to zero cards?
+    'no_results' — LinkedIn explicitly says there is nothing (genuine
+    end); anything else is 'unknown' (expired session already handled
+    upstream; broken selectors or a lazy-load failure land here) and
+    must be treated as an error, never as successful completion."""
+    soup = parse_html(html)
+    if select_first(soup, "no_results_banner") is not None:
+        return "no_results"
+    return "unknown"

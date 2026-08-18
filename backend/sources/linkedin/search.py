@@ -32,6 +32,12 @@ EXPERIENCE = {
 _JOB_VIEW_RE = re.compile(r"/jobs/view/(\d+)")
 
 
+class ResultsPageUnrecognized(Exception):
+    """A results page parsed to zero cards without LinkedIn's explicit
+    no-results banner — selector break or lazy-load failure. Must end
+    the run as an error, never as successful completion."""
+
+
 def build_search_url(config: dict, start: int = 0) -> str:
     params: dict[str, str] = {"keywords": config["keywords"]}
     if config.get("location"):
@@ -127,14 +133,17 @@ async def run_search(supervisor, run_id: int) -> dict:
             html = await supervisor.fetch_page(build_search_url(config, start))
             cards = parse_results(html)
             if not cards:
-                break  # end of results (or an unparseable page — either way, stop)
-            for card in cards:
-                if collected >= cap:
-                    break
-                if db.upsert_job(card):
-                    collected += 1
+                if selectors.classify_empty_results(html) == "no_results":
+                    break  # LinkedIn explicitly says this is the end
+                raise ResultsPageUnrecognized(
+                    "Results page matched no known selectors — LinkedIn's DOM "
+                    "may have changed (or the page failed to load)."
+                )
             start += PAGE_SIZE
-            db.update_search_run(run_id, next_start=start, collected=collected)
+            # One transaction: job cache + run membership + cursor. A crash
+            # between cards and checkpoint can't desync the accounting, and
+            # re-recording the same page after a restart is a no-op.
+            collected = db.record_search_page(run_id, cards, start, cap)
             progress(event="page", next_start=start)
             if collected < cap:
                 await pacing.page_delay()
@@ -148,8 +157,6 @@ async def run_search(supervisor, run_id: int) -> dict:
         log.exception("search run %s failed", run_id)
         status, message = "stopped_error", f"{type(exc).__name__}: {exc}"
 
-    db.update_search_run(
-        run_id, status=status, next_start=start, collected=collected, message=message
-    )
+    db.update_search_run(run_id, status=status, message=message)
     progress(event=status)
     return db.get_search_run(run_id)

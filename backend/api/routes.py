@@ -173,13 +173,27 @@ async def confirm_profile(body: dict):
 
 # --- LinkedIn session + search (gate 2 lives inside connect) ----------------
 
-_background_tasks: set[asyncio.Task] = set()
+_search_tasks: dict[int, asyncio.Task] = {}
+_connect_task: asyncio.Task | None = None
 
 
-def _spawn(coro) -> None:
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+def _spawn_search(run_id: int) -> bool:
+    """One worker per run, ever: a second Start/Resume for a run that is
+    already being driven is a no-op. Returns whether a task was spawned."""
+    existing = _search_tasks.get(run_id)
+    if existing is not None and not existing.done():
+        return False
+    task = asyncio.create_task(_connect_then_search(run_id))
+    _search_tasks[run_id] = task
+    task.add_done_callback(lambda t: _search_tasks.pop(run_id, None))
+    return True
+
+
+def _spawn_connect() -> None:
+    global _connect_task
+    if _connect_task is not None and not _connect_task.done():
+        return
+    _connect_task = asyncio.create_task(_connect_only())
 
 
 async def _connect_then_search(run_id: int) -> None:
@@ -203,6 +217,27 @@ async def _connect_then_search(run_id: int) -> None:
     await sources.source.resume(run_id)
 
 
+async def _connect_only() -> None:
+    try:
+        await sources.source.connect()
+    except (sources.AuthRequired, sources.CaptchaStop):
+        pass  # state is already persisted and bannered by the supervisor
+    except Exception:  # noqa: BLE001
+        log.exception("LinkedIn connect failed")
+
+
+def recover_search_runs() -> list[int]:
+    """Startup recovery: runs left in 'running' by a previous process are
+    orphans — reclaim each with a fresh worker so an interrupted search
+    resumes across restarts without user action. Returns claimed ids."""
+    claimed = []
+    for run in db.running_search_runs():
+        if _spawn_search(run["id"]):
+            claimed.append(run["id"])
+            log.info("recovered interrupted search run %s", run["id"])
+    return claimed
+
+
 @router.get("/linkedin/status")
 async def linkedin_status():
     return await sources.source.health()
@@ -212,17 +247,9 @@ async def linkedin_status():
 async def linkedin_connect():
     """Open the headed browser window and detect sign-in in the
     background; the UI follows progress via /linkedin/status and SSE."""
-    _spawn(_connect_only())
+    sources.source.mark_connecting()  # visible before the task even starts
+    _spawn_connect()
     return await sources.source.health()
-
-
-async def _connect_only() -> None:
-    try:
-        await sources.source.connect()
-    except (sources.AuthRequired, sources.CaptchaStop):
-        pass  # state is already persisted and bannered by the supervisor
-    except Exception:  # noqa: BLE001
-        log.exception("LinkedIn connect failed")
 
 
 @router.post("/search/start")
@@ -239,7 +266,7 @@ async def search_start(body: dict):
         "cap": body.get("cap"),
     }
     run_id = db.create_search_run(config)
-    _spawn(_connect_then_search(run_id))
+    _spawn_search(run_id)
     return {"run_id": run_id, "status": "running"}
 
 
@@ -255,8 +282,8 @@ async def search_resume(body: dict | None = None):
     if run["status"] == "done":
         return run
     db.update_search_run(run["id"], status="running", message=None)
-    _spawn(_connect_then_search(run["id"]))
-    return {**run, "status": "running"}
+    _spawn_search(run["id"])
+    return {**run, "status": "running", "message": None}
 
 
 @router.get("/search/latest")
@@ -266,8 +293,15 @@ async def search_latest():
 
 
 @router.get("/jobs")
-async def jobs_list():
-    return {"jobs": db.list_jobs()}
+async def jobs_list(run_id: int | None = None):
+    """Jobs for a search run — the latest one by default. The global job
+    cache backs detail fetches but is not what the UI lists."""
+    if run_id is None:
+        latest = db.latest_search_run()
+        if latest is None:
+            return {"jobs": [], "run_id": None}
+        run_id = latest["id"]
+    return {"jobs": db.list_jobs(run_id), "run_id": run_id}
 
 
 @router.post("/jobs/{job_id}/detail")

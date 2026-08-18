@@ -30,5 +30,11 @@ class LinkedInSource(JobSource):
     async def health(self) -> dict:
         return self._supervisor.status()
 
+    def mark_connecting(self) -> None:
+        self._supervisor.mark_connecting()
+
+    def restore_state(self) -> None:
+        self._supervisor.restore_state()
+
     async def close(self) -> None:
         await self._supervisor.close()

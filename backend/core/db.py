@@ -59,6 +59,11 @@ CREATE TABLE IF NOT EXISTS jobs (
     description_hash  TEXT,
     detail_fetched_at TEXT
 );
+CREATE TABLE IF NOT EXISTS search_run_jobs (
+    run_id INTEGER NOT NULL,
+    job_id TEXT NOT NULL,
+    PRIMARY KEY (run_id, job_id)
+);
 CREATE TABLE IF NOT EXISTS action_counts (
     day   TEXT PRIMARY KEY,
     count INTEGER NOT NULL
@@ -229,12 +234,69 @@ def get_job(job_id: str) -> dict | None:
     return _job_row_to_dict(row) if row else None
 
 
-def list_jobs() -> list[dict]:
+def list_jobs(run_id: int | None = None) -> list[dict]:
+    """All cached jobs, or — with `run_id` — only the jobs that belong to
+    that search run (what the UI shows as the current results)."""
+    columns = ", ".join(f"jobs.{c}" for c in _JOB_COLUMNS)
     with _connect() as conn:
-        rows = conn.execute(
-            f"SELECT {', '.join(_JOB_COLUMNS)} FROM jobs ORDER BY last_seen_at DESC"
-        ).fetchall()
+        if run_id is None:
+            rows = conn.execute(
+                f"SELECT {columns} FROM jobs ORDER BY last_seen_at DESC"
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                f"SELECT {columns} FROM jobs "
+                "JOIN search_run_jobs ON search_run_jobs.job_id = jobs.job_id "
+                "WHERE search_run_jobs.run_id = ? ORDER BY jobs.last_seen_at DESC",
+                (run_id,),
+            ).fetchall()
     return [_job_row_to_dict(r) for r in rows]
+
+
+def record_search_page(run_id: int, cards: list[dict], next_start: int, cap: int) -> int:
+    """Persist one results page atomically: upsert the cards into the
+    global job cache, associate them with the run (up to `cap` members),
+    and checkpoint the run's cursor + collected count — all in a single
+    transaction, so a crash between card insertion and checkpoint can't
+    desync the accounting. Idempotent: re-recording the same page after
+    a crash changes nothing. Returns the run's collected total."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        for card in cards:
+            collected = conn.execute(
+                "SELECT COUNT(*) FROM search_run_jobs WHERE run_id = ?", (run_id,)
+            ).fetchone()[0]
+            if collected >= cap:
+                break
+            conn.execute(
+                "INSERT INTO jobs (job_id, title, company, location, posted_text, "
+                "workplace, easy_apply, url, first_seen_at, last_seen_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(job_id) DO UPDATE SET title = excluded.title, "
+                "company = excluded.company, location = excluded.location, "
+                "posted_text = excluded.posted_text, workplace = excluded.workplace, "
+                "easy_apply = excluded.easy_apply, url = excluded.url, "
+                "last_seen_at = excluded.last_seen_at",
+                (
+                    card["job_id"], card["title"], card["company"],
+                    card.get("location"), card.get("posted_text"),
+                    card.get("workplace"), int(card.get("easy_apply", False)),
+                    card["url"], now, now,
+                ),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO search_run_jobs (run_id, job_id) VALUES (?, ?)",
+                (run_id, card["job_id"]),
+            )
+        collected = conn.execute(
+            "SELECT COUNT(*) FROM search_run_jobs WHERE run_id = ?", (run_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "UPDATE search_runs SET next_start = ?, collected = ?, updated_at = ? "
+            "WHERE id = ?",
+            (next_start, collected, now, run_id),
+        )
+    return collected
 
 
 def save_job_detail(job_id: str, description: str, description_hash: str) -> None:
@@ -262,22 +324,29 @@ def create_search_run(config: dict) -> int:
         return cursor.lastrowid
 
 
+_UNSET = object()
+
+
 def update_search_run(
     run_id: int,
     *,
     status: str | None = None,
     next_start: int | None = None,
     collected: int | None = None,
-    message: str | None = None,
+    message: object = _UNSET,
 ) -> None:
+    """`message` uses a sentinel so passing message=None explicitly
+    *clears* a stale error message (omit the argument to leave it)."""
     sets, params = ["updated_at = ?"], [datetime.now(timezone.utc).isoformat()]
     for column, value in (
-        ("status", status), ("next_start", next_start),
-        ("collected", collected), ("message", message),
+        ("status", status), ("next_start", next_start), ("collected", collected),
     ):
         if value is not None:
             sets.append(f"{column} = ?")
             params.append(value)
+    if message is not _UNSET:
+        sets.append("message = ?")
+        params.append(message)
     params.append(run_id)
     with _connect() as conn:
         conn.execute(f"UPDATE search_runs SET {', '.join(sets)} WHERE id = ?", params)
@@ -289,6 +358,26 @@ def get_search_run(run_id: int) -> dict | None:
 
 def latest_search_run() -> dict | None:
     return _search_run_query("ORDER BY id DESC LIMIT 1", ())
+
+
+def running_search_runs() -> list[dict]:
+    """Runs left in 'running' — after a restart these are orphans (no
+    task holds them) and must be reclaimed by startup recovery."""
+    import json
+
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, config_json, status, next_start, collected, message, "
+            "started_at, updated_at FROM search_runs WHERE status = 'running'"
+        ).fetchall()
+    return [
+        {
+            "id": r[0], "config": json.loads(r[1]), "status": r[2],
+            "next_start": r[3], "collected": r[4], "message": r[5],
+            "started_at": r[6], "updated_at": r[7],
+        }
+        for r in rows
+    ]
 
 
 def _search_run_query(clause: str, params: tuple) -> dict | None:

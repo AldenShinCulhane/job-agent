@@ -8,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from backend import sources
+from backend.api import routes as api_routes
 from backend.api.routes import router
 from backend.core import db
 
@@ -22,6 +23,11 @@ PORT = 8700
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
+    # Reload any persisted captcha/error banner, then reclaim search runs
+    # a previous process left 'running' — interrupted searches resume
+    # across restarts without user action.
+    sources.source.restore_state()
+    api_routes.recover_search_runs()
     yield
     # Close the LinkedIn browser context cleanly so the persistent
     # profile in .data/browser/ isn't left mid-write.

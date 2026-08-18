@@ -8,6 +8,7 @@ const labelCls = 'block text-xs font-medium uppercase tracking-wide text-slate-5
 
 const LINKEDIN_STATES: Record<string, { label: string; tone: string }> = {
   idle: { label: 'Not connected', tone: 'bg-slate-100 text-slate-600' },
+  connecting: { label: 'Connecting…', tone: 'bg-sky-100 text-sky-800' },
   ready: { label: 'LinkedIn connected', tone: 'bg-emerald-100 text-emerald-800' },
   logged_out: { label: 'Sign-in needed', tone: 'bg-amber-100 text-amber-800' },
   captcha_stop: { label: 'Checkpoint — stopped', tone: 'bg-rose-100 text-rose-800' },
@@ -25,6 +26,15 @@ const RUN_LABELS: Record<string, string> = {
 
 const WORKPLACE_OPTIONS = ['remote', 'hybrid', 'onsite'] as const
 
+const EXPERIENCE_OPTIONS = [
+  { id: 'internship', label: 'Internship' },
+  { id: 'entry', label: 'Entry level' },
+  { id: 'associate', label: 'Associate' },
+  { id: 'mid_senior', label: 'Mid-Senior' },
+  { id: 'director', label: 'Director' },
+  { id: 'executive', label: 'Executive' },
+] as const
+
 export default function Search() {
   const [linkedin, setLinkedin] = useState<LinkedInStatus | null>(null)
   const [run, setRun] = useState<SearchRun | null>(null)
@@ -37,6 +47,7 @@ export default function Search() {
   const [location, setLocation] = useState('')
   const [datePosted, setDatePosted] = useState('')
   const [workplace, setWorkplace] = useState<string[]>([])
+  const [experience, setExperience] = useState<string[]>([])
   const [cap, setCap] = useState(100)
 
   const refresh = useCallback(async () => {
@@ -58,9 +69,12 @@ export default function Search() {
     refresh()
   }, [refresh])
 
-  // Poll while a run is active or a sign-in/checkpoint is pending.
+  // Poll while a run is active or the session is mid-transition.
   const active =
-    run?.status === 'running' || linkedin?.state === 'logged_out' || linkedin?.state === 'captcha_stop'
+    run?.status === 'running' ||
+    linkedin?.state === 'connecting' ||
+    linkedin?.state === 'logged_out' ||
+    linkedin?.state === 'captcha_stop'
   useEffect(() => {
     if (!active) return
     const timer = setInterval(refresh, 2500)
@@ -84,6 +98,7 @@ export default function Search() {
         location: location || null,
         date_posted: datePosted || null,
         workplace,
+        experience,
         cap,
       })
       await refresh()
@@ -133,7 +148,8 @@ export default function Search() {
             )}
             {linkedin?.state !== 'ready' && (
               <button
-                className="rounded-md bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-700"
+                className="rounded-md bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-40"
+                disabled={linkedin?.state === 'connecting'}
                 onClick={connect}
               >
                 Connect
@@ -197,6 +213,25 @@ export default function Search() {
               onChange={(e) => setCap(Number(e.target.value) || 100)}
             />
           </label>
+          <div className="col-span-2 md:col-span-3">
+            <span className={labelCls}>Experience level</span>
+            <div className="mt-1 flex flex-wrap gap-3">
+              {EXPERIENCE_OPTIONS.map((opt) => (
+                <label key={opt.id} className="flex items-center gap-1 text-sm">
+                  <input
+                    type="checkbox"
+                    checked={experience.includes(opt.id)}
+                    onChange={(e) =>
+                      setExperience((prev) =>
+                        e.target.checked ? [...prev, opt.id] : prev.filter((x) => x !== opt.id),
+                      )
+                    }
+                  />
+                  {opt.label}
+                </label>
+              ))}
+            </div>
+          </div>
         </div>
         <div className="mt-4 flex items-center gap-3">
           <button

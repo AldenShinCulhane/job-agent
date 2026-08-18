@@ -7,14 +7,17 @@ from pathlib import Path
 
 import pytest
 
+import asyncio
+
 from backend.core import db
-from backend.sources.linkedin import job_detail, pacing, search
+from backend.sources.linkedin import job_detail, pacing, search, selectors
 from backend.sources.linkedin.selectors import is_checkpoint_url
-from backend.sources.linkedin.supervisor import CaptchaStop
+from backend.sources.linkedin.supervisor import CaptchaStop, LinkedInSupervisor
 
 FIXTURES = Path(__file__).parent / "fixtures"
 SEARCH_HTML = (FIXTURES / "linkedin_search_results.html").read_text()
 SEARCH_FALLBACK_HTML = (FIXTURES / "linkedin_search_results_fallback.html").read_text()
+NO_RESULTS_HTML = (FIXTURES / "linkedin_search_no_results.html").read_text()
 DETAIL_HTML = (FIXTURES / "linkedin_job_detail.html").read_text()
 
 
@@ -93,6 +96,26 @@ def test_checkpoint_urls_detected():
     assert is_checkpoint_url("https://www.linkedin.com/security/CHALLENGE")
     assert not is_checkpoint_url("https://www.linkedin.com/jobs/search/?keywords=x")
     assert not is_checkpoint_url("https://www.linkedin.com/feed/")
+    # Plain login URLs are a sign-in situation, not a checkpoint.
+    assert not is_checkpoint_url("https://www.linkedin.com/uas/login?session=x")
+
+
+def test_classify_page_states():
+    nav = '<html><body><header class="global-nav">x</header></body></html>'
+    login = '<html><body><form class="login__form"><input id="username"></form></body></html>'
+    challenge = '<html><body><form id="challenge-form"></form></body></html>'
+    feed = "https://www.linkedin.com/feed/"
+    assert selectors.classify_page(feed, nav) == "ready"
+    assert selectors.classify_page(feed, login) == "logged_out"
+    assert selectors.classify_page("https://www.linkedin.com/uas/login", "<p>x</p>") == "logged_out"
+    assert selectors.classify_page(feed, challenge) == "captcha_stop"
+    assert selectors.classify_page("https://www.linkedin.com/checkpoint/x", nav) == "captcha_stop"
+    assert selectors.classify_page(feed, "<p>mystery</p>") == "unknown"
+
+
+def test_classify_empty_results():
+    assert selectors.classify_empty_results(NO_RESULTS_HTML) == "no_results"
+    assert selectors.classify_empty_results("<div>anything else</div>") == "unknown"
 
 
 # --- collect / dedupe / resume ----------------------------------------------
@@ -100,15 +123,62 @@ def test_checkpoint_urls_detected():
 async def test_search_collects_dedupes_and_finishes(test_db, no_delays):
     run_id = db.create_search_run({"keywords": "engineer", "cap": 50})
     # Page 1: two parseable jobs. Page 2: same page again (all duplicates).
-    # Page 3: empty -> end of results.
-    fake = FakeSupervisor([SEARCH_HTML, SEARCH_HTML])
+    # Page 3: LinkedIn's explicit no-results banner -> genuine end.
+    fake = FakeSupervisor([SEARCH_HTML, SEARCH_HTML, NO_RESULTS_HTML])
     run = await search.run_search(fake, run_id)
     assert run["status"] == "done"
     assert run["collected"] == 2  # duplicates did not count
-    assert len(db.list_jobs()) == 2
-    # Empty page 3 ends the run before advancing past it.
+    assert len(db.list_jobs(run_id)) == 2
+    # The no-results page ends the run before advancing past it.
     assert run["next_start"] == 2 * search.PAGE_SIZE
     assert "start=25" in fake.urls[1] and "start=50" in fake.urls[2]
+
+
+async def test_empty_page_without_no_results_banner_is_an_error(test_db, no_delays):
+    """Selector break / lazy-load failure must never masquerade as
+    successful completion."""
+    run_id = db.create_search_run({"keywords": "engineer", "cap": 50})
+    fake = FakeSupervisor(["<html><body><div>totally unfamiliar</div></body></html>"])
+    run = await search.run_search(fake, run_id)
+    assert run["status"] == "stopped_error"
+    assert "no known selectors" in run["message"]
+
+
+async def test_previously_cached_jobs_still_count_for_a_new_run(test_db, no_delays):
+    """Run accounting is membership-based: a job already in the global
+    cache from an earlier run still counts toward this run's collected
+    and cap, and /jobs for the run returns exactly this run's results."""
+    db.upsert_job(
+        {
+            "job_id": "8888888888",
+            "title": "Old Cached Job",
+            "company": "Historic Corp",
+            "url": "https://www.linkedin.com/jobs/view/8888888888/",
+        }
+    )
+    first_run = db.create_search_run({"keywords": "engineer", "cap": 50})
+    await search.run_search(FakeSupervisor([SEARCH_HTML, NO_RESULTS_HTML]), first_run)
+
+    second_run = db.create_search_run({"keywords": "engineer", "cap": 50})
+    run = await search.run_search(
+        FakeSupervisor([SEARCH_HTML, NO_RESULTS_HTML]), second_run
+    )
+    assert run["collected"] == 2  # both jobs known globally — still this run's results
+    assert {j["job_id"] for j in db.list_jobs(second_run)} == {
+        "9000000001",
+        "9000000002",
+    }
+    assert len(db.list_jobs()) == 3  # global cache keeps the historic job
+
+
+def test_record_search_page_is_idempotent(test_db):
+    run_id = db.create_search_run({"keywords": "engineer", "cap": 50})
+    cards = search.parse_results(SEARCH_HTML)
+    first = db.record_search_page(run_id, cards, 25, cap=50)
+    again = db.record_search_page(run_id, cards, 25, cap=50)  # crash replay
+    assert first == again == 2
+    assert db.get_search_run(run_id)["collected"] == 2
+    assert db.get_search_run(run_id)["next_start"] == 25
 
 
 async def test_search_respects_cap(test_db, no_delays):
@@ -131,12 +201,12 @@ async def test_search_stops_cleanly_on_captcha_and_resumes(test_db, no_delays):
     # Resume (fresh process, same DB): picks up at the saved offset,
     # collects the fallback page, then finishes — no duplicated work.
     db.update_search_run(run_id, status="running")
-    fake2 = FakeSupervisor([SEARCH_FALLBACK_HTML])
+    fake2 = FakeSupervisor([SEARCH_FALLBACK_HTML, NO_RESULTS_HTML])
     resumed = await search.run_search(fake2, run_id)
     assert resumed["status"] == "done"
     assert resumed["collected"] == 4
     assert f"start={search.PAGE_SIZE}" in fake2.urls[0]
-    assert len(db.list_jobs()) == 4
+    assert len(db.list_jobs(run_id)) == 4
 
 
 async def test_search_daily_cap_is_terminal_but_resumable(test_db, no_delays):
@@ -218,3 +288,96 @@ def test_daily_action_cap(test_db, monkeypatch):
         pacing.check_daily_cap()
     with pytest.raises(pacing.DailyCapReached):
         pacing.check_daily_cap()
+
+
+# --- durable state / run bookkeeping ----------------------------------------
+
+def test_supervisor_banner_state_survives_restart(test_db):
+    crashed = LinkedInSupervisor()
+    crashed._set_state("captcha_stop", "checkpoint hit")
+
+    fresh = LinkedInSupervisor()  # new process
+    fresh.restore_state()
+    assert (fresh.state, fresh.detail) == ("captcha_stop", "checkpoint hit")
+
+    # Non-durable states reset to idle on restart (a stale 'ready' would
+    # lie — no browser is open yet).
+    crashed._set_state("ready", None)
+    fresh2 = LinkedInSupervisor()
+    fresh2.restore_state()
+    assert fresh2.state == "idle"
+
+
+def test_update_search_run_message_none_clears(test_db):
+    run_id = db.create_search_run({"keywords": "x"})
+    db.update_search_run(run_id, status="stopped_error", message="boom")
+    db.update_search_run(run_id, status="running", message=None)
+    assert db.get_search_run(run_id)["message"] is None
+    db.update_search_run(run_id, collected=5)  # message omitted -> untouched
+    assert db.get_search_run(run_id)["message"] is None
+
+
+# --- startup recovery + worker idempotency (routes layer) --------------------
+
+async def test_startup_recovery_resumes_interrupted_run(
+    test_db, no_delays, monkeypatch
+):
+    """Real restart shape: a run is left 'running' in the DB with a page
+    checkpointed, the process dies, startup recovery reclaims it and the
+    run completes from the saved offset."""
+    from backend.api import routes
+
+    run_id = db.create_search_run({"keywords": "engineer", "cap": 50})
+    db.record_search_page(
+        run_id, search.parse_results(SEARCH_HTML), search.PAGE_SIZE, cap=50
+    )
+    assert db.get_search_run(run_id)["status"] == "running"  # orphaned
+
+    fake_browser = FakeSupervisor([SEARCH_FALLBACK_HTML, NO_RESULTS_HTML])
+
+    class FakeSource:
+        async def connect(self):
+            return {"state": "ready"}
+
+        async def resume(self, rid):
+            db.update_search_run(rid, status="running")
+            return await search.run_search(fake_browser, rid)
+
+    monkeypatch.setattr(routes.sources, "source", FakeSource())
+    assert routes.recover_search_runs() == [run_id]
+    await routes._search_tasks[run_id]
+
+    run = db.get_search_run(run_id)
+    assert run["status"] == "done"
+    assert run["collected"] == 4
+    assert f"start={search.PAGE_SIZE}" in fake_browser.urls[0]  # resumed at offset
+
+
+async def test_duplicate_resume_spawns_single_worker(test_db, monkeypatch):
+    from backend.api import routes
+
+    run_id = db.create_search_run({"keywords": "engineer", "cap": 50})
+    release = asyncio.Event()
+    connects = []
+
+    class SlowSource:
+        async def connect(self):
+            connects.append(1)
+            await release.wait()
+
+        async def resume(self, rid):
+            db.update_search_run(rid, status="done")
+            return db.get_search_run(rid)
+
+    monkeypatch.setattr(routes.sources, "source", SlowSource())
+    assert routes._spawn_search(run_id) is True
+    task = routes._search_tasks[run_id]
+    assert routes._spawn_search(run_id) is False  # already driven — no-op
+    release.set()
+    await task
+    assert connects == [1]  # exactly one worker ran
+
+    # After the worker finishes, a new spawn is allowed again.
+    assert routes._spawn_search(run_id) is True
+    release.set()
+    await routes._search_tasks.get(run_id, task)
