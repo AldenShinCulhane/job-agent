@@ -141,6 +141,11 @@ def classify_page(url: str, html: str) -> str:
         return "captcha_stop"
     if select_first(soup, "login_form") is not None or "/login" in url.lower():
         return "logged_out"
+    # Still ON the feed = signed in: LinkedIn redirects unauthenticated
+    # visitors off /feed/. URL-based and therefore robust to nav DOM
+    # changes (observed live: global-nav selectors missed a real feed).
+    if "linkedin.com/feed" in url.lower():
+        return "ready"
     if select_first(soup, "logged_in_marker") is not None:
         return "ready"
     return "unknown"

@@ -105,12 +105,19 @@ def test_classify_page_states():
     login = '<html><body><form class="login__form"><input id="username"></form></body></html>'
     challenge = '<html><body><form id="challenge-form"></form></body></html>'
     feed = "https://www.linkedin.com/feed/"
+    jobs = "https://www.linkedin.com/jobs/search/?keywords=x"
     assert selectors.classify_page(feed, nav) == "ready"
+    assert selectors.classify_page(jobs, nav) == "ready"
     assert selectors.classify_page(feed, login) == "logged_out"
     assert selectors.classify_page("https://www.linkedin.com/uas/login", "<p>x</p>") == "logged_out"
     assert selectors.classify_page(feed, challenge) == "captcha_stop"
     assert selectors.classify_page("https://www.linkedin.com/checkpoint/x", nav) == "captcha_stop"
-    assert selectors.classify_page(feed, "<p>mystery</p>") == "unknown"
+    # Regression (found in live smoke): a real signed-in feed whose nav
+    # DOM matches none of our selectors must still classify as ready —
+    # unauthenticated sessions never stay on /feed/.
+    assert selectors.classify_page(feed, "<p>unrecognized feed DOM</p>") == "ready"
+    # Off-feed pages without markers stay unknown (tolerated by fetch_page).
+    assert selectors.classify_page(jobs, "<p>mystery</p>") == "unknown"
 
 
 def test_classify_empty_results():
