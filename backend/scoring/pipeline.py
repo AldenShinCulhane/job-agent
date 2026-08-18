@@ -56,6 +56,7 @@ async def run_pipeline(run_id: int) -> dict:
     scored = skipped = failed = 0
     stopped: str | None = None
     detail: str | None = None
+    last_failure: str | None = None  # actionable cause for isolated failures
 
     def profile_stale() -> bool:
         latest = db.latest_profile()
@@ -128,6 +129,9 @@ async def run_pipeline(run_id: int) -> dict:
                 skipped += 1
             elif outcome == "raced":
                 failed += 1  # bounded — the retry timer revisits it
+                last_failure = (
+                    f"job {job_id}: description kept changing during scoring"
+                )
             else:  # stale_profile
                 stopped = "stale_profile"
                 log.info("scoring run %s stopped: profile changed mid-pass", run_id)
@@ -158,10 +162,15 @@ async def run_pipeline(run_id: int) -> dict:
             stopped, detail = "engine", str(exc)
             log.warning("scoring run %s stopped, engine error: %s", run_id, exc)
             break
-        except Exception:  # noqa: BLE001 — isolate per-job failures
+        except Exception as exc:  # noqa: BLE001 — isolate per-job failures
             failed += 1
+            last_failure = f"job {job_id}: {type(exc).__name__}: {exc}"
             log.exception("scoring job %s failed; continuing", job_id)
 
+    if detail is None and failed:
+        # Retry exhaustion persists this — the stall must name a cause,
+        # not just claim one exists.
+        detail = f"{failed} job(s) failed — last: {last_failure}"
     summary = {"scored": scored, "skipped": skipped, "failed": failed,
                "stopped": stopped, "detail": detail}
     log.info("scoring run %s pass finished: %s", run_id, summary)

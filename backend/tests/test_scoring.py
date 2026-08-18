@@ -639,11 +639,13 @@ async def test_pipeline_worker_arms_bounded_retry(test_db, monkeypatch):
     monkeypatch.setattr(routes, "_arm_pipeline_retry", fake_arm)
     monkeypatch.setattr(routes, "_pipeline_retry_attempts", 0)
     for _ in range(routes._PIPELINE_MAX_RETRIES + 2):
-        await routes._pipeline_worker(1)
+        await routes._pipeline_worker(1, 1)
     assert delays == [60.0, 120.0, 240.0]  # bounded backoff, then break
-    # The open circuit is user-visible, not just a log line.
+    # The open circuit is user-visible AND owned: it names the exact
+    # (run, profile) it blocks, so restarts keep it enforced.
     assert routes._get_scoring_stall() == {
         "reason": "retry_exhausted", "detail": "engine hiccup",
+        "run_id": 1, "profile_version": 1,
     }
 
 
@@ -707,10 +709,11 @@ async def test_worker_persists_blocked_stall_without_timer(test_db, monkeypatch)
     monkeypatch.setattr(pipeline, "run_pipeline", fake_run)
     monkeypatch.setattr(routes, "_arm_pipeline_retry", lambda d: armed.append(d))
     monkeypatch.setattr(routes, "_pipeline_retry_attempts", 0)
-    await routes._pipeline_worker(1)
+    await routes._pipeline_worker(1, 1)
     assert armed == []
     assert routes._get_scoring_stall() == {
         "reason": "engine_blocked", "detail": "Not logged in",
+        "run_id": 1, "profile_version": 1,
     }
 
 
@@ -718,7 +721,7 @@ async def test_probe_success_clears_stall_and_resumes(test_db, monkeypatch):
     from backend.api import routes
     from backend.core import llm
 
-    routes._set_scoring_stall("engine_blocked", "Not logged in")
+    routes._set_scoring_stall("engine_blocked", "Not logged in", 1, 1)
     monkeypatch.setattr(routes, "_pipeline_retry_attempts", 2)
     resumed = []
 
@@ -733,6 +736,107 @@ async def test_probe_success_clears_stall_and_resumes(test_db, monkeypatch):
     assert routes._get_scoring_stall() is None
     assert routes._pipeline_retry_attempts == 0
     assert resumed == [True]
+
+
+async def test_stall_enforced_across_triggers_and_cleared_when_obsolete(
+    test_db, monkeypatch
+):
+    """A persisted stall for exactly the current (run, profile) keeps
+    every resume trigger — startup included — suppressed; a stall for
+    superseded work is dropped and scoring proceeds."""
+    from backend.api import routes
+    from backend.scoring import pipeline
+
+    _confirm_profile()
+    version = db.latest_profile()[0]
+    run_id = _seed_run(["p1"])
+    ran = []
+
+    async def fake_run(rid):
+        ran.append(rid)
+        return {"scored": 0, "skipped": 0, "failed": 0,
+                "stopped": None, "detail": None}
+
+    monkeypatch.setattr(pipeline, "run_pipeline", fake_run)
+    monkeypatch.setattr(routes, "_pipeline_task", None)
+    monkeypatch.setattr(routes, "_pipeline_key", None)
+
+    # Matching stall: circuit stays open, nothing spawns.
+    routes._set_scoring_stall("retry_exhausted", "boom", run_id, version)
+    assert routes._maybe_resume_scoring() is False
+    assert ran == []
+    assert routes._get_scoring_stall() is not None  # still enforced
+
+    # Stall for an older run: obsolete — cleared, work resumes.
+    routes._set_scoring_stall("retry_exhausted", "boom", run_id - 1, version)
+    assert routes._maybe_resume_scoring() is True
+    await routes._pipeline_task
+    assert ran == [run_id]
+    assert routes._get_scoring_stall() is None
+
+
+async def test_probe_with_pinned_model_does_not_clear_stall(test_db, monkeypatch):
+    """probe() echoes a cached pin without touching the engine — that
+    must not open the circuit. reprobe resets the pin, verifies live,
+    and only then recovers."""
+    from backend.api import routes
+    from backend.core import llm
+
+    db.set_state("pinned_model", "claude-fable-5")
+    routes._set_scoring_stall("engine_blocked", "Not logged in", 1, 1)
+    resumed = []
+    monkeypatch.setattr(routes, "_maybe_resume_scoring",
+                        lambda: resumed.append(True) or True)
+
+    result = await routes.probe_engine()  # cached-pin path — no health check
+    assert result["ok"] is True
+    assert routes._get_scoring_stall() is not None  # stall survives
+    assert resumed == []
+
+    async def fake_probe():
+        return "claude-fable-5"
+
+    monkeypatch.setattr(llm, "probe", fake_probe)
+    result = await routes.reprobe_engine()  # resets pin -> genuine check
+    assert result["ok"] is True
+    assert routes._get_scoring_stall() is None
+    assert resumed == [True]
+
+
+async def test_isolated_failure_detail_names_job_and_cause(test_db, monkeypatch):
+    from backend import sources
+    from backend.scoring import pipeline
+
+    _confirm_profile()
+    run_id = _seed_run(["p1"])
+
+    async def broken_fetch(job_id, force=False):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(sources.source, "fetch_detail", broken_fetch)
+    summary = await pipeline.run_pipeline(run_id)
+    assert summary["failed"] == 1 and summary["stopped"] is None
+    assert "job p1" in summary["detail"] and "RuntimeError: boom" in summary["detail"]
+
+
+async def test_double_hash_race_reports_cause(test_db, fake_source, monkeypatch):
+    from backend.core import llm
+    from backend.scoring import pipeline
+
+    _confirm_profile()
+    run_id = _seed_run(["p1"])
+    counter = []
+
+    async def always_mutating(prompt, schema, task, system_prompt=""):
+        counter.append(1)
+        db.save_job_detail("p1", f"text {len(counter)}", f"hash-{len(counter)}")
+        return req(required_skills=["Python"])
+
+    monkeypatch.setattr(llm, "structured", always_mutating)
+    summary = await pipeline.run_pipeline(run_id)
+    assert summary["failed"] == 1
+    assert "job p1" in summary["detail"]
+    assert "changing" in summary["detail"]
 
 
 async def test_explain_mid_call_mutation_refused(test_db, monkeypatch):

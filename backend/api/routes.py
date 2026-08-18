@@ -50,6 +50,11 @@ async def status():
 
 @router.post("/engine/probe")
 async def probe_engine():
+    # With a model already pinned, probe() just echoes the pin — that is
+    # NOT a health check and must not clear a scoring stall. Only an
+    # unpinned probe (fresh start, or /engine/reprobe which resets the
+    # pin first) actually exercises the engine.
+    live = db.get_state("pinned_model") is None
     try:
         model = await llm.probe()
     except llm.EngineError as exc:
@@ -59,9 +64,10 @@ async def probe_engine():
             "detail": str(exc),
             "engine": llm.engine_status(),
         }
-    # Engine verified healthy: whatever stalled scoring on it is over —
-    # clear the stall/breaker and resume without any user gate.
-    _on_engine_recovered()
+    if live:
+        # Engine verified healthy for real: clear the stall/breaker and
+        # resume scoring without any user gate.
+        _on_engine_recovered()
     return {"ok": True, "model": model}
 
 
@@ -208,14 +214,21 @@ _pipeline_retry_task: asyncio.Task | None = None
 _pipeline_retry_attempts = 0
 _PIPELINE_MAX_RETRIES = 3
 # Persisted, user-visible reason scoring is stalled (engine login/config
-# problem, or the retry budget ran dry). Cleared on progress and on a
-# successful engine probe; survives restarts like the captcha banner.
+# problem, or the retry budget ran dry). Carries the ownership token
+# (run_id, profile_version) of the work it blocks: matching work stays
+# suppressed across restarts — the circuit breaker is enforced, not just
+# remembered — while a stall for a superseded run/profile is obsolete
+# and cleared. Cleared on progress and on a live engine probe.
 _SCORING_STALL_KEY = "scoring_stall"
 
 
-def _set_scoring_stall(reason: str, detail: str | None) -> None:
-    db.set_state(_SCORING_STALL_KEY,
-                 json.dumps({"reason": reason, "detail": detail}))
+def _set_scoring_stall(reason: str, detail: str | None,
+                       run_id: int, profile_version: int) -> None:
+    db.set_state(
+        _SCORING_STALL_KEY,
+        json.dumps({"reason": reason, "detail": detail,
+                    "run_id": run_id, "profile_version": profile_version}),
+    )
 
 
 def _clear_scoring_stall() -> None:
@@ -245,7 +258,7 @@ def _spawn_pipeline(run_id: int) -> bool:
             return False
         _pipeline_task.cancel()
     _pipeline_key = key
-    _pipeline_task = asyncio.create_task(_pipeline_worker(run_id))
+    _pipeline_task = asyncio.create_task(_pipeline_worker(run_id, version))
     return True
 
 
@@ -260,7 +273,7 @@ def _cancel_pipeline() -> None:
     _pipeline_retry_attempts = 0
 
 
-async def _pipeline_worker(run_id: int) -> None:
+async def _pipeline_worker(run_id: int, profile_version: int) -> None:
     global _pipeline_retry_attempts
     try:
         summary = await scoring_pipeline.run_pipeline(run_id)
@@ -283,9 +296,10 @@ async def _pipeline_worker(run_id: int) -> None:
         _arm_pipeline_retry(max(llm.seconds_until_retry(), 60.0))
     elif stopped == "engine_blocked":
         # Missing login / bad config / model entitlement: a timer can't
-        # fix it. Persist the reason for the UI; a successful engine
-        # probe (or reprobe after the user acts) resumes automatically.
-        _set_scoring_stall("engine_blocked", summary["detail"])
+        # fix it. Persist the reason for the UI; a live engine probe
+        # (reprobe after the user acts) resumes automatically.
+        _set_scoring_stall("engine_blocked", summary["detail"],
+                           run_id, profile_version)
     elif stopped == "engine" or (stopped is None and summary["failed"] > 0):
         # Transient engine trouble or isolated per-job failures: bounded
         # backoff, circuit-broken so a persistent failure can't loop the
@@ -295,7 +309,8 @@ async def _pipeline_worker(run_id: int) -> None:
             _pipeline_retry_attempts += 1
             _arm_pipeline_retry(delay)
         else:
-            _set_scoring_stall("retry_exhausted", summary["detail"])
+            _set_scoring_stall("retry_exhausted", summary["detail"],
+                               run_id, profile_version)
             log.error(
                 "scoring run %s: giving up automatic retries after %d attempts",
                 run_id, _PIPELINE_MAX_RETRIES,
@@ -331,10 +346,24 @@ async def _pipeline_retry_after(delay: float) -> None:
 
 def _maybe_resume_scoring() -> bool:
     """Kick the pipeline when the current run is done collecting but has
-    jobs the (current) profile hasn't been scored against."""
+    jobs the (current) profile hasn't been scored against. A persisted
+    stall for exactly this (run, profile) keeps the circuit open — every
+    trigger, startup included, is suppressed until a live probe or a
+    login action clears it; a stall for superseded work is obsolete and
+    dropped."""
     run = db.latest_search_run()
     if run is None or run["status"] != "done":
         return False
+    try:
+        version = scoring_pipeline.confirmed_profile()[0]
+    except scoring_pipeline.NoConfirmedProfile:
+        return False
+    stall = _get_scoring_stall()
+    if stall is not None:
+        if (stall.get("run_id") == run["id"]
+                and stall.get("profile_version") == version):
+            return False  # breaker enforced across restarts
+        _clear_scoring_stall()  # different run/profile — no longer applies
     if scoring_pipeline.pending_count(run["id"]) == 0:
         return False
     return _spawn_pipeline(run["id"])
