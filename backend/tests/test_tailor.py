@@ -394,9 +394,13 @@ async def test_repair_round_uses_xhigh_and_full_schema(monkeypatch):
 # --- Geometry-aware page limits (fit loops with a fake engine) ---------------
 
 def _fake_compiler(monkeypatch, pages_fn):
-    """Replace the LaTeX engine with a deterministic page counter."""
+    """Replace the LaTeX engine with a deterministic page counter. Fake
+    PDFs are plain text pypdf cannot parse, so fullness defaults to
+    "not sparse" — tests exercising the balance pass override it."""
     from backend.tailor import compile as latex
+    from backend.tailor import page_limit
 
+    monkeypatch.setattr(page_limit, "last_page_fullness", lambda p: 0.8)
     calls = []
 
     def fake_compile(tex, workdir, jobname="document"):
@@ -542,6 +546,56 @@ async def test_sparse_balance_accepts_page_count_reduction(tmp_path, monkeypatch
     fit = await page_limit.fit_resume(tailored, PROFILE, ledger, {}, 2, tmp_path)
     assert fit.layout.item_sep_pt == 0
     assert fit.result.pages == 1
+
+
+async def test_one_page_sparse_resume_gets_relaxed_balance(tmp_path, monkeypatch):
+    """The main user case: a default one-page resume that is badly
+    underfilled gets one bounded LOOSER step, kept on measured gain."""
+    from backend.tailor import page_limit
+
+    calls = _fake_compiler(monkeypatch, lambda tex: 1)
+    fullness = iter([0.2, 0.6])  # sparse; relaxed layout measures fuller
+    monkeypatch.setattr(page_limit, "last_page_fullness",
+                        lambda p: next(fullness))
+    tailored, ledger = _cited_tailored()
+    fit = await page_limit.fit_resume(tailored, PROFILE, ledger, {}, 1, tmp_path)
+    assert fit.layout.section_before_pt == 14  # one notch past default
+    assert fit.layout.item_sep_pt == 2
+    assert fit.layout.font_pt == 11  # font/margins never touched
+    assert len(calls) == 2  # initial + adopted relax pass
+
+
+async def test_one_page_relax_rejected_without_fullness_gain(
+    tmp_path, monkeypatch
+):
+    from backend.resume import template
+    from backend.tailor import page_limit
+
+    calls = _fake_compiler(monkeypatch, lambda tex: 1)
+    fullness = iter([0.2, 0.15])  # relaxing measured WORSE
+    monkeypatch.setattr(page_limit, "last_page_fullness",
+                        lambda p: next(fullness))
+    tailored, ledger = _cited_tailored()
+    fit = await page_limit.fit_resume(tailored, PROFILE, ledger, {}, 1, tmp_path)
+    assert fit.layout == template.DEFAULT_LAYOUT
+    assert len(calls) == 3  # initial + attempt + kept-layout recompile
+
+
+async def test_one_page_relax_rejected_when_it_spills_a_page(
+    tmp_path, monkeypatch
+):
+    from backend.resume import template
+    from backend.tailor import page_limit
+
+    # The looser layout pushes onto a second page — never an improvement.
+    calls = _fake_compiler(
+        monkeypatch, lambda tex: 2 if "itemsep=2pt" in tex else 1)
+    monkeypatch.setattr(page_limit, "last_page_fullness", lambda p: 0.2)
+    tailored, ledger = _cited_tailored()
+    fit = await page_limit.fit_resume(tailored, PROFILE, ledger, {}, 1, tmp_path)
+    assert fit.layout == template.DEFAULT_LAYOUT
+    assert fit.result.pages == 1
+    assert len(calls) == 3
 
 
 async def test_fit_cover_ladder_then_condense_then_fail(tmp_path, monkeypatch):
@@ -1237,3 +1291,230 @@ async def test_engine_blocked_packages_recover_automatically(
     assert worker is not None  # recovery respawned the batch
     await asyncio.wait_for(worker, timeout=5)
     assert db.get_package(pkg)["status"] == "done"
+
+
+# --- Review round 2: supersede on input change, captcha, snapshots -----------
+
+async def test_posting_change_mid_generation_supersedes_package(
+    test_db, tmp_path, monkeypatch
+):
+    """The posting is edited WHILE generation is in flight: the package
+    must end superseded, never done — the worker's guarded transitions
+    cannot resurrect the row the JD change failed."""
+    import asyncio
+
+    from backend.tailor import pipeline as tailor_pipeline
+    from backend.tailor import resume as tailor_resume
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    pkg, _ = db.create_package("p1", version, "hash-a")
+    _tailor_env(monkeypatch, tmp_path)
+
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def gated_generate(profile, ledger, job, requirements, breakdown,
+                             page_limit):
+        started.set()
+        await release.wait()
+        return _cited_tailored()[0]
+
+    monkeypatch.setattr(tailor_resume, "generate_tailored", gated_generate)
+    worker = asyncio.create_task(tailor_pipeline.run_package(pkg))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    db.save_job_detail("p1", "Rewritten mid-flight.", "hash-new")  # the edit
+    release.set()
+    assert await asyncio.wait_for(worker, timeout=5) == "superseded"
+
+    row = db.get_package(pkg)
+    assert row["status"] == "failed"
+    assert "superseded: posting changed" in row["error"]
+    assert row["output_dir"] is None  # nothing stale was ever published
+
+    # The new posting is a fresh input set — a new package is available.
+    pkg2, created = db.create_package("p1", version, "hash-new")
+    assert created and pkg2 != pkg
+
+
+async def test_profile_change_mid_fitting_supersedes_package(
+    test_db, tmp_path, monkeypatch
+):
+    """Confirming a new profile version supersedes unfinished packages
+    pinned to the old one — including a worker mid-fitting — and
+    unstrands would-be-forever waiting_inputs rows."""
+    import asyncio
+
+    from backend.tailor import page_limit as pl
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    pkg, _ = db.create_package("p1", version, "hash-a")
+    _seed_job("p2", jd_hash="hash-a")  # no derived inputs: waits
+    waiting_pkg, _ = db.create_package("p2", version, "hash-a")
+    _tailor_env(monkeypatch, tmp_path)
+
+    release = asyncio.Event()
+    started = asyncio.Event()
+    original_fit_resume = pl.fit_resume
+
+    async def gated_fit(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return await original_fit_resume(*args, **kwargs)
+
+    monkeypatch.setattr(pl, "fit_resume", gated_fit)
+    worker = asyncio.create_task(tailor_pipeline.run_package(pkg))
+    await asyncio.wait_for(started.wait(), timeout=5)
+    version2 = db.save_profile({**PROFILE, "name": "Casey Two"})
+    db.confirm_profile(version2)  # the profile change
+    release.set()
+    assert await asyncio.wait_for(worker, timeout=5) == "superseded"
+
+    for stale in (pkg, waiting_pkg):
+        row = db.get_package(stale)
+        assert row["status"] == "failed"
+        assert "superseded: profile changed" in row["error"]
+
+
+async def test_posting_change_leaves_done_packages_alone(
+    test_db, tmp_path, monkeypatch
+):
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    _tailor_env(monkeypatch, tmp_path)
+    pkg, _ = db.create_package("p1", version, "hash-a")
+    assert await tailor_pipeline.run_package(pkg) == "done"
+
+    db.save_job_detail("p1", "Edited later.", "hash-later")
+    row = db.get_package(pkg)
+    assert row["status"] == "done"  # history is never rewritten
+    assert row["output_dir"] is not None
+
+
+async def test_captcha_stop_does_not_block_package_recovery(
+    test_db, tmp_path, monkeypatch
+):
+    """Startup with a persisted captcha stop AND a mid-flight package:
+    search recovery stays deferred (no bypass-shaped navigation), but the
+    package — which needs no browser — completes."""
+    import asyncio
+
+    from backend.api import routes
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    pkg, _ = db.create_package("p1", version, "hash-a")
+    db.update_package(pkg, status="generating")  # died mid-generation
+    _tailor_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(routes.sources.source, "current_state",
+                        lambda: "captcha_stop")
+    monkeypatch.setattr(routes, "_package_worker_task", None)
+
+    assert routes.recover_search_runs() == []  # search recovery deferred
+    worker = routes._package_worker_task
+    assert worker is not None  # ...but the package queue resumed anyway
+    await asyncio.wait_for(worker, timeout=5)
+    assert db.get_package(pkg)["status"] == "done"
+
+
+async def test_shipped_documents_must_match_cached_verdicts(
+    test_db, tmp_path, monkeypatch
+):
+    """Finding 3: the pre-publish assertion binds to the SHIPPED
+    documents. Persisted fitted content that drifted past validation
+    (no cached verdict) fails closed — with zero LLM calls."""
+    import asyncio
+    import shutil as shutil_mod
+
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    pkg, _ = db.create_package("p1", version, "hash-a")
+    generate_calls, entail_calls = _tailor_env(monkeypatch, tmp_path)
+
+    tripped = []
+    original_copy = shutil_mod.copy2
+
+    def dying_copy(*args, **kwargs):
+        if not tripped:
+            tripped.append(1)
+            raise asyncio.CancelledError
+        return original_copy(*args, **kwargs)
+
+    monkeypatch.setattr(shutil_mod, "copy2", dying_copy)
+    with pytest.raises(asyncio.CancelledError):
+        await tailor_pipeline.run_package(pkg)  # dies in publishing
+
+    # Tamper with the persisted fitted cover — an uncached claim.
+    row = db.get_package(pkg)
+    stage = row["stage"]
+    stage["cover_fit"]["tailored"]["cover_letter"]["paragraphs"][0]["text"] = (
+        "I won a Nobel Prize.")
+    db.update_package(pkg, stage=stage)
+    calls_before = (list(generate_calls), list(entail_calls))
+
+    assert await tailor_pipeline.run_package(pkg) == "failed"
+    row = db.get_package(pkg)
+    assert "ValidationFailed" in row["error"]
+    assert (generate_calls, entail_calls) == calls_before  # zero LLM
+
+
+async def test_provenance_and_jobmd_publish_from_snapshots(
+    test_db, tmp_path, monkeypatch
+):
+    """Finding 4: provenance and job.md describe what the LLM stages
+    actually used — a model change or re-score between generation and
+    publish never rewrites them."""
+    import asyncio
+    import shutil as shutil_mod
+    from pathlib import Path
+
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version, score=77.7,
+                  breakdown={"match_reasons": ["Original overlap"],
+                             "gap_reasons": []})
+    db.set_state("pinned_model", "claude-fable-5")
+    pkg, _ = db.create_package("p1", version, "hash-a")
+    _tailor_env(monkeypatch, tmp_path)
+
+    tripped = []
+    original_copy = shutil_mod.copy2
+
+    def dying_copy(*args, **kwargs):
+        if not tripped:
+            tripped.append(1)
+            raise asyncio.CancelledError
+        return original_copy(*args, **kwargs)
+
+    monkeypatch.setattr(shutil_mod, "copy2", dying_copy)
+    with pytest.raises(asyncio.CancelledError):
+        await tailor_pipeline.run_package(pkg)  # dies in publishing
+
+    # Between the crash and the resume: engine model changes AND the job
+    # is re-scored. Neither may leak into the published record.
+    db.set_state("pinned_model", "claude-opus-5")
+    db.save_score("p1", "hash-a", version, 33.3,
+                  {"match_reasons": ["Different reasons"], "gap_reasons": []})
+
+    assert await tailor_pipeline.run_package(pkg) == "done"
+    row = db.get_package(pkg)
+    prov = row["provenance"]
+    assert prov["model"] == "claude-fable-5"  # what generation used
+    assert prov["efforts"] == {"tailor": "high", "entail": "medium",
+                               "repair": None}  # no repair-tier call ran
+    job_md = (Path(row["output_dir"]) / "job.md").read_text()
+    assert "77.7" in job_md and "Original overlap" in job_md
+    assert "33.3" not in job_md and "Different reasons" not in job_md

@@ -177,6 +177,28 @@ async def entailment_failures(claims: list[dict], ledger: dict,
     return failures
 
 
+def cached_failures(tailored: dict, profile: dict, ledger: dict,
+                    cache: dict[str, dict]) -> list[dict]:
+    """Full validation from persisted verdicts ONLY — zero LLM calls.
+    The pre-publish assertion runs this against the exact shipped
+    documents (trimmed resume + condensed cover): every claim was
+    entailment-checked on its way here, so its verdict must be in the
+    cache — a missing verdict means the content drifted past validation
+    and fails closed."""
+    failures = deterministic_failures(tailored, profile, ledger)
+    if failures:
+        return failures
+    for claim in collect_claims(tailored):
+        verdict = cache.get(entailment_key(claim, ledger))
+        if verdict is None:
+            failures.append({"claim_id": claim["claim_id"],
+                             "reason": "no cached verdict for shipped claim"})
+        elif not verdict["supported"]:
+            failures.append({"claim_id": claim["claim_id"],
+                             "reason": verdict["reason"]})
+    return failures
+
+
 async def validate(tailored: dict, profile: dict, ledger: dict,
                    cache: dict[str, dict]) -> list[dict]:
     """All failures for both documents. Deterministic problems

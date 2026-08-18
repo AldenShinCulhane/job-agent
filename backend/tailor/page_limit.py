@@ -101,6 +101,20 @@ def resume_ladder(layout: template.Layout) -> list[template.Layout]:
     return [spacing, margins, font]
 
 
+def resume_relaxed(layout: template.Layout) -> template.Layout:
+    """One bounded step LOOSER — the balance direction for an underfilled
+    page (tightening only empties it further). Ceilings sit one gentle
+    notch past the proven defaults; font and margins never change."""
+    return replace(
+        layout,
+        section_before_pt=min(14, layout.section_before_pt + 2),
+        section_after_pt=min(12, layout.section_after_pt + 2),
+        item_sep_pt=min(2, layout.item_sep_pt + 1),
+        item_gap_pt=min(-1, layout.item_gap_pt + 1),
+        itemlist_end_gap_pt=min(-5, layout.itemlist_end_gap_pt + 1),
+    )
+
+
 def cover_ladder(layout: cover_mod.CoverLayout) -> list[cover_mod.CoverLayout]:
     tighter = replace(layout, par_skip_pt=max(4, layout.par_skip_pt - 2))
     narrow = replace(tighter, margin_in=max(0.85, tighter.margin_in - 0.15))
@@ -130,6 +144,7 @@ class FitResult:
     layout: object
     tailored: dict
     trimmed: list[str]
+    condensed: bool = False  # cover only: the condense LLM call ran
 
 
 # --- Persisted-fit recompiles (restart path, PLAN.md §4.6) -------------------
@@ -142,7 +157,7 @@ def fit_state(fit: FitResult) -> dict:
     from dataclasses import asdict
 
     return {"tailored": fit.tailored, "layout": asdict(fit.layout),
-            "trimmed": fit.trimmed}
+            "trimmed": fit.trimmed, "condensed": fit.condensed}
 
 
 def compile_resume_state(state: dict, profile: dict,
@@ -203,20 +218,29 @@ async def fit_resume(tailored: dict, profile: dict, ledger: dict,
             raise ValidationFailed(failures)
         result = _compile_resume(tailored, profile, layout, workdir)
 
-    if result.pages > 1:
-        fullness = last_page_fullness(result.pdf_path)
-        if fullness < SPARSE_FULLNESS:
-            # One balance pass: the next unused ladder step, kept only on
-            # MEASURED improvement — fewer pages, or the same page count
-            # with a fuller last page. Tightening spacing on an already
-            # sparse layout can make the last page emptier; that outcome
-            # is discarded, never shipped.
+    fullness = last_page_fullness(result.pdf_path)
+    if fullness < SPARSE_FULLNESS:
+        # One balance pass, kept only on MEASURED improvement — fewer
+        # pages, or the same page count with a fuller last page. A
+        # sparse multi-page tail gets one step TIGHTER (pull the orphan
+        # up); a sparse page on an already-fitting document — including
+        # the default one-page resume, the main user case — gets one
+        # bounded step LOOSER (spread the content). Anything that fails
+        # to measure better, or would exceed the limit, is discarded.
+        if result.pages > 1:
             balanced_layout = resume_ladder(layout)[0]
+        else:
+            balanced_layout = resume_relaxed(layout)
+        if balanced_layout != layout:  # at the ceilings: nothing to try
             balanced = _compile_resume(tailored, profile, balanced_layout,
                                        workdir)
-            if balanced.pages < result.pages or (
-                    balanced.pages == result.pages
-                    and last_page_fullness(balanced.pdf_path) > fullness):
+            # A looser layout that spills onto a new page is never an
+            # improvement (pages went up), so this also enforces the
+            # page limit for the relax direction.
+            improved = balanced.pages < result.pages or (
+                balanced.pages == result.pages
+                and last_page_fullness(balanced.pdf_path) > fullness)
+            if improved:
                 layout, result = balanced_layout, balanced
             else:
                 # Restore the kept layout's PDF — the balanced compile
@@ -264,6 +288,7 @@ async def fit_cover(tailored: dict, profile: dict, ledger: dict,
         return latex.compile_tex(tex, workdir, jobname="cover_letter")
 
     result = _compile(layout)
+    condensed = False
     if result.pages > 1:
         for step in cover_ladder(layout):
             layout = step
@@ -280,10 +305,11 @@ async def fit_cover(tailored: dict, profile: dict, ledger: dict,
             + "\n".join(f"- {fid}: {e['text']}" for fid, e in ledger.items())
             + "\n\nReturn the shortened paragraphs."
         )
-        condensed = await llm.structured(prompt, _CONDENSE_SCHEMA,
-                                         task="repair",
-                                         system_prompt=_CONDENSE_SYSTEM)
-        tailored["cover_letter"] = condensed
+        shorter = await llm.structured(prompt, _CONDENSE_SCHEMA,
+                                       task="repair",
+                                       system_prompt=_CONDENSE_SYSTEM)
+        condensed = True
+        tailored["cover_letter"] = shorter
         # Content rewrite: full revalidation before continuing.
         failures = await validate.validate(tailored, profile, ledger,
                                            entail_cache)
@@ -297,4 +323,4 @@ async def fit_cover(tailored: dict, profile: dict, ledger: dict,
             "floor after condensing (must be exactly 1)"
         )
     return FitResult(result=result, layout=layout, tailored=tailored,
-                     trimmed=[])
+                     trimmed=[], condensed=condensed)

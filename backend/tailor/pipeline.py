@@ -85,9 +85,31 @@ def _job_md(job: dict, snapshot: str, score: dict | None) -> str:
     return "\n".join(lines)
 
 
-def _transition(package_id: int, status: str, **kwargs) -> None:
-    db.update_package(package_id, status=status, **kwargs)
-    log.info("package %s -> %s", package_id, status)
+class Superseded(Exception):
+    """The package was invalidated (JD or profile changed) while a worker
+    was driving it — the guarded write no-oped, so stop touching it."""
+
+
+def _transition(package_id: int, status: str | None = None, **kwargs) -> None:
+    """Guarded state write: every pipeline write refuses to touch a
+    terminal row, so a JD/profile supersede that lands mid-flight wins —
+    the worker's next persist raises instead of resurrecting the row."""
+    if not db.update_package(package_id, status=status,
+                             guard_not_terminal=True, **kwargs):
+        raise Superseded(f"package {package_id} reached a terminal state "
+                         "outside this worker")
+    if status is not None:
+        log.info("package %s -> %s", package_id, status)
+
+
+def _park(package_id: int, status: str, stage: dict, error: str) -> bool:
+    """Exception-handler write; False when the package was superseded in
+    the meantime (nothing written, the terminal state stands)."""
+    try:
+        _transition(package_id, status, stage=stage, error=error)
+        return True
+    except Superseded:
+        return False
 
 
 def _score_if_current(pkg: dict) -> dict | None:
@@ -110,7 +132,8 @@ async def run_package(package_id: int) -> str:
     if pkg["status"] in ("done", "failed"):
         return pkg["status"]  # completed work is never redone
     if pkg["status"] != "queued":  # resuming a mid-flight package
-        db.update_package(package_id, retry_count=pkg["retry_count"] + 1)
+        db.update_package(package_id, retry_count=pkg["retry_count"] + 1,
+                          guard_not_terminal=True)
 
     job = db.get_job(pkg["job_id"])
     profile = db.get_profile(pkg["profile_version"])
@@ -143,7 +166,7 @@ async def run_package(package_id: int) -> str:
             requirements = db.get_requirements(cache_key(pkg["jd_hash"]))
             score = _score_if_current(pkg)
             if requirements is None or score is None:
-                db.update_package(
+                _transition(
                     package_id,
                     error="waiting for scoring to derive this job's "
                           "requirements and score; resumes automatically")
@@ -153,8 +176,26 @@ async def run_package(package_id: int) -> str:
                 profile, ledger, job, requirements, score.get("breakdown"),
                 limit,
             )
-            stage = {"tailored": tailored, "jd_snapshot": job["description"],
-                     "entail_cache": {}}
+            # Snapshot what this call ACTUALLY used the moment it
+            # succeeds — provenance and job.md publish from these, so an
+            # engine change, code upgrade, or re-score between now and
+            # publish can never misdescribe the artifacts.
+            stage = {
+                "tailored": tailored,
+                "jd_snapshot": job["description"],
+                "entail_cache": {},
+                "generation": {
+                    "model": db.get_state("pinned_model"),
+                    "effort": llm.effective_effort("tailor"),
+                    "prompt_version": tailor_resume.PROMPT_VERSION,
+                    "schema_version": tailor_resume.SCHEMA_VERSION,
+                    "requirements": requirements,
+                    "score": {
+                        "deterministic_score": score["deterministic_score"],
+                        "breakdown": score.get("breakdown") or {},
+                    },
+                },
+            }
             _transition(package_id, "validating", stage=stage)
 
         # Validation is bound to the exact content it approved: the hash
@@ -165,11 +206,13 @@ async def run_package(package_id: int) -> str:
             cache = stage.get("entail_cache", {})
             failures = await validate.validate(stage["tailored"], profile,
                                                ledger, cache)
+            repaired_round = False
             if failures:
                 repaired = await validate.repair(stage["tailored"], failures,
                                                  profile, ledger)
+                repaired_round = True
                 stage["tailored"] = repaired
-                db.update_package(package_id, stage=stage)
+                _transition(package_id, stage=stage)
                 failures = await validate.validate(repaired, profile, ledger,
                                                    cache)
             stage["entail_cache"] = cache
@@ -180,6 +223,13 @@ async def run_package(package_id: int) -> str:
                             error=f"truth validation failed after repair: {detail}")
                 return "failed"
             stage["validated_sha"] = _content_sha(stage["tailored"])
+            stage["validation"] = {
+                "model": db.get_state("pinned_model"),
+                "effort_entail": llm.effective_effort("entail"),
+                "repaired": repaired_round,
+            }
+            if repaired_round:
+                stage["validation"]["effort_repair"] = llm.effective_effort("repair")
             _transition(package_id, "fitting", stage=stage)
 
         # Each fit persists its result (fitted JSON + layout) before the
@@ -194,17 +244,31 @@ async def run_package(package_id: int) -> str:
                 workdir / "resume")
             stage["resume_fit"] = page_limit.fit_state(resume_fit)
             stage["entail_cache"] = cache
-            db.update_package(package_id, stage=stage)
+            _transition(package_id, stage=stage)
         if "cover_fit" not in stage:
             _transition(package_id, "fitting")
             cover_fit = await page_limit.fit_cover(
                 stage["tailored"], profile, ledger, cache, job,
                 workdir / "cover")
             stage["cover_fit"] = page_limit.fit_state(cover_fit)
+            if cover_fit.condensed:  # the one LLM call inside fitting
+                stage["cover_fit"]["condense"] = {
+                    "model": db.get_state("pinned_model"),
+                    "effort": llm.effective_effort("repair"),
+                }
             stage["entail_cache"] = cache
-            db.update_package(package_id, stage=stage)
+            _transition(package_id, stage=stage)
 
         _transition(package_id, "asserting", stage=stage)
+        # A posting edited at any point before publish supersedes this
+        # package (save_job_detail fails the row; this direct check is
+        # the belt to that suspender — either way nothing stale ships).
+        current_job = db.get_job(pkg["job_id"])
+        if current_job is None or current_job.get("description_hash") != pkg["jd_hash"]:
+            _transition(package_id, "failed",
+                        error="superseded: posting changed before publish; "
+                              "re-select the job to build a new package")
+            return "failed"
         # Rebuild both PDFs from the persisted fitted state (pure
         # template render + local compile, zero LLM) — the same path
         # whether this process ran the fits or a previous one did — and
@@ -220,6 +284,16 @@ async def run_package(package_id: int) -> str:
                 f"pages, cover {cover_res.pages}/1 pages")
         if stage.get("validated_sha") != _content_sha(stage["tailored"]):
             raise page_limit.ValidationFailed([])
+        # The final truth assertion binds to the SHIPPED documents: the
+        # trimmed resume and the condensed cover letter, re-checked from
+        # cached verdicts only (zero LLM — every claim was validated on
+        # the way here, so a cache miss means drift and fails closed).
+        shipped = json.loads(json.dumps(stage["resume_fit"]["tailored"]))
+        shipped["cover_letter"] = stage["cover_fit"]["tailored"]["cover_letter"]
+        failures = validate.cached_failures(shipped, profile, ledger,
+                                            stage.get("entail_cache", {}))
+        if failures:
+            raise page_limit.ValidationFailed(failures)
 
         _transition(package_id, "publishing")
         final_dir = output_dir_for(job, package_id)
@@ -233,19 +307,30 @@ async def run_package(package_id: int) -> str:
         tmp_dir.mkdir(parents=True)
         shutil.copy2(resume_res.pdf_path, tmp_dir / "resume.pdf")
         shutil.copy2(cover_res.pdf_path, tmp_dir / "cover_letter.pdf")
+        gen = stage["generation"]
         (tmp_dir / "job.md").write_text(
-            _job_md(job, stage.get("jd_snapshot") or "", _score_if_current(pkg)))
+            _job_md(job, stage.get("jd_snapshot") or "", gen["score"]))
         tmp_dir.rename(final_dir)  # single-step publish into a fresh name
         shutil.rmtree(workdir, ignore_errors=True)
 
+        # Provenance publishes from the per-stage snapshots (what each
+        # LLM call actually used), never from completion-time state —
+        # only the compile facts (engines, pages) and the template
+        # versions come from this process, because this process really
+        # did render and compile the shipped PDFs.
+        val = stage["validation"]
+        repair_effort = (val.get("effort_repair")
+                         or (stage["cover_fit"].get("condense") or {}).get("effort"))
         provenance = {
-            "model": db.get_state("pinned_model"),
+            "model": gen["model"],
             "engine_resume": resume_res.engine,
             "engine_cover": cover_res.engine,
-            "efforts": {task: llm.effective_effort(task)
-                        for task in ("tailor", "entail", "repair")},
-            "prompt_version": tailor_resume.PROMPT_VERSION,
-            "schema_version": tailor_resume.SCHEMA_VERSION,
+            "efforts": {"tailor": gen["effort"],
+                        "entail": val["effort_entail"],
+                        # None = no repair-tier call was ever made.
+                        "repair": repair_effort},
+            "prompt_version": gen["prompt_version"],
+            "schema_version": gen["schema_version"],
             "template_version": template.TEMPLATE_VERSION,
             "cover_template_version": cover_mod.TEMPLATE_VERSION,
             "profile_version": pkg["profile_version"],
@@ -262,24 +347,33 @@ async def run_package(package_id: int) -> str:
 
     except asyncio.CancelledError:
         raise  # shutdown: status stays mid-flight for startup recovery
+    except Superseded:
+        # A JD/profile change failed this row while we were driving it;
+        # the invalidation already wrote the terminal state — hands off.
+        log.info("package %s superseded mid-flight", package_id)
+        return "superseded"
     except llm.UsageExhausted as exc:
-        _transition(package_id, "waiting_usage", stage=stage, error=str(exc))
+        if not _park(package_id, "waiting_usage", stage, str(exc)):
+            return "superseded"
         return "waiting_usage"
     except (llm.AuthRequired, llm.ModelNotEntitled, llm.ConfigError) as exc:
         # Human-actionable engine problem: nothing this package did wrong.
         # Park it queued with the reason; engine recovery resumes the batch.
-        _transition(package_id, "queued", stage=stage,
-                    error=f"{type(exc).__name__}: {exc}")
+        if not _park(package_id, "queued", stage,
+                     f"{type(exc).__name__}: {exc}"):
+            return "superseded"
         return "engine_blocked"
     except (llm.EngineError, latex.CompileError, page_limit.FitError,
             page_limit.ValidationFailed) as exc:
-        _transition(package_id, "failed", stage=stage,
-                    error=f"{type(exc).__name__}: {exc}")
+        if not _park(package_id, "failed", stage,
+                     f"{type(exc).__name__}: {exc}"):
+            return "superseded"
         return "failed"
     except Exception as exc:  # noqa: BLE001 — isolation: only this package fails
         log.exception("package %s failed unexpectedly", package_id)
-        _transition(package_id, "failed", stage=stage,
-                    error=f"{type(exc).__name__}: {exc}")
+        if not _park(package_id, "failed", stage,
+                     f"{type(exc).__name__}: {exc}"):
+            return "superseded"
         return "failed"
 
 

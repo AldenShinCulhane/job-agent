@@ -810,6 +810,11 @@ def recover_search_runs() -> list[int]:
     # when there is no stall. The package stall gets the same treatment.
     _arm_stall_recovery()
     _arm_package_stall_recovery()
+    # Mid-flight packages resume before the captcha check too: tailoring
+    # needs no browser, so a LinkedIn checkpoint must not strand a
+    # package queue that was mid-generation when the process died.
+    # Completed stages are persisted — nothing is regenerated (§4.6).
+    _maybe_resume_packages()
     if sources.source.current_state() == "captcha_stop":
         log.info("captcha stop persisted — deferring search recovery until resolved")
         return []
@@ -820,9 +825,6 @@ def recover_search_runs() -> list[int]:
         # A previous process may have died mid-scoring: the run is done
         # but jobs remain unscored. Same auto-resume rule as search.
         _maybe_resume_scoring()
-    # Mid-flight packages from a previous process resume too — completed
-    # stages are persisted, so nothing is regenerated (PLAN.md §4.6).
-    _maybe_resume_packages()
     return claimed
 
 

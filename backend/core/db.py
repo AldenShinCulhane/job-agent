@@ -203,9 +203,21 @@ def get_profile(version: int) -> dict | None:
 
 
 def confirm_profile(version: int) -> None:
+    now = datetime.now(timezone.utc).isoformat()
     with _connect() as conn:
         conn.execute(
             "UPDATE profile_versions SET confirmed = 1 WHERE version = ?", (version,)
+        )
+        # Unfinished packages pinned to any other profile version are now
+        # stale inputs: without this they strand forever (job_scores only
+        # keeps the current profile's row, so their waiting_inputs check
+        # never passes) or publish against a profile the user replaced.
+        # Done packages are history and stay untouched.
+        conn.execute(
+            "UPDATE packages SET status = 'failed', error = ?, updated_at = ? "
+            "WHERE profile_version != ? AND status NOT IN ('done', 'failed')",
+            ("superseded: profile changed before the package finished; "
+             "re-select the job to build a new package", now, version),
         )
 
 
@@ -389,6 +401,19 @@ def save_job_detail(job_id: str, description: str, description_hash: str) -> Non
             "UPDATE jobs SET description = ?, description_hash = ?, "
             "detail_fetched_at = ? WHERE job_id = ?",
             (description, description_hash, now, job_id),
+        )
+        # A posting edit supersedes this job's unfinished packages in the
+        # same transaction the hash moves — a package pinned to the old
+        # text must never publish against it. Done packages keep their
+        # pinned snapshot; the guarded pipeline transitions stop any
+        # worker already mid-flight on a superseded row.
+        conn.execute(
+            "UPDATE packages SET status = 'failed', error = ?, updated_at = ? "
+            "WHERE job_id = ? AND jd_hash != ? "
+            "AND status NOT IN ('done', 'failed')",
+            ("superseded: posting changed before the package finished; "
+             "re-select the job to build a new package", now, job_id,
+             description_hash),
         )
 
 
@@ -735,10 +760,14 @@ def update_package(
     retry_count: int | None = None,
     provenance: object = _UNSET,
     output_dir: str | None = None,
-) -> None:
-    """Persist a state-machine transition. `stage`/`provenance` take
-    dicts; `error`/`stage`/`provenance` use the sentinel so passing None
-    explicitly clears the column (omit to leave it)."""
+    guard_not_terminal: bool = False,
+) -> bool:
+    """Persist a state-machine transition; returns whether a row was
+    written. `stage`/`provenance` take dicts; `error`/`stage`/
+    `provenance` use the sentinel so passing None explicitly clears the
+    column (omit to leave it). With `guard_not_terminal` the write
+    no-ops against a done/failed row — a worker still driving a package
+    that a JD/profile change just superseded can never resurrect it."""
     import json
 
     sets, params = ["updated_at = ?"], [datetime.now(timezone.utc).isoformat()]
@@ -759,8 +788,13 @@ def update_package(
         sets.append("error = ?")
         params.append(error)
     params.append(package_id)
+    where = "id = ?"
+    if guard_not_terminal:
+        where += " AND status NOT IN ('done', 'failed')"
     with _connect() as conn:
-        conn.execute(f"UPDATE packages SET {', '.join(sets)} WHERE id = ?", params)
+        cursor = conn.execute(
+            f"UPDATE packages SET {', '.join(sets)} WHERE {where}", params)
+    return cursor.rowcount > 0
 
 
 def list_packages() -> list[dict]:
