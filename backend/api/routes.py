@@ -151,8 +151,11 @@ async def profile_preview(version: int):
         media_type="application/pdf",
         filename="resume-preview.pdf",
         # inline, or the iframe preview triggers a download instead of
-        # rendering the PDF in the pane
+        # rendering the PDF in the pane; no-store so a browser can never
+        # pin stale headers to this URL (bit us live: a cached
+        # 'attachment' response kept downloading after the fix)
         content_disposition_type="inline",
+        headers={"Cache-Control": "no-store"},
     )
 
 

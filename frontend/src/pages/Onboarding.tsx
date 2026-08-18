@@ -371,7 +371,7 @@ export default function Onboarding() {
         <iframe
           key={payload.version}
           title="Resume preview"
-          src={`/api/profile/preview.pdf?version=${payload.version}`}
+          src={`/api/profile/preview.pdf?version=${payload.version}&inline=1`}
           className="h-[85vh] w-full rounded-lg"
         />
       </section>
