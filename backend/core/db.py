@@ -84,6 +84,21 @@ CREATE TABLE IF NOT EXISTS job_scores (
     explanation_json    TEXT,
     scored_at           TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS packages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id          TEXT NOT NULL,
+    profile_version INTEGER NOT NULL,
+    jd_hash         TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'queued',
+    stage_json      TEXT,
+    error           TEXT,
+    retry_count     INTEGER NOT NULL DEFAULT 0,
+    provenance_json TEXT,
+    output_dir      TEXT,
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL,
+    UNIQUE (job_id, profile_version, jd_hash)
+);
 """
 
 # One-shot schema fixes for databases created by earlier revisions of
@@ -638,3 +653,124 @@ def get_action_count(day: str) -> int:
             "SELECT count FROM action_counts WHERE day = ?", (day,)
         ).fetchone()
     return row[0] if row else 0
+
+
+# --- Packages (tailoring state machine, PLAN.md §4.5/§4.6) ------------------
+# A package is keyed by exactly the inputs its documents were built from:
+# (job_id, profile_version, jd_hash). Re-selecting the same job with the
+# same inputs returns the existing row — a completed package is never
+# regenerated. A new profile version or an edited posting (hash change)
+# is a different package. `stage_json` persists per-stage intermediate
+# data (tailored JSON, validation verdicts) so a restart resumes at the
+# stage boundary instead of re-spending LLM calls; `provenance_json`
+# records what actually built the artifacts (PLAN.md §4.6).
+
+_PACKAGE_COLUMNS = (
+    "id", "job_id", "profile_version", "jd_hash", "status", "stage_json",
+    "error", "retry_count", "provenance_json", "output_dir",
+    "created_at", "updated_at",
+)
+
+
+def _package_row_to_dict(row) -> dict:
+    import json
+
+    package = dict(zip(_PACKAGE_COLUMNS, row))
+    package["stage"] = json.loads(package.pop("stage_json") or "{}")
+    package["provenance"] = json.loads(package.pop("provenance_json") or "{}")
+    return package
+
+
+def create_package(job_id: str, profile_version: int, jd_hash: str) -> tuple[int, bool]:
+    """(package id, created). Idempotent per (job, profile, hash): an
+    existing package — whatever its status — is returned, not duplicated."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO packages (job_id, profile_version, jd_hash, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?) "
+            "ON CONFLICT(job_id, profile_version, jd_hash) DO NOTHING",
+            (job_id, profile_version, jd_hash, now, now),
+        )
+        if cursor.rowcount > 0:
+            return cursor.lastrowid, True
+        row = conn.execute(
+            "SELECT id FROM packages WHERE job_id = ? AND profile_version = ? "
+            "AND jd_hash = ?",
+            (job_id, profile_version, jd_hash),
+        ).fetchone()
+        return row[0], False
+
+
+def get_package(package_id: int) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            f"SELECT {', '.join(_PACKAGE_COLUMNS)} FROM packages WHERE id = ?",
+            (package_id,),
+        ).fetchone()
+    return _package_row_to_dict(row) if row else None
+
+
+def update_package(
+    package_id: int,
+    *,
+    status: str | None = None,
+    stage: object = _UNSET,
+    error: object = _UNSET,
+    retry_count: int | None = None,
+    provenance: object = _UNSET,
+    output_dir: str | None = None,
+) -> None:
+    """Persist a state-machine transition. `stage`/`provenance` take
+    dicts; `error`/`stage`/`provenance` use the sentinel so passing None
+    explicitly clears the column (omit to leave it)."""
+    import json
+
+    sets, params = ["updated_at = ?"], [datetime.now(timezone.utc).isoformat()]
+    if status is not None:
+        sets.append("status = ?")
+        params.append(status)
+    if retry_count is not None:
+        sets.append("retry_count = ?")
+        params.append(retry_count)
+    if output_dir is not None:
+        sets.append("output_dir = ?")
+        params.append(output_dir)
+    for column, value in (("stage_json", stage), ("provenance_json", provenance)):
+        if value is not _UNSET:
+            sets.append(f"{column} = ?")
+            params.append(json.dumps(value) if value is not None else None)
+    if error is not _UNSET:
+        sets.append("error = ?")
+        params.append(error)
+    params.append(package_id)
+    with _connect() as conn:
+        conn.execute(f"UPDATE packages SET {', '.join(sets)} WHERE id = ?", params)
+
+
+def list_packages() -> list[dict]:
+    """Every package, newest first, with its job's display fields."""
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT {', '.join('packages.' + c for c in _PACKAGE_COLUMNS)}, "
+            "jobs.title, jobs.company, jobs.url FROM packages "
+            "JOIN jobs ON jobs.job_id = packages.job_id "
+            "ORDER BY packages.id DESC"
+        ).fetchall()
+    packages = []
+    for row in rows:
+        package = _package_row_to_dict(row[: len(_PACKAGE_COLUMNS)])
+        package["title"], package["company"], package["url"] = row[len(_PACKAGE_COLUMNS):]
+        packages.append(package)
+    return packages
+
+
+def packages_to_resume() -> list[dict]:
+    """Packages a previous process left mid-flight — everything not in a
+    terminal state, oldest first so batch order is preserved on restart."""
+    with _connect() as conn:
+        rows = conn.execute(
+            f"SELECT {', '.join(_PACKAGE_COLUMNS)} FROM packages "
+            "WHERE status NOT IN ('done', 'failed') ORDER BY id"
+        ).fetchall()
+    return [_package_row_to_dict(row) for row in rows]
