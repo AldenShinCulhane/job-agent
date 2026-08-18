@@ -41,6 +41,7 @@ TASK_EFFORT: dict[str, str] = {
     "extract": "medium",
     "normalize": "medium",
     "score_explain": "medium",
+    "entail": "medium",  # batched fact→claim support judgments (validation)
     "tailor": "high",
     "repair": "xhigh",
     "layout_final": "max",

@@ -1,5 +1,7 @@
 """Tailoring pipeline tests (PLAN.md §4.5/§4.6, M4). All data fake."""
 
+import json
+
 import pytest
 
 from backend.core import db
@@ -226,6 +228,165 @@ def test_cover_render_escapes_and_structures():
     assert tex.count("Casey Example") == 2  # header + signature
     assert "casey@example.com" in tex
     assert "source_ids" not in tex  # internal metadata never rendered
+
+
+# --- Truth validation (deterministic + batched entailment) -------------------
+
+def _ledger_and_ids():
+    from backend.resume import facts
+
+    ledger = facts.build_ledger(PROFILE)
+    by_text = {entry["text"]: fid for fid, entry in ledger.items()}
+    return ledger, by_text
+
+
+def test_validator_rejects_unknown_source_ids():
+    from backend.tailor import validate
+
+    ledger, _ = _ledger_and_ids()
+    tailored = _tailored()
+    tailored["experiences"][0]["bullets"][0]["source_ids"] = ["nope-123"]
+    failures = validate.deterministic_failures(tailored, PROFILE, ledger)
+    assert any("unknown source_ids" in f["reason"] for f in failures)
+
+
+def test_validator_grounds_numbers_in_cited_facts():
+    from backend.tailor import validate
+
+    ledger, by_text = _ledger_and_ids()
+    bullet_id = by_text["Built internal tools with Python"]
+
+    tailored = _tailored()
+    tailored["experiences"][0]["bullets"][0] = {
+        "text": "Cut costs by 300% with Python tools",
+        "source_ids": [bullet_id], "relevance": 90,
+    }
+    failures = validate.deterministic_failures(tailored, PROFILE, ledger)
+    assert any("300" in f["reason"] for f in failures)
+
+    # An uncited number in a cover paragraph is equally rejected.
+    tailored = _tailored()
+    tailored["cover_letter"]["paragraphs"][1] = {
+        "text": "I shipped 12 services.", "source_ids": []}
+    failures = validate.deterministic_failures(tailored, PROFILE, ledger)
+    assert any(f["claim_id"] == "cover:p1" for f in failures)
+
+    # Numbers present in the cited fact pass ("30" must not match "300").
+    tailored, ledger_full = _cited_tailored()
+    ledger_full["m-1"] = {"kind": "bullet",
+                          "text": "Reduced load time 300 ms", "path": "/x"}
+    tailored["experiences"][0]["bullets"][0] = {
+        "text": "Reduced load time by 300 ms", "source_ids": ["m-1"],
+        "relevance": 80,
+    }
+    assert validate.deterministic_failures(tailored, PROFILE, ledger_full) == []
+    tailored["experiences"][0]["bullets"][0]["text"] = "Reduced load time 30 ms"
+    failures = validate.deterministic_failures(tailored, PROFILE, ledger_full)
+    assert any("30" in f["reason"] for f in failures)
+
+
+def test_validator_rejects_structural_drift():
+    from backend.tailor import validate
+
+    ledger, _ = _ledger_and_ids()
+    tailored = _tailored(section_order=["experience", "experience",
+                                        "projects", "skills"])
+    assert any(f["claim_id"] == "section_order"
+               for f in validate.deterministic_failures(tailored, PROFILE, ledger))
+
+    tailored = _tailored(skills_order=["Languages", "Made Up"])
+    assert any(f["claim_id"] == "skills_order"
+               for f in validate.deterministic_failures(tailored, PROFILE, ledger))
+
+    tailored = _tailored()
+    tailored["experiences"][0]["index"] = 7
+    assert any("out of range" in f["reason"]
+               for f in validate.deterministic_failures(tailored, PROFILE, ledger))
+
+
+def _cited_tailored():
+    """A _tailored() whose source_ids all exist in the real ledger."""
+    ledger, by_text = _ledger_and_ids()
+    tailored = _tailored()
+    tailored["experiences"][0]["bullets"][0]["source_ids"] = [
+        by_text["Built internal tools with Python"]]
+    tailored["projects"][0]["bullets"][0]["source_ids"] = [
+        by_text["Wrote a CLI tool"]]
+    tailored["cover_letter"]["paragraphs"][0]["source_ids"] = [
+        by_text["Built internal tools with Python"]]
+    return tailored, ledger
+
+
+async def test_entailment_batches_caches_and_fails_closed(monkeypatch):
+    from backend.core import llm
+    from backend.tailor import validate
+
+    tailored, ledger = _cited_tailored()
+    calls = []
+
+    async def fake_structured(prompt, schema, task, system_prompt=""):
+        calls.append(task)
+        # Support everything except the first experience bullet; return
+        # NO verdict for cover:p1 — silence must fail closed.
+        claim_ids = [json.loads(line)["claim_id"]
+                     for line in prompt.splitlines() if line.startswith("{")]
+        return {"verdicts": [
+            {"claim_id": cid,
+             "supported": cid != "exp0:b0",
+             "reason": "checked"}
+            for cid in claim_ids if cid != "cover:p1"
+        ]}
+
+    monkeypatch.setattr(llm, "structured", fake_structured)
+    cache: dict[str, dict] = {}
+    failures = await validate.validate(tailored, PROFILE, ledger, cache)
+    assert calls == ["entail"]  # ONE batched pass for both documents
+    failed_ids = {f["claim_id"] for f in failures}
+    assert "exp0:b0" in failed_ids  # unsupported verdict
+    assert "cover:p1" in failed_ids  # missing verdict fails closed
+
+    # Cached verdicts make an unchanged-claims revalidation free.
+    failures2 = await validate.validate(tailored, PROFILE, ledger, cache)
+    assert calls == ["entail", "entail"]  # cover:p1 was never cached...
+    assert "exp0:b0" in {f["claim_id"] for f in failures2}  # ...but this hit cache
+
+
+async def test_validate_short_circuits_on_deterministic_failure(monkeypatch):
+    from backend.core import llm
+    from backend.tailor import validate
+
+    async def exploding_structured(*a, **k):
+        raise AssertionError("LLM must not be called for structural failures")
+
+    monkeypatch.setattr(llm, "structured", exploding_structured)
+    ledger, _ = _ledger_and_ids()
+    tailored = _tailored()
+    tailored["experiences"][0]["bullets"][0]["source_ids"] = ["nope-1"]
+    failures = await validate.validate(tailored, PROFILE, ledger, {})
+    assert failures  # reported without any LLM spend
+
+
+async def test_repair_round_uses_xhigh_and_full_schema(monkeypatch):
+    from backend.core import llm
+    from backend.tailor import resume as tailor_resume
+    from backend.tailor import validate
+
+    tailored, ledger = _cited_tailored()
+    seen = {}
+
+    async def fake_structured(prompt, schema, task, system_prompt=""):
+        seen.update(schema=schema, task=task, prompt=prompt)
+        return tailored
+
+    monkeypatch.setattr(llm, "structured", fake_structured)
+    result = await validate.repair(
+        _tailored(), [{"claim_id": "exp0:b0", "reason": "unsupported"}],
+        PROFILE, ledger,
+    )
+    assert result == tailored
+    assert seen["task"] == "repair"
+    assert seen["schema"] is tailor_resume.TAILOR_SCHEMA
+    assert "exp0:b0" in seen["prompt"]
 
 
 def test_packages_to_resume_excludes_terminal_states(test_db):
