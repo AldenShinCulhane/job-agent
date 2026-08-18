@@ -389,6 +389,178 @@ async def test_repair_round_uses_xhigh_and_full_schema(monkeypatch):
     assert "exp0:b0" in seen["prompt"]
 
 
+# --- Geometry-aware page limits (fit loops with a fake engine) ---------------
+
+def _fake_compiler(monkeypatch, pages_fn):
+    """Replace the LaTeX engine with a deterministic page counter."""
+    from backend.tailor import compile as latex
+
+    calls = []
+
+    def fake_compile(tex, workdir, jobname="document"):
+        calls.append((jobname, tex))
+        workdir.mkdir(parents=True, exist_ok=True)
+        pdf = workdir / f"{jobname}.pdf"
+        pdf.write_text("fake")
+        return latex.CompileResult(pdf_path=pdf, pages=pages_fn(tex),
+                                   engine="fake")
+
+    monkeypatch.setattr(latex, "compile_tex", fake_compile)
+    return calls
+
+
+def _rich_tailored():
+    """Four resume bullets with distinct relevance for trim ordering."""
+    tailored, ledger = _cited_tailored()
+    sid = tailored["experiences"][0]["bullets"][0]["source_ids"]
+    tailored["experiences"][0]["bullets"] = [
+        {"text": "Most relevant work", "source_ids": sid, "relevance": 95},
+        {"text": "Least relevant work", "source_ids": sid, "relevance": 10},
+        {"text": "Mid relevant work", "source_ids": sid, "relevance": 50},
+    ]
+    return tailored, ledger
+
+
+async def test_fit_resume_within_limit_compiles_once(tmp_path, monkeypatch):
+    from backend.tailor import page_limit
+
+    calls = _fake_compiler(monkeypatch, lambda tex: 1)
+    tailored, ledger = _cited_tailored()
+    fit = await page_limit.fit_resume(tailored, PROFILE, ledger, {}, 1, tmp_path)
+    assert len(calls) == 1
+    assert fit.trimmed == [] and fit.result.pages == 1
+    assert fit.layout == __import__(
+        "backend.resume.template", fromlist=["DEFAULT_LAYOUT"]).DEFAULT_LAYOUT
+
+
+async def test_fit_resume_tightens_layout_before_touching_content(
+    tmp_path, monkeypatch
+):
+    from backend.tailor import page_limit
+
+    # Fits as soon as item spacing hits its floor — a layout-only fix.
+    calls = _fake_compiler(
+        monkeypatch, lambda tex: 1 if "itemsep=0pt" in tex else 2)
+    tailored, ledger = _rich_tailored()
+    fit = await page_limit.fit_resume(tailored, PROFILE, ledger, {}, 1, tmp_path)
+    assert fit.trimmed == []  # content untouched
+    assert fit.layout.item_sep_pt == 0
+    assert fit.layout.font_pt == 11  # later ladder steps never ran
+    assert len(calls) == 2
+
+
+async def test_fit_resume_trims_lowest_relevance_and_revalidates(
+    tmp_path, monkeypatch
+):
+    from backend.tailor import page_limit, validate
+
+    # Only fits once two bullets are gone — layout alone can't fix it.
+    calls = _fake_compiler(
+        monkeypatch,
+        lambda tex: 1 if tex.count("\\resumeItem{") <= 2 else 2)
+    revalidations = []
+
+    async def fake_validate(tailored, profile, ledger, cache):
+        revalidations.append(len(revalidations))
+        return []
+
+    monkeypatch.setattr(validate, "validate", fake_validate)
+    tailored, ledger = _rich_tailored()
+    fit = await page_limit.fit_resume(tailored, PROFILE, ledger, {}, 1, tmp_path)
+    assert fit.trimmed == ["Least relevant work", "Mid relevant work"]
+    assert len(revalidations) == 2  # every trim went back through validation
+    remaining = [b["text"] for b in fit.tailored["experiences"][0]["bullets"]]
+    assert remaining == ["Most relevant work"]
+
+
+async def test_fit_resume_fails_when_floors_and_trims_run_out(
+    tmp_path, monkeypatch
+):
+    import pytest as _pytest
+
+    from backend.tailor import page_limit, validate
+
+    _fake_compiler(monkeypatch, lambda tex: 3)  # never fits
+
+    async def fake_validate(*a):
+        return []
+
+    monkeypatch.setattr(validate, "validate", fake_validate)
+    tailored, ledger = _rich_tailored()
+    with _pytest.raises(page_limit.FitError):
+        await page_limit.fit_resume(tailored, PROFILE, ledger, {}, 1, tmp_path)
+    # The original tailored JSON was never mutated by the failed fit.
+    assert len(tailored["experiences"][0]["bullets"]) == 3
+
+
+async def test_fit_resume_balances_sparse_last_page(tmp_path, monkeypatch):
+    from backend.tailor import page_limit
+
+    calls = _fake_compiler(monkeypatch, lambda tex: 2)
+    monkeypatch.setattr(page_limit, "last_page_fullness", lambda p: 0.1)
+    tailored, ledger = _cited_tailored()
+    fit = await page_limit.fit_resume(tailored, PROFILE, ledger, {}, 2, tmp_path)
+    assert len(calls) == 2  # initial + one balance pass
+    assert fit.layout.item_sep_pt == 0  # the balance pass tightened spacing
+    assert fit.result.pages == 2
+
+
+async def test_fit_cover_ladder_then_condense_then_fail(tmp_path, monkeypatch):
+    import pytest as _pytest
+
+    from backend.core import llm
+    from backend.tailor import page_limit, validate
+
+    # Fits only when the letter mentions "short" — layout never fixes it.
+    _fake_compiler(
+        monkeypatch, lambda tex: 1 if "short" in tex else 2)
+    condensed = {"paragraphs": [{"text": "A short letter.", "source_ids": []},
+                                {"text": "Thanks.", "source_ids": []}],
+                 "closing": "Sincerely,"}
+    llm_calls = []
+
+    async def fake_structured(prompt, schema, task, system_prompt=""):
+        llm_calls.append(task)
+        return condensed
+
+    async def fake_validate(tailored, profile, ledger, cache):
+        return []
+
+    monkeypatch.setattr(llm, "structured", fake_structured)
+    monkeypatch.setattr(validate, "validate", fake_validate)
+    tailored, ledger = _cited_tailored()
+    fit = await page_limit.fit_cover(tailored, PROFILE, ledger, {}, JOB, tmp_path)
+    assert llm_calls == ["repair"]  # one xhigh condense round
+    assert fit.result.pages == 1
+    assert fit.tailored["cover_letter"] == condensed
+    # Floors were reached before condensing was attempted.
+    assert fit.layout.margin_in == 0.7 and fit.layout.font_pt == 10
+
+    # And when even condensing can't reach one page: FitError.
+    _fake_compiler(monkeypatch, lambda tex: 2)
+    with _pytest.raises(page_limit.FitError):
+        await page_limit.fit_cover(tailored, PROFILE, ledger, {}, JOB, tmp_path)
+
+
+def test_content_bounds_measures_real_pdf(tmp_path):
+    from backend.tailor import compile as latex
+    from backend.tailor import page_limit
+
+    if not latex.available_engines():
+        import pytest as _pytest
+
+        _pytest.skip("no LaTeX engine installed")
+    tex = ("\\documentclass{article}\\begin{document}"
+           "Hello geometry\\end{document}")
+    result = latex.compile_tex(tex, tmp_path, jobname="geom")
+    bounds = page_limit.content_bounds(result.pdf_path)
+    assert len(bounds) == 1 and bounds[0] is not None
+    box = bounds[0]
+    assert box["x1"] > box["x0"] and box["y1"] > box["y0"]
+    fullness = page_limit.last_page_fullness(result.pdf_path)
+    assert 0.0 < fullness < 1.0
+
+
 def test_packages_to_resume_excludes_terminal_states(test_db):
     """Restart recovery picks up mid-flight packages in batch order and
     never a done/failed one (PLAN §4.6: completed work is never redone)."""
