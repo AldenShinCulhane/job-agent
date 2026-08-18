@@ -55,11 +55,24 @@ async def run_pipeline(run_id: int) -> dict:
     scored = skipped = failed = 0
     stopped: str | None = None
 
+    def profile_stale() -> bool:
+        latest = db.latest_profile()
+        return latest is None or not latest[2] or latest[0] != version
+
     jobs = db.list_jobs(run_id)
     total = len(jobs)
     for job in jobs:
         job_id = job["job_id"]
         try:
+            # Generation token: the pass belongs to the profile version it
+            # started with. Confirming a new profile cancels the worker,
+            # but an in-flight iteration could still write a stale score
+            # after an await — verify at iteration start AND again right
+            # before the write below.
+            if profile_stale():
+                stopped = "stale_profile"
+                log.info("scoring run %s stopped: profile changed mid-pass", run_id)
+                break
             current = db.get_job(job_id)
             existing = db.get_score(job_id)
             if (
@@ -78,6 +91,10 @@ async def run_pipeline(run_id: int) -> dict:
             current = db.get_job(job_id)
             requirements = await normalize_job(job_id)
             result = score_job(requirements, profile, user_years=user_years)
+            if profile_stale():  # the awaits above may have raced a confirm
+                stopped = "stale_profile"
+                log.info("scoring run %s stopped: profile changed mid-job", run_id)
+                break
             db.save_score(
                 job_id,
                 current["description_hash"],
@@ -103,6 +120,12 @@ async def run_pipeline(run_id: int) -> dict:
         except llm.UsageExhausted as exc:
             stopped = "usage"
             log.info("scoring run %s stopped, usage exhausted: %s", run_id, exc)
+            break
+        except llm.EngineError as exc:
+            # Auth/config/transient engine failures affect every job the
+            # same way — stopping beats repeating the failure ~100 times.
+            stopped = "engine"
+            log.warning("scoring run %s stopped, engine error: %s", run_id, exc)
             break
         except Exception:  # noqa: BLE001 — isolate per-job failures
             failed += 1

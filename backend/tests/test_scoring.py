@@ -2,6 +2,8 @@
 false substring matches, YoE boundaries, missing requirements, education
 matching — with expected ordering and filter behavior. All data fake."""
 
+import asyncio
+
 import pytest
 
 from backend.core import db
@@ -223,15 +225,22 @@ async def test_normalization_cached_by_jd_hash(test_db, monkeypatch):
     assert first == second
     assert calls == ["normalize"]
 
-    # Hash change (edited posting) -> cascade invalidated, re-extracted.
+    # The cache is content-addressed: a DIFFERENT job with the same
+    # description hash reuses the extraction — no second LLM call.
+    _seed_job(job_id="n2", description="We need Python.", jd_hash="hash-a")
+    assert await norm.normalize_job("n2") == first
+    assert calls == ["normalize"]
+
+    # Hash change (edited posting) -> score invalidated, re-extracted;
+    # the old cache row survives for jobs still carrying hash-a.
     db.save_score("n1", "hash-a", 1, 88.0, {"skills": 100.0})
     db.invalidate_derived("n1")
     db.save_job_detail("n1", "We need Rust now.", "hash-b")
-    assert db.get_requirements("n1") is None
     assert db.get_score("n1") is None
+    assert db.get_requirements("hash-a") is not None
     await norm.normalize_job("n1")
     assert calls == ["normalize", "normalize"]
-    assert test_db.get_requirements("n1")["jd_hash"] == "hash-b"
+    assert test_db.get_requirements("hash-b") is not None
 
 
 async def test_detail_hash_change_invalidates_cascade(test_db):
@@ -248,13 +257,15 @@ async def test_detail_hash_change_invalidates_cascade(test_db):
             )
 
     _seed_job(description="Original text.", jd_hash="stale-hash")
-    db.save_requirements("n1", "stale-hash", req(required_skills=["Python"]))
+    db.save_requirements("stale-hash", req(required_skills=["Python"]))
     db.save_score("n1", "stale-hash", 1, 90.0, {"skills": 100.0})
 
     result = await job_detail.fetch_detail(FakeSup(), "n1", force=True)
     assert result["changed"] is True
-    assert db.get_requirements("n1") is None
     assert db.get_score("n1") is None
+    # Content-addressed requirements survive — another job may share the
+    # old description; the new hash simply misses the cache.
+    assert db.get_requirements("stale-hash") is not None
 
 
 # --- automatic pipeline ------------------------------------------------------
@@ -435,16 +446,17 @@ async def test_maybe_resume_scoring_spawns_for_done_run(test_db, monkeypatch):
 def test_llm_rerank_never_overwrites_baseline(test_db):
     _seed_job()
     db.save_score("n1", "hash-a", 1, 77.5, {"skills": 90.0})
-    db.set_llm_rerank("n1", 84.0)
+    db.set_llm_rerank("n1", 84.0, 1)
     db.set_explanation("n1", {"pitch": "solid fit"})
     stored = db.get_score("n1")
     assert stored["deterministic_score"] == 77.5  # baseline untouched
-    assert stored["llm_rerank"] == 84.0
+    assert stored["llm_rerank"] == 84.0 and stored["llm_rank"] == 1
     assert stored["explanation"] == {"pitch": "solid fit"}
     # Re-scoring resets the LLM layer — it described the old baseline.
     db.save_score("n1", "hash-b", 2, 61.0, {"skills": 70.0})
     stored = db.get_score("n1")
-    assert stored["llm_rerank"] is None and stored["explanation"] is None
+    assert stored["llm_rerank"] is None and stored["llm_rank"] is None
+    assert stored["explanation"] is None
 
 
 # --- LLM layer: explain + close-match rerank ---------------------------------
@@ -489,11 +501,174 @@ async def test_rerank_orders_close_matches_within_band(test_db, monkeypatch):
     monkeypatch.setattr(llm, "structured", fake_structured)
     result = await llm_layer.rerank_close_matches(run_id)
     assert result["reranked"] == 2
-    # Rerank stays inside the cluster's own range; baseline untouched.
+    # Rerank stays inside the cluster's own range; baseline untouched;
+    # rank ordinals record the LLM's order explicitly.
     assert db.get_score("r2")["llm_rerank"] == 90.0
+    assert db.get_score("r2")["llm_rank"] == 1
     assert db.get_score("r1")["llm_rerank"] == 88.0
+    assert db.get_score("r1")["llm_rank"] == 2
     assert db.get_score("r1")["deterministic_score"] == 90.0
     assert db.get_score("r3")["llm_rerank"] is None
+
+
+async def test_rerank_all_equal_cluster_keeps_order_via_rank(test_db, monkeypatch):
+    """Identical cluster scores collapse rerank values to one number —
+    the rank ordinal is what preserves the LLM's order."""
+    from backend.core import llm
+    from backend.scoring import llm_layer
+
+    _confirm_profile()
+    run_id = _seed_run(["e1", "e2", "e3"])
+    for job_id in ("e1", "e2", "e3"):
+        db.save_job_detail(job_id, "d", f"h-{job_id}")
+        db.save_score(job_id, f"h-{job_id}", 1, 80.0,
+                      {"matched_skills": [], "missing_skills": []})
+
+    async def fake_structured(prompt, schema, task, system_prompt=""):
+        return {"ordered_job_ids": ["e3", "e1", "e2"]}
+
+    monkeypatch.setattr(llm, "structured", fake_structured)
+    await llm_layer.rerank_close_matches(run_id)
+    assert [db.get_score(j)["llm_rerank"] for j in ("e3", "e1", "e2")] == [
+        80.0, 80.0, 80.0,
+    ]
+    assert [db.get_score(j)["llm_rank"] for j in ("e3", "e1", "e2")] == [1, 2, 3]
+
+
+async def test_explain_refuses_stale_score(test_db, monkeypatch):
+    """A score row from an older profile version (or an edited posting)
+    reads as unscored — never explained with mixed-era data."""
+    from backend.scoring import llm_layer
+
+    _confirm_profile()
+    current = db.latest_profile()[0]
+    _seed_job()
+    db.save_score("n1", "hash-a", current - 1 or 999, 80.0,
+                  {"matched_skills": [], "missing_skills": []})
+    with pytest.raises(ValueError):
+        await llm_layer.explain_job("n1")
+    # Right version but stale hash: same refusal.
+    db.save_score("n1", "old-hash", current, 80.0,
+                  {"matched_skills": [], "missing_skills": []})
+    with pytest.raises(ValueError):
+        await llm_layer.explain_job("n1")
+
+
+def test_list_jobs_hides_stale_scores(test_db):
+    _confirm_profile()
+    version = db.latest_profile()[0]
+    run_id = _seed_run(["s1", "s2"])
+    db.save_job_detail("s1", "d", "h-s1")
+    db.save_job_detail("s2", "d", "h-s2")
+    db.save_score("s1", "h-s1", version, 90.0, {})       # fresh
+    db.save_score("s2", "h-s2", version + 1, 70.0, {})   # other version
+    by_id = {j["job_id"]: j for j in db.list_jobs(run_id, profile_version=version)}
+    assert by_id["s1"]["deterministic_score"] == 90.0
+    assert by_id["s2"]["deterministic_score"] is None  # stale -> unscored
+
+
+async def test_pipeline_stops_on_engine_error(test_db, fake_source, monkeypatch):
+    """A typed engine failure ends the pass instead of repeating per-job
+    across the whole run."""
+    from backend.core import llm
+    from backend.scoring import pipeline
+
+    _confirm_profile()
+    run_id = _seed_run(["p1", "p2", "p3"])
+    calls = []
+
+    async def broken_structured(prompt, schema, task, system_prompt=""):
+        calls.append(task)
+        raise llm.TransientFailure("engine hiccup")
+
+    monkeypatch.setattr(llm, "structured", broken_structured)
+    summary = await pipeline.run_pipeline(run_id)
+    assert summary["stopped"] == "engine"
+    assert summary["failed"] == 0
+    assert len(calls) == 1  # stopped at the first failure, not 3
+
+
+async def test_pipeline_token_stops_stale_profile_write(
+    test_db, fake_normalize_llm, monkeypatch
+):
+    """A profile confirmed mid-pass must not receive old-version scores:
+    the generation token check before the write ends the pass."""
+    from backend import sources
+    from backend.scoring import pipeline
+
+    _confirm_profile()
+    run_id = _seed_run(["p1", "p2"])
+
+    async def confirming_fetch_detail(job_id, force=False):
+        db.save_job_detail(job_id, f"Description for {job_id}", f"hash-{job_id}")
+        # The user confirms a new profile while this job's detail fetch
+        # is in flight.
+        _confirm_profile()
+        return {**db.get_job(job_id), "refetched": True, "changed": False}
+
+    async def instant():
+        pass
+
+    monkeypatch.setattr(sources.source, "fetch_detail", confirming_fetch_detail)
+    monkeypatch.setattr(sources, "page_delay", instant)
+
+    summary = await pipeline.run_pipeline(run_id)
+    assert summary["stopped"] == "stale_profile"
+    assert summary["scored"] == 0
+    assert db.get_score("p1") is None  # nothing written under the old version
+
+
+async def test_pipeline_worker_arms_bounded_retry(test_db, monkeypatch):
+    """Engine stops arm the shutdown-owned retry timer with backoff, and
+    the circuit breaker gives up after the retry budget."""
+    from backend.api import routes
+    from backend.scoring import pipeline
+
+    delays = []
+
+    async def fake_run(run_id):
+        return {"scored": 0, "skipped": 0, "failed": 0, "stopped": "engine"}
+
+    def fake_arm(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(pipeline, "run_pipeline", fake_run)
+    monkeypatch.setattr(routes, "_arm_pipeline_retry", fake_arm)
+    monkeypatch.setattr(routes, "_pipeline_retry_attempts", 0)
+    for _ in range(routes._PIPELINE_MAX_RETRIES + 2):
+        await routes._pipeline_worker(1)
+    assert delays == [60.0, 120.0, 240.0]  # bounded backoff, then break
+
+
+async def test_spawn_pipeline_recycles_on_profile_change(test_db, monkeypatch):
+    """The worker is keyed by (run, profile version): a new confirmed
+    version replaces the old worker instead of being refused."""
+    from backend.api import routes
+    from backend.scoring import pipeline
+
+    _confirm_profile()
+    run_id = _seed_run(["p1"])
+    started = []
+    release = asyncio.Event()
+
+    async def slow_run(rid):
+        started.append(db.latest_profile()[0])
+        await release.wait()
+        return {"scored": 0, "skipped": 0, "failed": 0, "stopped": None}
+
+    monkeypatch.setattr(pipeline, "run_pipeline", slow_run)
+    monkeypatch.setattr(routes, "_pipeline_task", None)
+    monkeypatch.setattr(routes, "_pipeline_key", None)
+
+    assert routes._spawn_pipeline(run_id) is True
+    assert routes._spawn_pipeline(run_id) is False  # same key -> no-op
+    first_task = routes._pipeline_task
+    _confirm_profile()  # version bump
+    assert routes._spawn_pipeline(run_id) is True  # new key -> replaced
+    release.set()
+    await asyncio.gather(first_task, routes._pipeline_task,
+                         return_exceptions=True)
+    assert first_task.cancelled()
 
 
 async def test_rerank_rejects_bad_id_set(test_db, monkeypatch):

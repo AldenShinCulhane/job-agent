@@ -96,6 +96,7 @@ export interface Job {
   detail_fetched_at: string | null
   deterministic_score: number | null
   llm_rerank: number | null
+  llm_rank: number | null
   score_breakdown: ScoreBreakdown | null
 }
 

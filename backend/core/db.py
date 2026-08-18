@@ -68,9 +68,8 @@ CREATE TABLE IF NOT EXISTS action_counts (
     day   TEXT PRIMARY KEY,
     count INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS job_requirements (
-    job_id            TEXT PRIMARY KEY,
-    jd_hash           TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS requirements_cache (
+    jd_hash           TEXT PRIMARY KEY,
     requirements_json TEXT NOT NULL,
     normalized_at     TEXT NOT NULL
 );
@@ -81,10 +80,21 @@ CREATE TABLE IF NOT EXISTS job_scores (
     deterministic_score REAL NOT NULL,
     breakdown_json      TEXT NOT NULL,
     llm_rerank          REAL,
+    llm_rank            INTEGER,
     explanation_json    TEXT,
     scored_at           TEXT NOT NULL
 );
 """
+
+# One-shot schema fixes for databases created by earlier revisions of
+# this branch (executescript's IF NOT EXISTS cannot alter shapes).
+_MIGRATIONS = (
+    # requirements were briefly keyed per-job; the cache is now
+    # content-addressed by jd_hash (cheap to regenerate — just drop).
+    "DROP TABLE IF EXISTS job_requirements",
+    # rerank rank ordinal added after the table first shipped.
+    "ALTER TABLE job_scores ADD COLUMN llm_rank INTEGER",
+)
 
 
 def init() -> None:
@@ -92,6 +102,11 @@ def init() -> None:
     os.chmod(DATA_DIR, 0o700)  # mkdir mode is subject to umask; enforce
     with _connect() as conn:
         conn.executescript(_SCHEMA)
+        for statement in _MIGRATIONS:
+            try:
+                conn.execute(statement)
+            except sqlite3.OperationalError:
+                pass  # already applied (e.g. duplicate column)
     os.chmod(DB_PATH, 0o600)
 
 
@@ -250,23 +265,32 @@ def get_job(job_id: str) -> dict | None:
     return _job_row_to_dict(row) if row else None
 
 
-def list_jobs(run_id: int | None = None) -> list[dict]:
+def list_jobs(run_id: int | None = None,
+              profile_version: int | None = None) -> list[dict]:
     """All cached jobs, or — with `run_id` — only the jobs that belong to
     that search run (what the UI shows as the current results). Each job
-    carries its scores (LEFT JOIN — unscored jobs get None)."""
+    carries its scores via LEFT JOIN, but ONLY when the score row matches
+    the job's CURRENT description hash and the given profile version —
+    stale rows (mid-rescore, edited posting) surface as unscored, never
+    as old numbers."""
     import json
 
     columns = ", ".join(f"jobs.{c}" for c in _JOB_COLUMNS)
     score_cols = (
         "job_scores.deterministic_score, job_scores.llm_rerank, "
-        "job_scores.breakdown_json"
+        "job_scores.llm_rank, job_scores.breakdown_json"
     )
-    join = "LEFT JOIN job_scores ON job_scores.job_id = jobs.job_id"
+    join = (
+        "LEFT JOIN job_scores ON job_scores.job_id = jobs.job_id "
+        "AND job_scores.jd_hash IS jobs.description_hash "
+        "AND job_scores.profile_version IS ?"
+    )
     with _connect() as conn:
         if run_id is None:
             rows = conn.execute(
                 f"SELECT {columns}, {score_cols} FROM jobs {join} "
-                "ORDER BY jobs.last_seen_at DESC"
+                "ORDER BY jobs.last_seen_at DESC",
+                (profile_version,),
             ).fetchall()
         else:
             rows = conn.execute(
@@ -274,14 +298,15 @@ def list_jobs(run_id: int | None = None) -> list[dict]:
                 "JOIN search_run_jobs ON search_run_jobs.job_id = jobs.job_id "
                 f"{join} WHERE search_run_jobs.run_id = ? "
                 "ORDER BY jobs.last_seen_at DESC",
-                (run_id,),
+                (profile_version, run_id),
             ).fetchall()
     jobs = []
     for row in rows:
         job = _job_row_to_dict(row[: len(_JOB_COLUMNS)])
         job["deterministic_score"] = row[len(_JOB_COLUMNS)]
         job["llm_rerank"] = row[len(_JOB_COLUMNS) + 1]
-        raw = row[len(_JOB_COLUMNS) + 2]
+        job["llm_rank"] = row[len(_JOB_COLUMNS) + 2]
+        raw = row[len(_JOB_COLUMNS) + 3]
         job["score_breakdown"] = json.loads(raw) if raw else None
         jobs.append(job)
     return jobs
@@ -344,37 +369,38 @@ def save_job_detail(job_id: str, description: str, description_hash: str) -> Non
 
 
 # --- Normalized requirements + scores (PLAN.md §4.4) ------------------------
-# Both are keyed by job AND stamped with the jd_hash they were computed
-# from; a hash change invalidates the whole cascade (invalidate_derived).
+# Requirements are content-addressed by jd_hash — two postings with the
+# same description share one extraction. Scores are per job, stamped
+# with the jd_hash + profile version they were computed from; a hash
+# change invalidates the score cascade (invalidate_derived), while the
+# requirements row keeps serving any other job with that description.
 
-def save_requirements(job_id: str, jd_hash: str, requirements: dict) -> None:
+def save_requirements(jd_hash: str, requirements: dict) -> None:
     import json
 
     now = datetime.now(timezone.utc).isoformat()
     with _connect() as conn:
         conn.execute(
-            "INSERT INTO job_requirements (job_id, jd_hash, requirements_json, "
-            "normalized_at) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(job_id) DO UPDATE SET jd_hash = excluded.jd_hash, "
+            "INSERT INTO requirements_cache (jd_hash, requirements_json, "
+            "normalized_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(jd_hash) DO UPDATE SET "
             "requirements_json = excluded.requirements_json, "
             "normalized_at = excluded.normalized_at",
-            (job_id, jd_hash, json.dumps(requirements), now),
+            (jd_hash, json.dumps(requirements), now),
         )
 
 
-def get_requirements(job_id: str) -> dict | None:
-    """{'jd_hash': ..., 'requirements': {...}} or None."""
+def get_requirements(jd_hash: str | None) -> dict | None:
     import json
 
+    if not jd_hash:
+        return None
     with _connect() as conn:
         row = conn.execute(
-            "SELECT jd_hash, requirements_json FROM job_requirements "
-            "WHERE job_id = ?",
-            (job_id,),
+            "SELECT requirements_json FROM requirements_cache WHERE jd_hash = ?",
+            (jd_hash,),
         ).fetchone()
-    if row is None:
-        return None
-    return {"jd_hash": row[0], "requirements": json.loads(row[1])}
+    return json.loads(row[0]) if row else None
 
 
 def save_score(
@@ -398,19 +424,21 @@ def save_score(
             "profile_version = excluded.profile_version, "
             "deterministic_score = excluded.deterministic_score, "
             "breakdown_json = excluded.breakdown_json, "
-            "llm_rerank = NULL, explanation_json = NULL, "
+            "llm_rerank = NULL, llm_rank = NULL, explanation_json = NULL, "
             "scored_at = excluded.scored_at",
             (job_id, jd_hash, profile_version, deterministic_score,
              json.dumps(breakdown), now),
         )
 
 
-def set_llm_rerank(job_id: str, rerank: float | None) -> None:
-    """LLM layer only — never touches the deterministic baseline."""
+def set_llm_rerank(job_id: str, rerank: float | None, rank: int | None) -> None:
+    """LLM layer only — never touches the deterministic baseline. `rank`
+    is the 1-based cluster ordinal, which survives even when every
+    cluster score is identical (rerank values alone would tie)."""
     with _connect() as conn:
         conn.execute(
-            "UPDATE job_scores SET llm_rerank = ? WHERE job_id = ?",
-            (rerank, job_id),
+            "UPDATE job_scores SET llm_rerank = ?, llm_rank = ? WHERE job_id = ?",
+            (rerank, rank, job_id),
         )
 
 
@@ -448,8 +476,8 @@ def get_score(job_id: str) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
             "SELECT jd_hash, profile_version, deterministic_score, "
-            "breakdown_json, llm_rerank, explanation_json FROM job_scores "
-            "WHERE job_id = ?",
+            "breakdown_json, llm_rerank, llm_rank, explanation_json "
+            "FROM job_scores WHERE job_id = ?",
             (job_id,),
         ).fetchone()
     if row is None:
@@ -460,15 +488,18 @@ def get_score(job_id: str) -> dict | None:
         "deterministic_score": row[2],
         "breakdown": json.loads(row[3]),
         "llm_rerank": row[4],
-        "explanation": json.loads(row[5]) if row[5] else None,
+        "llm_rank": row[5],
+        "explanation": json.loads(row[6]) if row[6] else None,
     }
 
 
 def invalidate_derived(job_id: str) -> None:
-    """The JD hash moved: normalized requirements, score, and explanation
-    are all stale — drop them so the pipeline recomputes (PLAN.md §4.4)."""
+    """The job's JD hash moved: its score and explanation are stale —
+    drop them so the pipeline recomputes (PLAN.md §4.4). The
+    content-addressed requirements cache is untouched: the old row may
+    still serve other jobs with that description, and the new hash
+    simply misses."""
     with _connect() as conn:
-        conn.execute("DELETE FROM job_requirements WHERE job_id = ?", (job_id,))
         conn.execute("DELETE FROM job_scores WHERE job_id = ?", (job_id,))
 
 

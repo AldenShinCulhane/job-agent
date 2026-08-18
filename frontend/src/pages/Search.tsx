@@ -132,6 +132,11 @@ export default function Search() {
 
   const start = async () => {
     setError(null)
+    // A new search is a new result set — selections and explanations
+    // from the previous run don't carry over.
+    setSelected(new Set())
+    setExplanations({})
+    setExpanded(null)
     try {
       await api.searchStart({
         keywords,
@@ -209,20 +214,29 @@ export default function Search() {
   // deterministic score stays visible as the backbone.
   const displayScore = (j: Job) => j.llm_rerank ?? j.deterministic_score
 
+  // Posting date when LinkedIn gave a parseable one; the card's
+  // first-seen time is only the fallback.
+  const postedTime = (j: Job) => {
+    const posted = j.posted_text ? Date.parse(j.posted_text) : NaN
+    return Number.isNaN(posted) ? Date.parse(j.first_seen_at) || 0 : posted
+  }
+
   const visibleJobs = useMemo(() => {
     let list = jobs
     if (hideExceeds)
       list = list.filter((j) => !j.score_breakdown?.exceeds_experience)
     if (easyOnly) list = list.filter((j) => j.easy_apply)
     if (sortBy === 'score')
-      list = [...list].sort(
-        (a, b) => (displayScore(b) ?? -1) - (displayScore(a) ?? -1),
-      )
-    else
-      list = [...list].sort((a, b) =>
-        (b.first_seen_at ?? '').localeCompare(a.first_seen_at ?? ''),
-      )
+      list = [...list].sort((a, b) => {
+        const byScore = (displayScore(b) ?? -1) - (displayScore(a) ?? -1)
+        if (byScore !== 0) return byScore
+        // Equal scores: the LLM's rank ordinal breaks the tie (an
+        // all-equal rerank cluster would otherwise lose its order).
+        return (a.llm_rank ?? Infinity) - (b.llm_rank ?? Infinity)
+      })
+    else list = [...list].sort((a, b) => postedTime(b) - postedTime(a))
     return list
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobs, hideExceeds, easyOnly, sortBy])
 
   const scoredCount = jobs.filter((j) => j.deterministic_score !== null).length

@@ -94,22 +94,24 @@ def _prompt(job: dict) -> str:
 
 
 async def normalize_job(job_id: str) -> dict:
-    """Return the normalized requirements for a job, extracting (and
-    caching by JD hash) only when the cache is missing or stale."""
+    """Return the normalized requirements for a job's description. The
+    cache is content-addressed by JD hash — two postings with the same
+    description share one extraction, and a description never pays for
+    extraction twice."""
     job = db.get_job(job_id)
     if job is None:
         raise KeyError(f"unknown job {job_id}")
     if not job.get("description") or not job.get("description_hash"):
         raise ValueError(f"job {job_id} has no cached description to normalize")
-    cached = db.get_requirements(job_id)
-    if cached is not None and cached["jd_hash"] == job["description_hash"]:
-        return cached["requirements"]
+    cached = db.get_requirements(job["description_hash"])
+    if cached is not None:
+        return cached
     requirements = await llm.structured(
         _prompt(job),
         REQUIREMENTS_SCHEMA,
         task="normalize",
         system_prompt=_SYSTEM_PROMPT,
     )
-    db.save_requirements(job_id, job["description_hash"], requirements)
+    db.save_requirements(job["description_hash"], requirements)
     log.info("job %s normalized (hash %s)", job_id, job["description_hash"])
     return requirements

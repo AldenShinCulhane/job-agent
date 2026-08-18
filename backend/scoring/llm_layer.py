@@ -81,18 +81,24 @@ def _job_summary(job: dict, score: dict, requirements: dict | None) -> str:
 
 async def explain_job(job_id: str) -> dict:
     """On-demand strengths/gaps/pitch for one scored job; cached on the
-    score row until the cascade invalidates it."""
+    score row until the cascade invalidates it. Only a score computed
+    from the CURRENT profile version and CURRENT description hash is
+    explained — a stale row (mid-rescore, edited posting) reads as
+    unscored rather than producing an old-profile explanation."""
+    version, profile = confirmed_profile()
     job = db.get_job(job_id)
     if job is None:
         raise KeyError(f"unknown job {job_id}")
     score = db.get_score(job_id)
-    if score is None:
-        raise ValueError(f"job {job_id} is not scored yet")
+    if (
+        score is None
+        or score["profile_version"] != version
+        or score["jd_hash"] != job["description_hash"]
+    ):
+        raise ValueError(f"job {job_id} is not scored for the current profile yet")
     if score["explanation"] is not None:
         return score["explanation"]
-    _, profile = confirmed_profile()
-    cached = db.get_requirements(job_id)
-    requirements = cached["requirements"] if cached else None
+    requirements = db.get_requirements(job["description_hash"])
     prompt = (
         "Explain this candidate-job fit: concrete strengths, concrete "
         "gaps, and a one-line pitch the candidate could lead with.\n\n"
@@ -109,22 +115,28 @@ async def explain_job(job_id: str) -> dict:
 async def rerank_close_matches(run_id: int, band: float = RERANK_BAND) -> dict:
     """One LLM pass ordering the jobs within `band` of the run's top
     deterministic score. Rerank values are spaced inside the cluster's
-    own [min, max] — the deterministic scale stays the backbone."""
-    scored = [j for j in db.list_jobs(run_id) if j["deterministic_score"] is not None]
+    own [min, max] — the deterministic scale stays the backbone — and a
+    1-based rank ordinal is stored alongside, so the LLM's order
+    survives even when every cluster score is identical."""
+    version, profile = confirmed_profile()
+    # Current-version/hash scores only — a mid-rescore run has nothing
+    # rerankable, not a mix of old and new numbers.
+    scored = [
+        j
+        for j in db.list_jobs(run_id, profile_version=version)
+        if j["deterministic_score"] is not None
+    ]
     if len(scored) < 2:
         return {"reranked": 0}
     top = max(j["deterministic_score"] for j in scored)
     cluster = [j for j in scored if top - j["deterministic_score"] <= band]
     if len(cluster) < 2:
         return {"reranked": 0}
-    _, profile = confirmed_profile()
     summaries = []
     for job in cluster:
         score = db.get_score(job["job_id"])
-        cached = db.get_requirements(job["job_id"])
-        summaries.append(
-            _job_summary(job, score, cached["requirements"] if cached else None)
-        )
+        requirements = db.get_requirements(job["description_hash"])
+        summaries.append(_job_summary(job, score, requirements))
     prompt = (
         "These jobs scored within a few points of each other — too close "
         "for the deterministic scorer to separate meaningfully. Order "
@@ -144,6 +156,6 @@ async def rerank_close_matches(run_id: int, band: float = RERANK_BAND) -> dict:
     lo = min(j["deterministic_score"] for j in cluster)
     step = (hi - lo) / (len(ordered) - 1)
     for position, job_id in enumerate(ordered):
-        db.set_llm_rerank(job_id, round(hi - position * step, 2))
+        db.set_llm_rerank(job_id, round(hi - position * step, 2), position + 1)
     log.info("reranked %d close matches in run %s", len(ordered), run_id)
     return {"reranked": len(ordered), "ordered_job_ids": ordered}

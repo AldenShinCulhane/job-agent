@@ -181,9 +181,10 @@ async def confirm_profile(body: dict):
         )
     db.confirm_profile(version)
     broker.publish("profile", {"version": version, "event": "confirmed"})
-    # Existing scores were computed against the previous profile version;
-    # re-score the current run (deterministic-only when requirements are
-    # already cached — cheap, no LLM).
+    # A worker scoring against the previous profile version is now
+    # wasted spend — cancel it, then re-score the current run
+    # (deterministic-only when requirements are already cached; no LLM).
+    _cancel_pipeline()
     _maybe_resume_scoring()
     return {"ok": True, "version": version}
 
@@ -194,34 +195,93 @@ _search_tasks: dict[int, asyncio.Task] = {}
 _connect_task: asyncio.Task | None = None
 _cap_retry_task: asyncio.Task | None = None
 _pipeline_task: asyncio.Task | None = None
-_pipeline_run_id: int | None = None
+# Ownership token: (run_id, profile_version) the running pass serves. A
+# spawn for a different key cancels the old worker — it would otherwise
+# keep spending browser/LLM budget on a run or profile the user moved
+# past. The pass also re-verifies the version before every score write.
+_pipeline_key: tuple[int, int] | None = None
+_pipeline_retry_task: asyncio.Task | None = None
+_pipeline_retry_attempts = 0
+_PIPELINE_MAX_RETRIES = 3
 
 
 def _spawn_pipeline(run_id: int) -> bool:
-    """One scoring pipeline at a time, always for the current run. A
-    pass for an older run is cancelled — its data-derived progress is
-    kept, so nothing is lost."""
-    global _pipeline_task, _pipeline_run_id
+    """One scoring pipeline at a time, keyed by (run, profile version)."""
+    global _pipeline_task, _pipeline_key
+    try:
+        version, _ = scoring_pipeline.confirmed_profile()
+    except scoring_pipeline.NoConfirmedProfile:
+        return False
+    key = (run_id, version)
     if _pipeline_task is not None and not _pipeline_task.done():
-        if _pipeline_run_id == run_id:
+        if _pipeline_key == key:
             return False
         _pipeline_task.cancel()
-    _pipeline_run_id = run_id
+    _pipeline_key = key
     _pipeline_task = asyncio.create_task(_pipeline_worker(run_id))
     return True
 
 
+def _cancel_pipeline() -> None:
+    """Stop scoring work immediately: the run set or profile it was
+    scoring against is no longer current. Data-derived progress is kept."""
+    global _pipeline_retry_attempts
+    if _pipeline_task is not None and not _pipeline_task.done():
+        _pipeline_task.cancel()
+    if _pipeline_retry_task is not None and not _pipeline_retry_task.done():
+        _pipeline_retry_task.cancel()
+    _pipeline_retry_attempts = 0
+
+
 async def _pipeline_worker(run_id: int) -> None:
+    global _pipeline_retry_attempts
     try:
         summary = await scoring_pipeline.run_pipeline(run_id)
-        if summary["stopped"] == "cap":
-            _arm_cap_retry()  # the reset callback re-triggers scoring too
     except asyncio.CancelledError:
         raise
     except scoring_pipeline.NoConfirmedProfile:
         log.info("scoring skipped for run %s: no confirmed profile", run_id)
+        return
     except Exception:  # noqa: BLE001 — idempotent; next trigger retries
         log.exception("scoring pipeline failed for run %s", run_id)
+        return
+    if summary["scored"] > 0:
+        _pipeline_retry_attempts = 0  # progress resets the circuit breaker
+    stopped = summary["stopped"]
+    if stopped == "cap":
+        _arm_cap_retry()  # the reset callback re-triggers scoring too
+    elif stopped == "usage":
+        # The engine recorded retry_at; resume once the cooldown passes.
+        _arm_pipeline_retry(max(llm.seconds_until_retry(), 60.0))
+    elif stopped == "engine" or (stopped is None and summary["failed"] > 0):
+        # Transient engine trouble or isolated per-job failures: bounded
+        # backoff, circuit-broken so a persistent failure can't loop the
+        # LLM budget away. Any later trigger still resumes normally.
+        if _pipeline_retry_attempts < _PIPELINE_MAX_RETRIES:
+            delay = min(60.0 * (2**_pipeline_retry_attempts), 900.0)
+            _pipeline_retry_attempts += 1
+            _arm_pipeline_retry(delay)
+        else:
+            log.error(
+                "scoring run %s: giving up automatic retries after %d attempts",
+                run_id, _PIPELINE_MAX_RETRIES,
+            )
+    # session/stale_profile stops are owned by connect recovery and the
+    # profile-confirm trigger respectively — no timer here.
+
+
+def _arm_pipeline_retry(delay: float) -> None:
+    global _pipeline_retry_task
+    if _pipeline_retry_task is not None and not _pipeline_retry_task.done():
+        return
+    _pipeline_retry_task = asyncio.create_task(_pipeline_retry_after(delay))
+
+
+async def _pipeline_retry_after(delay: float) -> None:
+    jittered = delay + random.uniform(5, 30)
+    log.info("scoring retries in %.0f s", jittered)
+    await asyncio.sleep(jittered)
+    _maybe_resume_scoring()
 
 
 def _maybe_resume_scoring() -> bool:
@@ -241,6 +301,10 @@ def _spawn_search(run_id: int) -> bool:
     existing = _search_tasks.get(run_id)
     if existing is not None and not existing.done():
         return False
+    # Collection owns the browser/LLM budget while it runs; a scoring
+    # pass for a previous run set must not keep spending beside it. The
+    # completion/recovery triggers restart scoring afterwards.
+    _cancel_pipeline()
     task = asyncio.create_task(_connect_then_search(run_id))
     _search_tasks[run_id] = task
 
@@ -398,7 +462,7 @@ async def shutdown_background_tasks() -> None:
     tasks = [
         t
         for t in [_connect_task, _cap_retry_task, _pipeline_task,
-                  *_search_tasks.values()]
+                  _pipeline_retry_task, *_search_tasks.values()]
         # Completed tasks may belong to a previous event loop (an earlier
         # lifespan in the same process); awaiting them there raises.
         if t is not None and not t.done()
@@ -481,8 +545,14 @@ async def jobs_list(run_id: int | None = None):
         if latest is None:
             return {"jobs": [], "run_id": None, "scoring_pending": 0}
         run_id = latest["id"]
+    try:
+        profile_version = scoring_pipeline.confirmed_profile()[0]
+    except scoring_pipeline.NoConfirmedProfile:
+        profile_version = None
     return {
-        "jobs": db.list_jobs(run_id),
+        # Scores join only against the current profile version + JD hash
+        # — mid-rescore the UI sees "unscored", never stale numbers.
+        "jobs": db.list_jobs(run_id, profile_version=profile_version),
         "run_id": run_id,
         # Remaining pipeline work — the UI shows "Scoring…" while > 0.
         "scoring_pending": scoring_pipeline.pending_count(run_id),
