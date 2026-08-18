@@ -40,9 +40,20 @@ def parse_detail(html: str) -> str:
     soup = selectors.parse_html(html)
     node = selectors.select_first(soup, "detail_description")
     text = selectors.text_of(node)
-    if not text:
-        raise DetailParseError("no job description found on the page")
-    return text
+    if text:
+        return text
+    # Selector-free fallback: LinkedIn's classes are obfuscated and churn,
+    # but the description section is headed "About the job". Climb from
+    # that anchor to the first ancestor with substantial text.
+    anchor = soup.find(string=lambda s: s and "About the job" in s)
+    if anchor is not None:
+        el = anchor.parent
+        while el is not None and el.name not in ("body", "html", "[document]"):
+            text = selectors.text_of(el)
+            if text and len(text) > 200:
+                return text
+            el = el.parent
+    raise DetailParseError("no job description found on the page")
 
 
 async def fetch_detail(supervisor, job_id: str, force: bool = False) -> dict:
@@ -56,7 +67,16 @@ async def fetch_detail(supervisor, job_id: str, force: bool = False) -> dict:
         return {**job, "refetched": False, "changed": False}
 
     html = await supervisor.fetch_page(job["url"])
-    description = parse_detail(html)
+    try:
+        description = parse_detail(html)
+    except DetailParseError:
+        # Keep the unparseable page locally (gitignored .data/) so the
+        # selector chain can be fixed against the real DOM instead of
+        # guesswork. Overwritten each failure; never leaves the machine.
+        dump = db.DATA_DIR / "debug_last_detail.html"
+        dump.write_text(html)
+        log.warning("job %s: no description matched; page dumped to %s", job_id, dump)
+        raise
     new_hash = description_hash(description)
     changed = bool(job["description_hash"]) and new_hash != job["description_hash"]
     if changed:

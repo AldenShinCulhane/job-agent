@@ -50,6 +50,9 @@ SELECTORS: dict[str, list[str]] = {
         "h1.t-24",
     ],
     "detail_description": [
+        # Current DOM (observed live 2026-08): obfuscated hashed classes,
+        # but a stable semantic container id remains.
+        "div[id^='JobDetails_AboutTheJob']",
         "#job-details",
         ".jobs-description__content",
         ".jobs-box__html-content",

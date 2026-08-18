@@ -85,6 +85,23 @@ def test_parse_detail_extracts_description():
     assert "3+ years of experience" in text
 
 
+def test_parse_detail_obfuscated_dom_via_stable_id():
+    html = (FIXTURES / "linkedin_job_detail_obfuscated.html").read_text()
+    text = job_detail.parse_detail(html)
+    assert "Python and FastAPI" in text
+    assert text.startswith("About the job")
+
+
+def test_parse_detail_anchor_fallback_without_any_known_selector():
+    """Even with the stable id gone, the 'About the job' heading anchors
+    the climb to the description container."""
+    html = (FIXTURES / "linkedin_job_detail_obfuscated.html").read_text().replace(
+        'id="JobDetails_AboutTheJob_9000000001" ', ""
+    )
+    text = job_detail.parse_detail(html)
+    assert "Python and FastAPI" in text
+
+
 def test_parse_detail_raises_on_empty_page():
     with pytest.raises(job_detail.DetailParseError):
         job_detail.parse_detail("<html><body><p>nothing here</p></body></html>")
