@@ -18,9 +18,9 @@ const LINKEDIN_STATES: Record<string, { label: string; tone: string }> = {
 const RUN_LABELS: Record<string, string> = {
   running: 'Searching…',
   done: 'Search complete',
-  stopped_captcha: 'Stopped at a LinkedIn checkpoint',
-  stopped_auth: 'Stopped — sign-in needed',
-  stopped_cap: 'Stopped — daily action cap reached',
+  stopped_captcha: 'Stopped at a LinkedIn checkpoint — resumes after you resolve it and reconnect',
+  stopped_auth: 'Stopped — sign in via Connect and the search resumes automatically',
+  stopped_cap: 'Daily action cap reached — resumes automatically when it resets',
   stopped_error: 'Stopped on an error',
 }
 
@@ -241,7 +241,7 @@ export default function Search() {
           >
             Start search
           </button>
-          {run?.status?.startsWith('stopped_') && (
+          {run?.status === 'stopped_error' && (
             <button
               className="rounded-md border border-slate-300 px-4 py-2 text-sm hover:bg-slate-50"
               onClick={resume}

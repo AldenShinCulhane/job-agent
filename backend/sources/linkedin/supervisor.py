@@ -208,6 +208,7 @@ class LinkedInSupervisor:
             self._raise_for_page_state(
                 selectors.classify_page(page.url or "", await page.content())
             )
+            html = ""
             for _ in range(_SCROLL_STEPS):
                 # The jobs list is its own scroll container; nudge it and
                 # the window so lazy cards render either way.
@@ -217,10 +218,13 @@ class LinkedInSupervisor:
                     " if (el) el.scrollBy(0, 800); window.scrollBy(0, 800); }"
                 )
                 await pacing.scroll_delay()
-            html = await page.content()
-            # Re-classify what we ended up with — a challenge can also be
-            # injected while the page sits open.
-            self._raise_for_page_state(selectors.classify_page(page.url or "", html))
+                # Re-classify after EVERY step, before the next scripted
+                # action — a challenge can be injected at any moment, and
+                # continuing to scroll one is off the table.
+                html = await page.content()
+                self._raise_for_page_state(
+                    selectors.classify_page(page.url or "", html)
+                )
             return html
 
     def _raise_for_page_state(self, verdict: str) -> None:

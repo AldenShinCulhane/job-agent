@@ -8,7 +8,7 @@ never attempt any bypass.
 
 import asyncio
 import random
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 
 from backend.core import db
 
@@ -37,6 +37,20 @@ def check_daily_cap() -> int:
             "the run resumes tomorrow."
         )
     return used
+
+
+def budget_remaining() -> int:
+    """Browser actions left in today's (UTC) budget."""
+    return max(0, DAILY_ACTION_CAP - db.get_action_count(_today()))
+
+
+def seconds_until_cap_reset() -> float:
+    """Seconds until the next UTC midnight, when the counter resets."""
+    now = datetime.now(timezone.utc)
+    reset = datetime.combine(
+        (now + timedelta(days=1)).date(), time(0, 0), tzinfo=timezone.utc
+    )
+    return (reset - now).total_seconds()
 
 
 async def page_delay() -> None:

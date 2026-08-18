@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 import tempfile
 from pathlib import Path
 
@@ -175,6 +176,7 @@ async def confirm_profile(body: dict):
 
 _search_tasks: dict[int, asyncio.Task] = {}
 _connect_task: asyncio.Task | None = None
+_cap_retry_task: asyncio.Task | None = None
 
 
 def _spawn_search(run_id: int) -> bool:
@@ -218,7 +220,9 @@ async def _connect_then_search(run_id: int) -> None:
         except sources.AuthRequired as exc:
             db.update_search_run(run_id, status="stopped_auth", message=str(exc))
             return
-        await sources.source.resume(run_id)
+        result = await sources.source.resume(run_id)
+        if result and result.get("status") == "stopped_cap":
+            _arm_cap_retry()  # resumes by itself when the UTC budget resets
     except asyncio.CancelledError:
         raise  # shutdown: leave the run 'running' for recovery
     except Exception as exc:  # noqa: BLE001 — terminal state over silent death
@@ -241,29 +245,63 @@ async def _connect_only() -> None:
     # Session is good again — automatically reclaim the work that was
     # blocked on it (gate 2 rule: the user performs an action, never
     # approves one; no extra Resume click).
-    _reclaim_runs(("running", "stopped_auth", "stopped_captcha"))
+    _reclaim_latest(("running", "stopped_auth", "stopped_captcha"))
 
 
-def _reclaim_runs(statuses: tuple[str, ...]) -> list[int]:
-    claimed = []
-    for run in db.search_runs_by_status(statuses):
-        if run["status"] != "running":
-            db.update_search_run(run["id"], status="running", message=None)
-        if _spawn_search(run["id"]):
-            claimed.append(run["id"])
-            log.info("reclaimed search run %s (was %s)", run["id"], run["status"])
-    return claimed
+def _reclaim_latest(statuses: tuple[str, ...]) -> list[int]:
+    """Reclaim the CURRENT (latest) run only, and only when its status is
+    in `statuses`. Older runs are history — auto-resuming them would
+    silently spend LinkedIn actions on searches the user moved past."""
+    run = db.latest_search_run()
+    if run is None or run["status"] not in statuses:
+        return []
+    if run["status"] != "running":
+        db.update_search_run(run["id"], status="running", message=None)
+    if _spawn_search(run["id"]):
+        log.info("reclaimed search run %s (was %s)", run["id"], run["status"])
+        return [run["id"]]
+    return []
+
+
+def _maybe_resume_capped() -> list[int]:
+    """A cap-stopped current run resumes with no user input: now if
+    today's budget has headroom, otherwise when the UTC counter resets."""
+    run = db.latest_search_run()
+    if run is None or run["status"] != "stopped_cap":
+        return []
+    if sources.budget_remaining() > 0:
+        return _reclaim_latest(("stopped_cap",))
+    _arm_cap_retry()
+    return []
+
+
+def _arm_cap_retry() -> None:
+    global _cap_retry_task
+    if _cap_retry_task is not None and not _cap_retry_task.done():
+        return
+    _cap_retry_task = asyncio.create_task(_cap_retry_after_reset())
+
+
+async def _cap_retry_after_reset() -> None:
+    delay = sources.seconds_until_cap_reset() + random.uniform(60, 300)
+    log.info("daily action cap spent — search auto-resumes in %.0f min", delay / 60)
+    await asyncio.sleep(delay)
+    _reclaim_latest(("stopped_cap",))
 
 
 def recover_search_runs() -> list[int]:
-    """Startup recovery: reclaim runs left 'running' by a previous
-    process. If a persisted captcha stop was restored, defer — restarting
-    navigation against a checkpoint is a bypass-shaped move; the work is
-    reclaimed when the user resolves it and connects."""
+    """Startup recovery for the current run: reclaim it if a previous
+    process left it 'running', or arm/resume a cap-stopped one. If a
+    persisted captcha stop was restored, defer — restarting navigation
+    against a checkpoint is a bypass-shaped move; the work is reclaimed
+    when the user resolves it and connects."""
     if sources.source.current_state() == "captcha_stop":
         log.info("captcha stop persisted — deferring search recovery until resolved")
         return []
-    return _reclaim_runs(("running",))
+    claimed = _reclaim_latest(("running",))
+    if not claimed:
+        claimed = _maybe_resume_capped()
+    return claimed
 
 
 async def shutdown_background_tasks() -> None:
@@ -272,7 +310,11 @@ async def shutdown_background_tasks() -> None:
     of login polling — close() would deadlock behind it, and an
     un-cancelled search task could reopen the browser after close.
     Interrupted runs stay 'running' for startup recovery."""
-    tasks = [t for t in [_connect_task, *_search_tasks.values()] if t is not None]
+    tasks = [
+        t
+        for t in [_connect_task, _cap_retry_task, *_search_tasks.values()]
+        if t is not None
+    ]
     for task in tasks:
         task.cancel()
     if tasks:

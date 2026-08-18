@@ -498,6 +498,80 @@ async def test_connect_success_reclaims_stopped_auth_run(
     assert run["message"] is None  # stale auth error cleared
 
 
+async def test_connect_reclaims_only_the_latest_run(test_db, no_delays, monkeypatch):
+    """Auto-reclaim is scoped to the CURRENT search: a successful Connect
+    must not silently spend LinkedIn actions on historical stopped runs."""
+    from backend.api import routes
+
+    old_run = _seed_orphaned_run()
+    db.update_search_run(old_run, status="stopped_auth", message="expired")
+    new_run = _seed_orphaned_run()
+    db.update_search_run(new_run, status="stopped_auth", message="expired")
+
+    fake = FakeLifecycleSource(browser_pages=[SEARCH_FALLBACK_HTML, NO_RESULTS_HTML])
+    monkeypatch.setattr(routes.sources, "source", fake)
+    await routes._connect_only()
+
+    assert old_run not in routes._search_tasks  # history untouched
+    task = routes._search_tasks.get(new_run)
+    assert task is not None
+    await task
+    assert db.get_search_run(new_run)["status"] == "done"
+    assert db.get_search_run(old_run)["status"] == "stopped_auth"
+
+
+async def test_capped_run_resumes_on_startup_when_budget_available(
+    test_db, no_delays, monkeypatch
+):
+    from backend.api import routes
+
+    run_id = _seed_orphaned_run()
+    db.update_search_run(run_id, status="stopped_cap", message="cap")
+
+    fake = FakeLifecycleSource(browser_pages=[SEARCH_FALLBACK_HTML, NO_RESULTS_HTML])
+    monkeypatch.setattr(routes.sources, "source", fake)
+    assert routes.recover_search_runs() == [run_id]
+    await routes._search_tasks[run_id]
+    assert db.get_search_run(run_id)["status"] == "done"
+
+
+async def test_capped_run_arms_retry_timer_when_budget_spent(test_db, monkeypatch):
+    from backend.api import routes
+
+    run_id = _seed_orphaned_run()
+    db.update_search_run(run_id, status="stopped_cap", message="cap")
+
+    fake = FakeLifecycleSource()
+    monkeypatch.setattr(routes.sources, "source", fake)
+    monkeypatch.setattr(routes.sources, "budget_remaining", lambda: 0)
+    monkeypatch.setattr(routes, "_cap_retry_task", None)
+
+    assert routes.recover_search_runs() == []  # nothing spent now
+    assert db.get_search_run(run_id)["status"] == "stopped_cap"
+    assert routes._cap_retry_task is not None  # resumes itself at UTC reset
+    routes._cap_retry_task.cancel()
+
+
+async def test_driver_arms_cap_retry_when_run_caps(test_db, monkeypatch):
+    from backend.api import routes
+
+    run_id = db.create_search_run({"keywords": "x", "cap": 50})
+
+    class CapSource:
+        async def connect(self):
+            return {"state": "ready"}
+
+        async def resume(self, rid):
+            db.update_search_run(rid, status="stopped_cap", message="cap")
+            return db.get_search_run(rid)
+
+    monkeypatch.setattr(routes.sources, "source", CapSource())
+    monkeypatch.setattr(routes, "_cap_retry_task", None)
+    await routes._connect_then_search(run_id)
+    assert routes._cap_retry_task is not None
+    routes._cap_retry_task.cancel()
+
+
 async def test_search_start_rejects_bad_cap(test_db):
     from fastapi import HTTPException
 
@@ -544,6 +618,46 @@ async def test_checkpoint_detected_before_any_scroll(test_db):
     with pytest.raises(CaptchaStop):
         await sup.fetch_page("https://www.linkedin.com/jobs/search/?keywords=x")
     assert page.scrolls == 0
+    assert sup.state == "captcha_stop"
+
+
+class FakeInjectedChallengePage:
+    """Clean page that turns into a challenge mid-scroll."""
+
+    def __init__(self, inject_after: int):
+        self.url = "https://www.linkedin.com/jobs/search/?keywords=x"
+        self.scrolls = 0
+        self._inject_after = inject_after
+
+    def is_closed(self):
+        return False
+
+    async def goto(self, url, wait_until=None):
+        pass
+
+    async def content(self):
+        if self.scrolls >= self._inject_after:
+            return '<html><body><form id="challenge-form"></form></body></html>'
+        return '<html><body><header class="global-nav">x</header></body></html>'
+
+    async def evaluate(self, script):
+        self.scrolls += 1
+
+
+async def test_challenge_injected_midscroll_stops_before_next_scroll(
+    test_db, monkeypatch
+):
+    async def instant():
+        pass
+
+    monkeypatch.setattr(pacing, "scroll_delay", instant)
+    sup = LinkedInSupervisor()
+    sup.state = "ready"
+    page = FakeInjectedChallengePage(inject_after=3)
+    sup._page = page
+    with pytest.raises(CaptchaStop):
+        await sup.fetch_page(page.url)
+    assert page.scrolls == 3  # detected right after injection, well before 8
     assert sup.state == "captcha_stop"
 
 

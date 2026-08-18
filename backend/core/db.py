@@ -360,27 +360,6 @@ def latest_search_run() -> dict | None:
     return _search_run_query("ORDER BY id DESC LIMIT 1", ())
 
 
-def search_runs_by_status(statuses: tuple[str, ...]) -> list[dict]:
-    """Runs in any of `statuses`. 'running' rows after a restart are
-    orphans (no task holds them) awaiting recovery; stopped_auth /
-    stopped_captcha rows are reclaimed when a connect succeeds."""
-    import json
-
-    placeholders = ", ".join("?" for _ in statuses)
-    with _connect() as conn:
-        rows = conn.execute(
-            "SELECT id, config_json, status, next_start, collected, message, "
-            f"started_at, updated_at FROM search_runs WHERE status IN ({placeholders})",
-            statuses,
-        ).fetchall()
-    return [
-        {
-            "id": r[0], "config": json.loads(r[1]), "status": r[2],
-            "next_start": r[3], "collected": r[4], "message": r[5],
-            "started_at": r[6], "updated_at": r[7],
-        }
-        for r in rows
-    ]
 
 
 def _search_run_query(clause: str, params: tuple) -> dict | None:
