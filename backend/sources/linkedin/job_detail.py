@@ -87,5 +87,8 @@ async def fetch_detail(supervisor, job_id: str, force: bool = False) -> dict:
     if changed:
         log.info("job %s description changed (hash %s -> %s)",
                  job_id, job["description_hash"], new_hash)
+        # Hash moved -> normalized requirements/score/explanation are all
+        # stale; drop them so the pipeline recomputes (PLAN.md §4.4).
+        db.invalidate_derived(job_id)
     db.save_job_detail(job_id, description, new_hash)
     return {**db.get_job(job_id), "refetched": True, "changed": changed}
