@@ -466,7 +466,7 @@ async def test_fit_resume_trims_lowest_relevance_and_revalidates(
         lambda tex: 1 if tex.count("\\resumeItem{") <= 2 else 2)
     revalidations = []
 
-    async def fake_validate(tailored, profile, ledger, cache):
+    async def fake_validate(tailored, profile, ledger, cache, record=None):
         revalidations.append(len(revalidations))
         return []
 
@@ -488,7 +488,7 @@ async def test_fit_resume_fails_when_floors_and_trims_run_out(
 
     _fake_compiler(monkeypatch, lambda tex: 3)  # never fits
 
-    async def fake_validate(*a):
+    async def fake_validate(*a, **k):
         return []
 
     monkeypatch.setattr(validate, "validate", fake_validate)
@@ -615,7 +615,7 @@ async def test_fit_cover_ladder_then_condense_then_fail(tmp_path, monkeypatch):
         llm_calls.append(task)
         return condensed
 
-    async def fake_validate(tailored, profile, ledger, cache):
+    async def fake_validate(tailored, profile, ledger, cache, record=None):
         return []
 
     monkeypatch.setattr(llm, "structured", fake_structured)
@@ -747,7 +747,9 @@ async def test_package_end_to_end_publishes_and_never_regenerates(
     assert prov["engine_resume"] == "fake" and prov["resume_pages"] == 1
     assert prov["cover_pages"] == 1 and prov["prompt_version"] >= 2
     assert prov["page_limit"] == 1  # the pinned limit, not a live read
-    assert prov["llm_calls"]["generation"]["effort"] == "high"
+    assert [c["call"] for c in prov["llm_calls"]] == ["generation",
+                                                      "entailment"]
+    assert prov["llm_calls"][0]["effort"] == "high"
     assert prov["template_version"] >= 1
     assert generate_calls == ["p1"] and entail_calls == ["entail"]
 
@@ -904,7 +906,7 @@ async def test_validation_failure_after_repair_fails_package(
     pkg, _ = db.create_package("p1", version, "hash-a")
     _tailor_env(monkeypatch, tmp_path)
 
-    async def always_failing(tailored, profile, ledger, cache):
+    async def always_failing(tailored, profile, ledger, cache, record=None):
         return [{"claim_id": "exp0:b0", "reason": "fabricated metric"}]
 
     repairs = []
@@ -1088,10 +1090,16 @@ async def test_restart_during_cover_condense_reuses_persisted_fits(
     assert len(condense_calls) == 2  # the interrupted one, once more
     prov = db.get_package(pkg)["provenance"]
     assert prov["cover_pages"] == 1
-    assert prov["llm_calls"]["generation"]["model"] == "claude-fable-5"
-    assert prov["llm_calls"]["entailment"]["model"] == "claude-fable-5"
-    assert prov["llm_calls"]["cover_condense"] == {"model": "claude-opus-5",
-                                                   "effort": "xhigh"}
+    # The ledger attributes every call to the model that actually made
+    # it, in order — the first condense died mid-call (no entry), the
+    # restart's condense and its revalidation ran on the new model.
+    assert [(c["call"], c["model"]) for c in prov["llm_calls"]] == [
+        ("generation", "claude-fable-5"),
+        ("entailment", "claude-fable-5"),
+        ("cover_condense", "claude-opus-5"),
+        ("entailment", "claude-opus-5"),
+    ]
+    assert prov["llm_calls"][2]["effort"] == "xhigh"
 
 
 @pytest.mark.parametrize("interrupt_at", ["asserting", "publishing"])
@@ -1521,12 +1529,10 @@ async def test_provenance_and_jobmd_publish_from_snapshots(
     assert await tailor_pipeline.run_package(pkg) == "done"
     row = db.get_package(pkg)
     calls = row["provenance"]["llm_calls"]
-    assert calls["generation"]["model"] == "claude-fable-5"  # at call time
-    assert calls["generation"]["effort"] == "high"
-    assert calls["entailment"] == {"model": "claude-fable-5",
-                                   "effort": "medium"}
-    assert calls["truth_repair"] is None  # never ran for this package
-    assert calls["cover_condense"] is None
+    assert [(c["call"], c["model"], c["effort"]) for c in calls] == [
+        ("generation", "claude-fable-5", "high"),  # at call time
+        ("entailment", "claude-fable-5", "medium"),
+    ]  # no repair-tier call ever ran, so no such entry exists
     job_md = (Path(row["output_dir"]) / "job.md").read_text()
     assert "77.7" in job_md and "Original overlap" in job_md
     assert "33.3" not in job_md and "Different reasons" not in job_md
@@ -1611,6 +1617,142 @@ async def test_profile_confirm_cancels_package_worker(test_db, monkeypatch):
     await asyncio.gather(worker, return_exceptions=True)
     assert worker.cancelled()  # in-flight spend stopped
     assert resumed == [True]  # surviving queue restarted
+
+
+# --- Review round 4: immediate checkpoints for LLM sub-stages ----------------
+
+async def test_condense_survives_entailment_failure_without_respend(
+    test_db, tmp_path, monkeypatch
+):
+    """Round-4 blocker: condense succeeds, the FOLLOWING entailment hits
+    UsageExhausted, the engine model changes — recovery must reuse the
+    persisted condense output (count stays 1) and the ledger must
+    attribute every call to the model that made it."""
+    from backend.core import llm
+    from backend.tailor import pipeline as tailor_pipeline
+    from backend.tailor import resume as tailor_resume
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    db.set_state("pinned_model", "claude-fable-5")
+    pkg, _ = db.create_package("p1", version, "hash-a")
+
+    def pages(tex):
+        if "Hiring Team" in tex:  # the cover letter
+            return 1 if "A short letter." in tex else 2
+        return 1
+    _fake_compiler(monkeypatch, pages)
+    monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
+
+    condense_calls, entail_n, healed = [], [0], [False]
+
+    async def fake_generate(profile, ledger, job, requirements, breakdown,
+                            page_limit):
+        return _cited_tailored()[0]
+
+    async def fake_structured(prompt, schema, task, system_prompt=""):
+        if task == "repair":  # the condense
+            condense_calls.append(1)
+            return {"paragraphs": [
+                {"text": "A short letter.", "source_ids": []},
+                {"text": "Thanks.", "source_ids": []}]}
+        assert task == "entail"
+        entail_n[0] += 1
+        if entail_n[0] == 2 and not healed[0]:
+            raise llm.UsageExhausted("weekly limit reached")
+        claim_ids = [json.loads(line)["claim_id"]
+                     for line in prompt.splitlines() if line.startswith("{")]
+        return {"verdicts": [{"claim_id": cid, "supported": True,
+                              "reason": "ok"} for cid in claim_ids]}
+
+    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
+    monkeypatch.setattr(llm, "structured", fake_structured)
+
+    assert await tailor_pipeline.run_package(pkg) == "waiting_usage"
+    row = db.get_package(pkg)
+    assert condense_calls == [1]
+    assert "cover_condensed" in row["stage"]  # output survived the crash
+    assert [c["call"] for c in row["stage"]["llm_calls"]] == [
+        "generation", "entailment", "cover_condense"]  # spend on record
+
+    # Cooldown passes; recovery happens to come back on another model.
+    db.set_state("pinned_model", "claude-opus-5")
+    healed[0] = True
+    assert await tailor_pipeline.run_package(pkg) == "done"
+    assert condense_calls == [1]  # the xhigh call was never repeated
+    prov = db.get_package(pkg)["provenance"]
+    assert [(c["call"], c["model"]) for c in prov["llm_calls"]] == [
+        ("generation", "claude-fable-5"),
+        ("entailment", "claude-fable-5"),
+        ("cover_condense", "claude-fable-5"),
+        ("entailment", "claude-opus-5"),  # only the retried entailment
+    ]
+    assert prov["cover_pages"] == 1
+
+
+async def test_repair_metadata_survives_revalidation_interruption(
+    test_db, tmp_path, monkeypatch
+):
+    """Round-4 blocker, repair flavor: the repaired JSON and its call
+    metadata persist together BEFORE revalidation, so an engine failure
+    there can never make provenance claim truth_repair never ran."""
+    from backend.core import llm
+    from backend.tailor import pipeline as tailor_pipeline
+    from backend.tailor import resume as tailor_resume
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    db.set_state("pinned_model", "claude-fable-5")
+    pkg, _ = db.create_package("p1", version, "hash-a")
+    _fake_compiler(monkeypatch, lambda tex: 1)
+    monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
+
+    fixed = _cited_tailored()[0]
+    broken = json.loads(json.dumps(fixed))
+    broken["experiences"][0]["bullets"][0]["text"] = "Claims too much impact"
+    repair_calls, entail_n, healed = [], [0], [False]
+
+    async def fake_generate(profile, ledger, job, requirements, breakdown,
+                            page_limit):
+        return broken
+
+    async def fake_structured(prompt, schema, task, system_prompt=""):
+        if task == "repair":
+            repair_calls.append(1)
+            return fixed
+        assert task == "entail"
+        entail_n[0] += 1
+        if entail_n[0] == 2 and not healed[0]:
+            raise llm.AuthRequired("Not logged in")  # dies re-validating
+        claim_ids = [json.loads(line)["claim_id"]
+                     for line in prompt.splitlines() if line.startswith("{")]
+        return {"verdicts": [
+            {"claim_id": cid,
+             "supported": not (entail_n[0] == 1 and cid == "exp0:b0"),
+             "reason": "checked"}
+            for cid in claim_ids]}
+
+    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
+    monkeypatch.setattr(llm, "structured", fake_structured)
+
+    assert await tailor_pipeline.run_package(pkg) == "engine_blocked"
+    row = db.get_package(pkg)
+    assert repair_calls == [1]
+    assert row["stage"]["tailored"] == fixed  # repaired JSON persisted...
+    assert [c["call"] for c in row["stage"]["llm_calls"]] == [
+        "generation", "entailment", "truth_repair"]  # ...with its record
+
+    healed[0] = True
+    assert await tailor_pipeline.run_package(pkg) == "done"
+    assert repair_calls == [1]  # never repeated
+    prov = db.get_package(pkg)["provenance"]
+    assert [c["call"] for c in prov["llm_calls"]] == [
+        "generation", "entailment", "truth_repair", "entailment"]
+    assert prov["llm_calls"][2] == {"call": "truth_repair",
+                                    "model": "claude-fable-5",
+                                    "effort": "xhigh"}
 
 
 def test_skills_order_duplicates_rejected_everywhere():

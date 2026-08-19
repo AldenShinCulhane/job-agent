@@ -136,11 +136,15 @@ _ENTAIL_SYSTEM = (
 
 
 async def entailment_failures(claims: list[dict], ledger: dict,
-                              cache: dict[str, dict]) -> list[dict]:
+                              cache: dict[str, dict],
+                              record=None) -> list[dict]:
     """One batched structured pass over every claim not already covered
     by a cached verdict. Mutates `cache` (persisted by the caller) and
     returns the unsupported claims. A claim the model fails to return a
-    verdict for counts as unsupported — never silently trusted."""
+    verdict for counts as unsupported — never silently trusted.
+    `record`, when given, is called as record("entailment") the moment
+    the LLM call returns — the caller checkpoints its ledger before any
+    later step can fail."""
     pending, failures = [], []
     for claim in claims:
         key = entailment_key(claim, ledger)
@@ -165,6 +169,8 @@ async def entailment_failures(claims: list[dict], ledger: dict,
     )
     result = await llm.structured(prompt, ENTAILMENT_SCHEMA, task="entail",
                                   system_prompt=_ENTAIL_SYSTEM)
+    if record is not None:
+        record("entailment")  # the call succeeded — checkpoint it now
     returned = {v["claim_id"]: v for v in result["verdicts"]}
     for key, claim in pending:
         verdict = returned.get(claim["claim_id"])
@@ -203,14 +209,15 @@ def cached_failures(tailored: dict, profile: dict, ledger: dict,
 
 
 async def validate(tailored: dict, profile: dict, ledger: dict,
-                   cache: dict[str, dict]) -> list[dict]:
+                   cache: dict[str, dict], record=None) -> list[dict]:
     """All failures for both documents. Deterministic problems
     short-circuit (no LLM spend on structurally broken output); a clean
     structure gets the batched entailment pass."""
     failures = deterministic_failures(tailored, profile, ledger)
     if failures:
         return failures
-    return await entailment_failures(collect_claims(tailored), ledger, cache)
+    return await entailment_failures(collect_claims(tailored), ledger, cache,
+                                     record=record)
 
 
 _REPAIR_SYSTEM = (

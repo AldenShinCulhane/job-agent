@@ -184,7 +184,7 @@ def _compile_resume(tailored: dict, profile: dict, layout: template.Layout,
 
 async def fit_resume(tailored: dict, profile: dict, ledger: dict,
                      entail_cache: dict, page_limit: int,
-                     workdir: Path) -> FitResult:
+                     workdir: Path, *, record=None) -> FitResult:
     """Compile → tighten layout within floors → trim lowest-relevance
     bullets (revalidating after every trim) → sparse-page balance.
     Raises FitError when the limit is unreachable."""
@@ -213,7 +213,7 @@ async def fit_resume(tailored: dict, profile: dict, ledger: dict,
         # A trim is a content change: revalidate before continuing.
         # Unchanged claims hit the entailment cache — zero LLM calls.
         failures = await validate.validate(tailored, profile, ledger,
-                                           entail_cache)
+                                           entail_cache, record=record)
         if failures:
             raise ValidationFailed(failures)
         result = _compile_resume(tailored, profile, layout, workdir)
@@ -275,9 +275,17 @@ _CONDENSE_SYSTEM = (
 
 async def fit_cover(tailored: dict, profile: dict, ledger: dict,
                     entail_cache: dict, job: dict,
-                    workdir: Path) -> FitResult:
+                    workdir: Path, *, record=None, precondensed=None,
+                    on_condensed=None) -> FitResult:
     """Cover letter must be exactly one page: bounded layout first, then
-    one xhigh condense round (revalidated), then failure."""
+    one xhigh condense round (revalidated), then failure.
+
+    `precondensed` is a previously persisted condense output: a resume
+    after the condense call succeeded but a later step failed reuses it
+    instead of paying the xhigh call again. `on_condensed(cover_letter)`
+    fires the moment a LIVE condense call returns, BEFORE revalidation —
+    the caller checkpoints the JSON and its call metadata so no
+    downstream failure can lose the spend."""
     tailored = json.loads(json.dumps(tailored))
     layout = cover_mod.DEFAULT_COVER_LAYOUT
 
@@ -297,22 +305,29 @@ async def fit_cover(tailored: dict, profile: dict, ledger: dict,
                 break
 
     if result.pages > 1:
-        letter = tailored["cover_letter"]
-        prompt = (
-            f"# Cover letter to shorten ({result.pages} pages; must be 1)\n"
-            f"{json.dumps(letter, indent=1)}\n\n"
-            "# Valid source_ids\n"
-            + "\n".join(f"- {fid}: {e['text']}" for fid, e in ledger.items())
-            + "\n\nReturn the shortened paragraphs."
-        )
-        shorter = await llm.structured(prompt, _CONDENSE_SCHEMA,
-                                       task="repair",
-                                       system_prompt=_CONDENSE_SYSTEM)
+        if precondensed is not None:
+            # The xhigh call already succeeded in a previous attempt —
+            # never pay for it twice (PLAN.md §4.6 no-duplicate-work).
+            shorter = precondensed
+        else:
+            letter = tailored["cover_letter"]
+            prompt = (
+                f"# Cover letter to shorten ({result.pages} pages; must be 1)\n"
+                f"{json.dumps(letter, indent=1)}\n\n"
+                "# Valid source_ids\n"
+                + "\n".join(f"- {fid}: {e['text']}" for fid, e in ledger.items())
+                + "\n\nReturn the shortened paragraphs."
+            )
+            shorter = await llm.structured(prompt, _CONDENSE_SCHEMA,
+                                           task="repair",
+                                           system_prompt=_CONDENSE_SYSTEM)
+            if on_condensed is not None:
+                on_condensed(shorter)  # checkpoint BEFORE revalidation
         condensed = True
         tailored["cover_letter"] = shorter
         # Content rewrite: full revalidation before continuing.
         failures = await validate.validate(tailored, profile, ledger,
-                                           entail_cache)
+                                           entail_cache, record=record)
         if failures:
             raise ValidationFailed(failures)
         result = _compile(layout)

@@ -194,9 +194,18 @@ async def run_package(package_id: int) -> str:
                                 "easy_apply")
                 },
                 "entail_cache": {},
-                "generation": {
+                # Append-only ledger of every LLM call this package ever
+                # made, each entry written the moment its call returns —
+                # a later failure can park the package but never lose or
+                # misattribute spend that already happened.
+                "llm_calls": [{
+                    "call": "generation",
                     "model": db.get_state("pinned_model"),
                     "effort": llm.effective_effort("tailor"),
+                    "prompt_version": tailor_resume.PROMPT_VERSION,
+                    "schema_version": tailor_resume.SCHEMA_VERSION,
+                }],
+                "generation": {
                     "prompt_version": tailor_resume.PROMPT_VERSION,
                     "schema_version": tailor_resume.SCHEMA_VERSION,
                     "requirements": requirements,
@@ -208,6 +217,20 @@ async def run_package(package_id: int) -> str:
             }
             _transition(package_id, "validating", stage=stage)
 
+        # Every later LLM call checkpoints itself into the append-only
+        # ledger the moment it returns; the recorder persists in place so
+        # a failure right after a call can never lose its record.
+        def _record(call: str, task: str) -> None:
+            stage.setdefault("llm_calls", []).append({
+                "call": call,
+                "model": db.get_state("pinned_model"),
+                "effort": llm.effective_effort(task),
+            })
+            _transition(package_id, stage=stage)
+
+        def record_entailment(call: str) -> None:
+            _record(call, "entail")
+
         # Validation is bound to the exact content it approved: the hash
         # guard means repaired-or-edited JSON can never coast on a stale
         # flag, and the asserting stage re-checks it before publish.
@@ -215,16 +238,24 @@ async def run_package(package_id: int) -> str:
             _transition(package_id, "validating")
             cache = stage.get("entail_cache", {})
             failures = await validate.validate(stage["tailored"], profile,
-                                               ledger, cache)
-            repaired_round = False
+                                               ledger, cache,
+                                               record=record_entailment)
             if failures:
                 repaired = await validate.repair(stage["tailored"], failures,
                                                  profile, ledger)
-                repaired_round = True
+                # The repaired JSON and its call metadata persist in ONE
+                # write, BEFORE revalidation — an interruption here can
+                # never make the record claim the repair didn't happen.
                 stage["tailored"] = repaired
+                stage.setdefault("llm_calls", []).append({
+                    "call": "truth_repair",
+                    "model": db.get_state("pinned_model"),
+                    "effort": llm.effective_effort("repair"),
+                })
                 _transition(package_id, stage=stage)
                 failures = await validate.validate(repaired, profile, ledger,
-                                                   cache)
+                                                   cache,
+                                                   record=record_entailment)
             stage["entail_cache"] = cache
             if failures:
                 detail = "; ".join(
@@ -233,13 +264,6 @@ async def run_package(package_id: int) -> str:
                             error=f"truth validation failed after repair: {detail}")
                 return "failed"
             stage["validated_sha"] = _content_sha(stage["tailored"])
-            stage["validation"] = {
-                "model": db.get_state("pinned_model"),
-                "effort_entail": llm.effective_effort("entail"),
-                "repaired": repaired_round,
-            }
-            if repaired_round:
-                stage["validation"]["effort_repair"] = llm.effective_effort("repair")
             _transition(package_id, "fitting", stage=stage)
 
         # Each fit persists its result (fitted JSON + layout) before the
@@ -257,21 +281,27 @@ async def run_package(package_id: int) -> str:
             _transition(package_id, "fitting")
             resume_fit = await page_limit.fit_resume(
                 stage["tailored"], profile, ledger, cache, limit,
-                workdir / "resume")
+                workdir / "resume", record=record_entailment)
             stage["resume_fit"] = page_limit.fit_state(resume_fit)
             stage["entail_cache"] = cache
             _transition(package_id, stage=stage)
         if "cover_fit" not in stage:
             _transition(package_id, "fitting")
+
+            def _on_condensed(cover_letter: dict) -> None:
+                # The xhigh condense call just returned: persist its
+                # output AND its ledger entry before revalidation can
+                # fail — a resume reuses this instead of paying again.
+                stage["cover_condensed"] = cover_letter
+                stage["entail_cache"] = cache
+                _record("cover_condense", "repair")
+
             cover_fit = await page_limit.fit_cover(
                 stage["tailored"], profile, ledger, cache, job_snap,
-                workdir / "cover")
+                workdir / "cover", record=record_entailment,
+                precondensed=stage.get("cover_condensed"),
+                on_condensed=_on_condensed)
             stage["cover_fit"] = page_limit.fit_state(cover_fit)
-            if cover_fit.condensed:  # the one LLM call inside fitting
-                stage["cover_fit"]["condense"] = {
-                    "model": db.get_state("pinned_model"),
-                    "effort": llm.effective_effort("repair"),
-                }
             stage["entail_cache"] = cache
             _transition(package_id, stage=stage)
 
@@ -333,24 +363,13 @@ async def run_package(package_id: int) -> str:
         # LLM call actually used), never from completion-time state —
         # only the compile facts (engines, pages) and the template
         # versions come from this process, because this process really
-        # did render and compile the shipped PDFs. Each stage records
-        # its OWN model: recovery between stages can legitimately switch
-        # engines, and the record must say which call ran on which.
-        val = stage["validation"]
+        # did render and compile the shipped PDFs. llm_calls is the
+        # append-only ledger verbatim: every call in the order it ran,
+        # each attributed to the model/effort that actually made it —
+        # including repeats (e.g. entailment before and after condense)
+        # across engine recoveries.
         provenance = {
-            "llm_calls": {
-                "generation": {"model": gen["model"],
-                               "effort": gen["effort"],
-                               "prompt_version": gen["prompt_version"],
-                               "schema_version": gen["schema_version"]},
-                "entailment": {"model": val["model"],
-                               "effort": val["effort_entail"]},
-                # null = that call never ran for this package.
-                "truth_repair": ({"model": val["model"],
-                                  "effort": val["effort_repair"]}
-                                 if val.get("repaired") else None),
-                "cover_condense": stage["cover_fit"].get("condense"),
-            },
+            "llm_calls": stage.get("llm_calls", []),
             "engine_resume": resume_res.engine,
             "engine_cover": cover_res.engine,
             "prompt_version": gen["prompt_version"],
