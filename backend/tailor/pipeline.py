@@ -179,10 +179,20 @@ async def run_package(package_id: int) -> str:
             # Snapshot what this call ACTUALLY used the moment it
             # succeeds — provenance and job.md publish from these, so an
             # engine change, code upgrade, or re-score between now and
-            # publish can never misdescribe the artifacts.
+            # publish can never misdescribe the artifacts. The card
+            # fields join the pin too: a search refresh can rewrite
+            # company/title/URL without moving the JD hash, and the
+            # cover greeting, output path, and job.md must describe the
+            # posting this package was generated for.
             stage = {
                 "tailored": tailored,
                 "jd_snapshot": job["description"],
+                "job_snapshot": {
+                    key: job.get(key)
+                    for key in ("job_id", "title", "company", "location",
+                                "url", "posted_text", "workplace",
+                                "easy_apply")
+                },
                 "entail_cache": {},
                 "generation": {
                     "model": db.get_state("pinned_model"),
@@ -236,6 +246,12 @@ async def run_package(package_id: int) -> str:
         # next stage starts: the LLM-bearing fit paths (cover condense,
         # trim revalidation) never re-run once their document is
         # recorded — a restart recompiles the persisted state instead.
+        # Everything after generation renders and publishes against the
+        # PINNED job card, not the live row — a search refresh that
+        # rewrites company/title/URL without moving the JD hash must not
+        # leak into the greeting, output path, or job.md.
+        job_snap = stage.get("job_snapshot") or job
+
         cache = stage.get("entail_cache", {})
         if "resume_fit" not in stage:
             _transition(package_id, "fitting")
@@ -248,7 +264,7 @@ async def run_package(package_id: int) -> str:
         if "cover_fit" not in stage:
             _transition(package_id, "fitting")
             cover_fit = await page_limit.fit_cover(
-                stage["tailored"], profile, ledger, cache, job,
+                stage["tailored"], profile, ledger, cache, job_snap,
                 workdir / "cover")
             stage["cover_fit"] = page_limit.fit_state(cover_fit)
             if cover_fit.condensed:  # the one LLM call inside fitting
@@ -277,7 +293,7 @@ async def run_package(package_id: int) -> str:
         resume_res = page_limit.compile_resume_state(
             stage["resume_fit"], profile, workdir / "resume")
         cover_res = page_limit.compile_cover_state(
-            stage["cover_fit"], profile, job, workdir / "cover")
+            stage["cover_fit"], profile, job_snap, workdir / "cover")
         if resume_res.pages > limit or cover_res.pages != 1:
             raise page_limit.FitError(
                 f"assertion failed: resume {resume_res.pages}/{limit} "
@@ -296,7 +312,7 @@ async def run_package(package_id: int) -> str:
             raise page_limit.ValidationFailed(failures)
 
         _transition(package_id, "publishing")
-        final_dir = output_dir_for(job, package_id)
+        final_dir = output_dir_for(job_snap, package_id)
         tmp_dir = final_dir.with_name(final_dir.name + ".publishing")
         # Both names are exclusive to THIS package id — anything already
         # there is this package's own interrupted publish, never another
@@ -309,7 +325,7 @@ async def run_package(package_id: int) -> str:
         shutil.copy2(cover_res.pdf_path, tmp_dir / "cover_letter.pdf")
         gen = stage["generation"]
         (tmp_dir / "job.md").write_text(
-            _job_md(job, stage.get("jd_snapshot") or "", gen["score"]))
+            _job_md(job_snap, stage.get("jd_snapshot") or "", gen["score"]))
         tmp_dir.rename(final_dir)  # single-step publish into a fresh name
         shutil.rmtree(workdir, ignore_errors=True)
 
@@ -317,18 +333,26 @@ async def run_package(package_id: int) -> str:
         # LLM call actually used), never from completion-time state —
         # only the compile facts (engines, pages) and the template
         # versions come from this process, because this process really
-        # did render and compile the shipped PDFs.
+        # did render and compile the shipped PDFs. Each stage records
+        # its OWN model: recovery between stages can legitimately switch
+        # engines, and the record must say which call ran on which.
         val = stage["validation"]
-        repair_effort = (val.get("effort_repair")
-                         or (stage["cover_fit"].get("condense") or {}).get("effort"))
         provenance = {
-            "model": gen["model"],
+            "llm_calls": {
+                "generation": {"model": gen["model"],
+                               "effort": gen["effort"],
+                               "prompt_version": gen["prompt_version"],
+                               "schema_version": gen["schema_version"]},
+                "entailment": {"model": val["model"],
+                               "effort": val["effort_entail"]},
+                # null = that call never ran for this package.
+                "truth_repair": ({"model": val["model"],
+                                  "effort": val["effort_repair"]}
+                                 if val.get("repaired") else None),
+                "cover_condense": stage["cover_fit"].get("condense"),
+            },
             "engine_resume": resume_res.engine,
             "engine_cover": cover_res.engine,
-            "efforts": {"tailor": gen["effort"],
-                        "entail": val["effort_entail"],
-                        # None = no repair-tier call was ever made.
-                        "repair": repair_effort},
             "prompt_version": gen["prompt_version"],
             "schema_version": gen["schema_version"],
             "template_version": template.TEMPLATE_VERSION,

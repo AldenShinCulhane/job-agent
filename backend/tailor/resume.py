@@ -16,8 +16,9 @@ from backend.core import llm
 # in a way that makes previously generated packages non-comparable.
 # v2: cover-letter closing became application-owned (removed from the
 # schema so no unvalidated LLM text can reach the rendered PDF).
+# schema v3: skills_order requires unique category names.
 PROMPT_VERSION = 2
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Keep prompts bounded: descriptions beyond this are truncated with a
 # marker (the requirements extraction already captured the essentials).
@@ -96,8 +97,10 @@ TAILOR_SCHEMA = {
             "minItems": len(SECTIONS),
             "maxItems": len(SECTIONS),
         },
-        # Skill CATEGORY names in tailored order — no new skills, ever.
-        "skills_order": {"type": "array", "items": {"type": "string"}},
+        # Skill CATEGORY names in tailored order — no new skills, ever,
+        # and no duplicates (a repeated name would duplicate the group).
+        "skills_order": {"type": "array", "items": {"type": "string"},
+                         "uniqueItems": True},
         "experiences": _ENTRY_BULLETS,
         "projects": _ENTRY_BULLETS,
         # The closing/signature is application-owned (cover.CLOSING) —
@@ -200,7 +203,12 @@ def tailored_profile(profile: dict, tailored: dict) -> dict:
     order = tailored.get("skills_order") or []
     groups = merged.get("skills", [])
     by_name = {g["category"]: g for g in groups}
-    reordered = [by_name[name] for name in order if name in by_name]
-    reordered += [g for g in groups if g["category"] not in set(order)]
+    seen: set[str] = set()
+    reordered = []
+    for name in order:  # schema + validator forbid duplicates; belt here
+        if name in by_name and name not in seen:
+            reordered.append(by_name[name])
+            seen.add(name)
+    reordered += [g for g in groups if g["category"] not in seen]
     merged["skills"] = reordered
     return merged

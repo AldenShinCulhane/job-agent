@@ -747,7 +747,7 @@ async def test_package_end_to_end_publishes_and_never_regenerates(
     assert prov["engine_resume"] == "fake" and prov["resume_pages"] == 1
     assert prov["cover_pages"] == 1 and prov["prompt_version"] >= 2
     assert prov["page_limit"] == 1  # the pinned limit, not a live read
-    assert prov["efforts"]["tailor"] == "high"
+    assert prov["llm_calls"]["generation"]["effort"] == "high"
     assert prov["template_version"] >= 1
     assert generate_calls == ["p1"] and entail_calls == ["entail"]
 
@@ -1022,6 +1022,7 @@ async def test_restart_during_cover_condense_reuses_persisted_fits(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
+    db.set_state("pinned_model", "claude-fable-5")
     pkg, _ = db.create_package("p1", version, "hash-a")
 
     def pages(tex):
@@ -1076,13 +1077,21 @@ async def test_restart_during_cover_condense_reuses_persisted_fits(
     assert "cover_fit" not in row["stage"]
     assert generate_calls == ["p1"] and resume_fit_calls == [1]
 
-    # "Restart": only the interrupted condense re-runs.
+    # "Restart" — on a recovered engine running a DIFFERENT model: only
+    # the interrupted condense re-runs, and provenance must attribute
+    # each stage's call to the model that actually made it.
+    db.set_state("pinned_model", "claude-opus-5")
     release.set()
     assert await tailor_pipeline.run_package(pkg) == "done"
     assert generate_calls == ["p1"]  # generation never repeated
     assert resume_fit_calls == [1]  # resume fit never repeated
     assert len(condense_calls) == 2  # the interrupted one, once more
-    assert db.get_package(pkg)["provenance"]["cover_pages"] == 1
+    prov = db.get_package(pkg)["provenance"]
+    assert prov["cover_pages"] == 1
+    assert prov["llm_calls"]["generation"]["model"] == "claude-fable-5"
+    assert prov["llm_calls"]["entailment"]["model"] == "claude-fable-5"
+    assert prov["llm_calls"]["cover_condense"] == {"model": "claude-opus-5",
+                                                   "effort": "xhigh"}
 
 
 @pytest.mark.parametrize("interrupt_at", ["asserting", "publishing"])
@@ -1511,10 +1520,116 @@ async def test_provenance_and_jobmd_publish_from_snapshots(
 
     assert await tailor_pipeline.run_package(pkg) == "done"
     row = db.get_package(pkg)
-    prov = row["provenance"]
-    assert prov["model"] == "claude-fable-5"  # what generation used
-    assert prov["efforts"] == {"tailor": "high", "entail": "medium",
-                               "repair": None}  # no repair-tier call ran
+    calls = row["provenance"]["llm_calls"]
+    assert calls["generation"]["model"] == "claude-fable-5"  # at call time
+    assert calls["generation"]["effort"] == "high"
+    assert calls["entailment"] == {"model": "claude-fable-5",
+                                   "effort": "medium"}
+    assert calls["truth_repair"] is None  # never ran for this package
+    assert calls["cover_condense"] is None
     job_md = (Path(row["output_dir"]) / "job.md").read_text()
     assert "77.7" in job_md and "Original overlap" in job_md
     assert "33.3" not in job_md and "Different reasons" not in job_md
+
+
+# --- Review round 3: job-card pinning, worker cancel, skills dedupe ----------
+
+async def test_job_card_change_after_generation_stays_pinned(
+    test_db, tmp_path, monkeypatch
+):
+    """A search refresh can rewrite company/title/URL without moving the
+    JD hash. Everything after generation — cover greeting, output path,
+    job.md — must describe the pinned card, not the refreshed one."""
+    import asyncio
+    from pathlib import Path
+
+    from backend.tailor import page_limit as pl
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    pkg, _ = db.create_package("p1", version, "hash-a")
+    _tailor_env(monkeypatch, tmp_path)
+
+    tripped = []
+    original_fit = pl.fit_resume
+
+    async def dying_fit(*args, **kwargs):
+        if not tripped:
+            tripped.append(1)
+            raise asyncio.CancelledError  # crash right after generation
+        return await original_fit(*args, **kwargs)
+
+    monkeypatch.setattr(pl, "fit_resume", dying_fit)
+    with pytest.raises(asyncio.CancelledError):
+        await tailor_pipeline.run_package(pkg)
+    row = db.get_package(pkg)
+    assert row["status"] == "fitting"
+    assert row["stage"]["job_snapshot"]["company"] == "Example Widgets Inc."
+
+    # The refresh: same job id, same description hash, new card fields.
+    db.upsert_job({"job_id": "p1", "title": "Renamed Role",
+                   "company": "Renamed Corp",
+                   "url": "https://www.linkedin.com/jobs/view/p1-renamed/"})
+    calls = _fake_compiler(monkeypatch, lambda tex: 1)  # fresh tex capture
+    assert await tailor_pipeline.run_package(pkg) == "done"
+
+    row = db.get_package(pkg)
+    assert "Example_Widgets_Inc" in row["output_dir"]
+    assert "Renamed" not in row["output_dir"]
+    job_md = (Path(row["output_dir"]) / "job.md").read_text()
+    assert "Example Widgets Inc." in job_md
+    assert "Backend Engineer" in job_md
+    assert "linkedin.com/jobs/view/p1/" in job_md
+    assert "Renamed" not in job_md
+    cover_tex = next(tex for name, tex in calls if name == "cover_letter")
+    assert "Example Widgets Inc" in cover_tex  # pinned greeting
+    assert "Renamed" not in cover_tex
+
+
+async def test_profile_confirm_cancels_package_worker(test_db, monkeypatch):
+    """Confirming a profile supersedes every old-profile package — the
+    in-flight worker is cancelled (no wasted high-effort spend) and the
+    surviving queue restarts."""
+    import asyncio
+
+    from backend.api import routes
+
+    version = db.save_profile(PROFILE)
+    monkeypatch.setattr(routes, "_validate_profile", lambda p: None)
+    monkeypatch.setattr(routes, "_ensure_preview", lambda v, p: None)
+    monkeypatch.setattr(routes, "_cancel_pipeline", lambda: None)
+    monkeypatch.setattr(routes, "_maybe_resume_scoring", lambda: False)
+    resumed = []
+    monkeypatch.setattr(routes, "_maybe_resume_packages",
+                        lambda: resumed.append(True) or True)
+    worker = asyncio.get_running_loop().create_task(asyncio.sleep(30))
+    monkeypatch.setattr(routes, "_package_worker_task", worker)
+
+    await routes.confirm_profile({"version": version})
+    await asyncio.gather(worker, return_exceptions=True)
+    assert worker.cancelled()  # in-flight spend stopped
+    assert resumed == [True]  # surviving queue restarted
+
+
+def test_skills_order_duplicates_rejected_everywhere():
+    """Schema forbids duplicate categories, the deterministic validator
+    flags them, and the renderer never duplicates a group even if both
+    somehow miss."""
+    from jsonschema import Draft202012Validator, ValidationError
+
+    from backend.tailor import resume as tailor_resume
+    from backend.tailor import validate
+
+    dup = _tailored(skills_order=["Tools", "Tools"])
+    with pytest.raises(ValidationError):
+        Draft202012Validator(tailor_resume.TAILOR_SCHEMA).validate(dup)
+
+    ledger, _ = _ledger_and_ids()
+    failures = validate.deterministic_failures(dup, PROFILE, ledger)
+    assert any(f["claim_id"] == "skills_order"
+               and "duplicate" in f["reason"] for f in failures)
+
+    merged = tailor_resume.tailored_profile(PROFILE, dup)
+    assert [g["category"] for g in merged["skills"]] == ["Tools", "Languages"]

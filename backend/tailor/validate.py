@@ -59,11 +59,14 @@ def deterministic_failures(tailored: dict, profile: dict,
         failures.append({"claim_id": "section_order",
                          "reason": f"not a permutation of {tailor_resume.SECTIONS}"})
     categories = {g["category"] for g in profile.get("skills", [])}
-    unknown = [name for name in tailored.get("skills_order", [])
-               if name not in categories]
+    skills_order = tailored.get("skills_order", [])
+    unknown = [name for name in skills_order if name not in categories]
     if unknown:
         failures.append({"claim_id": "skills_order",
                          "reason": f"unknown skill categories: {unknown}"})
+    if len(skills_order) != len(set(skills_order)):
+        failures.append({"claim_id": "skills_order",
+                         "reason": "duplicate skill categories"})
     for key in ("experiences", "projects"):
         available = len(profile.get(key, []))
         seen: set[int] = set()

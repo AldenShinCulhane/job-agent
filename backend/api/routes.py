@@ -214,6 +214,13 @@ async def confirm_profile(body: dict):
     # (deterministic-only when requirements are already cached; no LLM).
     _cancel_pipeline()
     _maybe_resume_scoring()
+    # Same for a package worker: confirm_profile just superseded every
+    # old-profile package, so an in-flight high-effort call would spend
+    # subscription time on a row it can no longer finish. Cancel, then
+    # restart whatever survived (packages already pinned to this
+    # version resume from their persisted stages).
+    _cancel_package_worker()
+    _maybe_resume_packages()
     return {"ok": True, "version": version}
 
 
@@ -590,6 +597,17 @@ def _maybe_resume_scoring() -> bool:
 _package_worker_task: asyncio.Task | None = None
 _package_retry_task: asyncio.Task | None = None
 _PACKAGE_INPUTS_POLL_S = 300.0
+
+
+def _cancel_package_worker() -> None:
+    """Stop in-flight package LLM spend whose inputs were just
+    superseded. The reference is dropped so a replacement can spawn
+    immediately; the cancelled task unwinds on its own (run_package
+    leaves the row's persisted state untouched on cancellation)."""
+    global _package_worker_task
+    if _package_worker_task is not None and not _package_worker_task.done():
+        _package_worker_task.cancel()
+    _package_worker_task = None
 
 
 def _spawn_package_worker() -> bool:
