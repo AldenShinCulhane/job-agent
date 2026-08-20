@@ -4,10 +4,9 @@ A local web app that turns your resume + a LinkedIn job search into tailored,
 LaTeX-typeset application packages — a resume and cover letter PDF per job,
 with strict page-limit enforcement and no fabricated claims.
 
-> **Status: v2 in development.** The engine, setup, and app skeleton work
-> (M0). Resume ingestion, LinkedIn search, scoring UI, and package
-> generation are being built — see `PLAN.md` for the full spec and
-> milestones.
+> **Status: v2 functional.** Resume ingestion, LinkedIn search, scoring,
+> and package generation are complete and live-tested end to end
+> (milestones M0–M4 in `PLAN.md`); polish (M5) is in progress.
 
 ## What it does
 
@@ -25,6 +24,28 @@ with strict page-limit enforcement and no fabricated claims.
    never one line over), and drops finished PDFs in `output/`.
 
 The app stops at PDFs. You click Apply yourself.
+
+## Screenshots
+
+*(All screenshots show sample data, not a real person or real LinkedIn
+postings.)*
+
+Confirm your extracted profile with a live LaTeX preview:
+
+![Profile onboarding with live preview](docs/screenshots/profile.png)
+
+Scored jobs, selection, and generated packages:
+
+![Search results with scores and packages](docs/screenshots/search.png)
+
+Settings — resume page limit, engine health, LaTeX engines:
+
+![Settings page](docs/screenshots/settings.png)
+
+When something needs you, a banner says exactly what and why — the app
+never sits silently and never asks for mid-run approvals:
+
+![Recovery banners](docs/screenshots/recovery.png)
 
 ## Quick start
 
@@ -119,9 +140,20 @@ bullets and cover-letter paragraphs must cite the source facts they rely
 on, and a validator checks that each cited fact actually supports the
 claim — after generation *and* after every page-fitting rewrite. New
 employers, degrees, dates, skills, or metrics that aren't in your resume
-are rejected and repaired. A package that can't pass validation or meet
-your page limit **fails** rather than shipping something oversized or
-untrue.
+are rejected and repaired (up to two bounded repair rounds). A package
+that can't pass validation or meet your page limit **fails** rather than
+shipping something oversized or untrue.
+
+## When something stops
+
+Every stop state is autonomous-by-default and visible: a banner explains
+what happened and the way out. Claude usage limit → pauses and resumes
+itself; Claude sign-in expired → banner with the login command
+(Settings has a re-check button); LinkedIn checkpoint → search stops
+cleanly, you solve it in the browser window and press Resume; LinkedIn
+session expired → reconnect from the Search tab. Interrupted work —
+including a killed server mid-generation — resumes from its last
+checkpoint without repeating paid LLM calls.
 
 ## Development
 
