@@ -47,6 +47,18 @@ def resume_page_limit() -> int:
         return 1
 
 
+# Truth repair is bounded: at most this many repair rounds over a
+# package's whole life. The append-only call ledger is the durable
+# attempt counter, so a restart resumes with the rounds already spent —
+# it can never grant extra ones.
+MAX_REPAIR_ROUNDS = 2
+
+
+def _repair_rounds(stage: dict) -> int:
+    return sum(1 for entry in stage.get("llm_calls", [])
+               if entry["call"] == "truth_repair")
+
+
 def _slug(text: str) -> str:
     parts = re.findall(r"[A-Za-z0-9]+", text or "")
     return "_".join(parts)[:40] or "package"
@@ -243,12 +255,14 @@ async def run_package(package_id: int) -> str:
             failures = await validate.validate(stage["tailored"], profile,
                                                ledger, cache,
                                                record=record_entailment)
-            if failures:
+            while failures and _repair_rounds(stage) < MAX_REPAIR_ROUNDS:
                 repaired = await validate.repair(stage["tailored"], failures,
                                                  profile, ledger)
                 # The repaired JSON and its call metadata persist in ONE
                 # write, BEFORE revalidation — an interruption here can
-                # never make the record claim the repair didn't happen.
+                # never make the record claim the repair didn't happen,
+                # and the ledger entry is what caps the round count
+                # across restarts.
                 stage["tailored"] = repaired
                 stage.setdefault("llm_calls", []).append({
                     "call": "truth_repair",
@@ -261,10 +275,12 @@ async def run_package(package_id: int) -> str:
                                                    record=record_entailment)
             stage["entail_cache"] = cache
             if failures:
+                rounds = _repair_rounds(stage)
                 detail = "; ".join(
                     f"{f['claim_id']}: {f['reason']}" for f in failures[:5])
                 _transition(package_id, "failed", stage=stage,
-                            error=f"truth validation failed after repair: {detail}")
+                            error=f"truth validation failed after {rounds} "
+                                  f"repair round(s): {detail}")
                 return "failed"
             stage["validated_sha"] = _content_sha(stage["tailored"])
             _transition(package_id, "fitting", stage=stage)

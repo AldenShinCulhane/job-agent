@@ -7,8 +7,10 @@ cited pair across both documents — not separate redundant QA prompts.
 Verdicts are cached by (claim text, cited facts) content hash so a
 revalidation after a pure trim (no text changed) costs zero LLM calls.
 
-Rejection → one repair round (xhigh) → revalidate → still failing →
-package failed. Source IDs are internal metadata only.
+Rejection → bounded repair rounds (xhigh, capped by the pipeline's
+MAX_REPAIR_ROUNDS via the durable call ledger) → revalidate after each
+→ still failing → package failed. Source IDs are internal metadata
+only.
 """
 
 import hashlib
@@ -238,8 +240,9 @@ _REPAIR_SYSTEM = (
 
 async def repair(tailored: dict, failures: list[dict], profile: dict,
                  ledger: dict) -> dict:
-    """One xhigh repair round: returns a full corrected tailored JSON
-    (same schema), which the caller must revalidate."""
+    """One xhigh repair pass: returns a full corrected tailored JSON
+    (same schema), which the caller must revalidate. The pipeline bounds
+    how many passes a package may spend."""
     facts = "\n".join(f"- {fid}: {entry['text']}" for fid, entry in ledger.items())
     prompt = (
         f"# Failed validation\n{json.dumps(failures, indent=1)}\n\n"

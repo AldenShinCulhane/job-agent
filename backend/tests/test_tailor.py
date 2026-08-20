@@ -921,8 +921,10 @@ async def test_validation_failure_after_repair_fails_package(
     monkeypatch.setattr(validate_mod, "repair", fake_repair)
     assert await tailor_pipeline.run_package(pkg) == "failed"
     row = db.get_package(pkg)
-    assert repairs == [1]  # exactly one repair round
-    assert "truth validation failed after repair" in row["error"]
+    assert repairs == [1, 1]  # bounded: exactly two repair rounds, never more
+    ledger = [c["call"] for c in row["stage"]["llm_calls"]]
+    assert ledger.count("truth_repair") == 2
+    assert "truth validation failed after 2 repair round(s)" in row["error"]
     assert "fabricated metric" in row["error"]
 
 
@@ -1755,6 +1757,136 @@ async def test_repair_metadata_survives_revalidation_interruption(
     assert prov["llm_calls"][2] == {"call": "truth_repair",
                                     "model": "claude-fable-5",
                                     "effort": "xhigh"}
+
+
+def _two_round_structured(repair_docs, repair_calls, entail_fail_texts,
+                          fail_at=None, healed=None):
+    """Fake llm.structured for the bounded-repair tests: each repair call
+    pops the next doc from `repair_docs`; entailment supports every claim
+    whose text is not in `entail_fail_texts`; the `fail_at`-th entailment
+    call raises AuthRequired until `healed[0]` flips."""
+    from backend.core import llm
+
+    entail_n = [0]
+
+    async def fake_structured(prompt, schema, task, system_prompt=""):
+        if task == "repair":
+            repair_calls.append(1)
+            return repair_docs.pop(0)
+        assert task == "entail"
+        entail_n[0] += 1
+        if fail_at is not None and entail_n[0] == fail_at and not healed[0]:
+            raise llm.AuthRequired("Not logged in")
+        rows = [json.loads(line) for line in prompt.splitlines()
+                if line.startswith("{")]
+        return {"verdicts": [
+            {"claim_id": r["claim_id"],
+             "supported": r["claim"] not in entail_fail_texts,
+             "reason": "checked"}
+            for r in rows]}
+
+    return fake_structured
+
+
+async def test_second_repair_round_recovers_package(
+    test_db, tmp_path, monkeypatch
+):
+    """Round-7 change: a first repair that still fails validation gets
+    exactly one more xhigh round; a second repair that grounds the doc
+    lets the package finish instead of failing closed."""
+    from backend.core import llm
+    from backend.tailor import pipeline as tailor_pipeline
+    from backend.tailor import resume as tailor_resume
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    db.set_state("pinned_model", "claude-fable-5")
+    pkg, _ = db.create_package("p1", version, "hash-a")
+    _fake_compiler(monkeypatch, lambda tex: 1)
+    monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
+
+    fixed = _cited_tailored()[0]
+    broken = json.loads(json.dumps(fixed))
+    broken["experiences"][0]["bullets"][0]["text"] = "Claims too much impact"
+    half_fixed = json.loads(json.dumps(fixed))
+    half_fixed["experiences"][0]["bullets"][0]["text"] = "Still too much"
+
+    async def fake_generate(profile, ledger, job, requirements, breakdown,
+                            page_limit):
+        return broken
+
+    repair_calls = []
+    fake_structured = _two_round_structured(
+        [half_fixed, fixed], repair_calls,
+        {"Claims too much impact", "Still too much"})
+    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
+    monkeypatch.setattr(llm, "structured", fake_structured)
+
+    assert await tailor_pipeline.run_package(pkg) == "done"
+    assert repair_calls == [1, 1]
+    prov = db.get_package(pkg)["provenance"]
+    assert [c["call"] for c in prov["llm_calls"]] == [
+        "generation", "entailment", "truth_repair", "entailment",
+        "truth_repair", "entailment"]
+    assert prov["llm_calls"][4] == {"call": "truth_repair",
+                                    "model": "claude-fable-5",
+                                    "effort": "xhigh"}
+
+
+async def test_restart_after_second_repair_never_repeats_repairs(
+    test_db, tmp_path, monkeypatch
+):
+    """Round-7 change, durability leg: a crash after the second repair
+    returned (and checkpointed) resumes with both rounds already on the
+    ledger — the restart revalidates but never buys a third repair."""
+    from backend.core import llm
+    from backend.tailor import pipeline as tailor_pipeline
+    from backend.tailor import resume as tailor_resume
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    db.set_state("pinned_model", "claude-fable-5")
+    pkg, _ = db.create_package("p1", version, "hash-a")
+    _fake_compiler(monkeypatch, lambda tex: 1)
+    monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
+
+    fixed = _cited_tailored()[0]
+    broken = json.loads(json.dumps(fixed))
+    broken["experiences"][0]["bullets"][0]["text"] = "Claims too much impact"
+    half_fixed = json.loads(json.dumps(fixed))
+    half_fixed["experiences"][0]["bullets"][0]["text"] = "Still too much"
+
+    async def fake_generate(profile, ledger, job, requirements, breakdown,
+                            page_limit):
+        return broken
+
+    repair_calls, healed = [], [False]
+    # Entailment call 3 is the revalidation AFTER the second repair —
+    # the engine dies there, after the repair itself was checkpointed.
+    fake_structured = _two_round_structured(
+        [half_fixed, fixed], repair_calls,
+        {"Claims too much impact", "Still too much"},
+        fail_at=3, healed=healed)
+    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
+    monkeypatch.setattr(llm, "structured", fake_structured)
+
+    assert await tailor_pipeline.run_package(pkg) == "engine_blocked"
+    row = db.get_package(pkg)
+    assert repair_calls == [1, 1]
+    assert row["stage"]["tailored"] == fixed  # second repair checkpointed
+    assert [c["call"] for c in row["stage"]["llm_calls"]] == [
+        "generation", "entailment", "truth_repair", "entailment",
+        "truth_repair"]
+
+    healed[0] = True
+    assert await tailor_pipeline.run_package(pkg) == "done"
+    assert repair_calls == [1, 1]  # zero repeated repair calls
+    prov = db.get_package(pkg)["provenance"]
+    assert [c["call"] for c in prov["llm_calls"]] == [
+        "generation", "entailment", "truth_repair", "entailment",
+        "truth_repair", "entailment"]
 
 
 # --- Review round 5: verdicts persist with the checkpoint; condensed wins ----
