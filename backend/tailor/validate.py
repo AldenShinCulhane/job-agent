@@ -169,17 +169,25 @@ async def entailment_failures(claims: list[dict], ledger: dict,
     )
     result = await llm.structured(prompt, ENTAILMENT_SCHEMA, task="entail",
                                   system_prompt=_ENTAIL_SYSTEM)
-    if record is not None:
-        record("entailment")  # the call succeeded — checkpoint it now
     returned = {v["claim_id"]: v for v in result["verdicts"]}
+    # EVERY verdict enters the cache before the checkpoint fires — a
+    # claim the model skipped gets a cached NEGATIVE verdict (fail
+    # closed, stable across restarts). Only then does the recorder
+    # persist, so the ledger entry and the verdicts it paid for land in
+    # one transition: "entailment ran" can never be on record without
+    # its results, and a later kill never repeats this call.
     for key, claim in pending:
         verdict = returned.get(claim["claim_id"])
         if verdict is None:
-            failures.append({"claim_id": claim["claim_id"],
-                             "reason": "no entailment verdict returned"})
-            continue
-        cache[key] = {"supported": verdict["supported"],
-                      "reason": verdict["reason"]}
+            cache[key] = {"supported": False,
+                          "reason": "no entailment verdict returned"}
+        else:
+            cache[key] = {"supported": verdict["supported"],
+                          "reason": verdict["reason"]}
+    if record is not None:
+        record("entailment")
+    for key, claim in pending:
+        verdict = cache[key]
         if not verdict["supported"]:
             failures.append({"claim_id": claim["claim_id"],
                              "reason": verdict["reason"]})

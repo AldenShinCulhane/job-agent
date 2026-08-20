@@ -347,10 +347,12 @@ async def test_entailment_batches_caches_and_fails_closed(monkeypatch):
     assert "exp0:b0" in failed_ids  # unsupported verdict
     assert "cover:p1" in failed_ids  # missing verdict fails closed
 
-    # Cached verdicts make an unchanged-claims revalidation free.
+    # EVERY verdict was cached — including the negative one for the
+    # claim the model skipped — so revalidation is fully free and
+    # stable: same failures, zero LLM calls.
     failures2 = await validate.validate(tailored, PROFILE, ledger, cache)
-    assert calls == ["entail", "entail"]  # cover:p1 was never cached...
-    assert "exp0:b0" in {f["claim_id"] for f in failures2}  # ...but this hit cache
+    assert calls == ["entail"]  # no second call for anything
+    assert {"exp0:b0", "cover:p1"} <= {f["claim_id"] for f in failures2}
 
 
 async def test_validate_short_circuits_on_deterministic_failure(monkeypatch):
@@ -1753,6 +1755,144 @@ async def test_repair_metadata_survives_revalidation_interruption(
     assert prov["llm_calls"][2] == {"call": "truth_repair",
                                     "model": "claude-fable-5",
                                     "effort": "xhigh"}
+
+
+# --- Review round 5: verdicts persist with the checkpoint; condensed wins ----
+
+async def test_entailment_verdicts_persist_with_checkpoint(
+    test_db, tmp_path, monkeypatch
+):
+    """Round-5 blocker: the verdict cache fills BEFORE the entailment
+    ledger entry persists, so a kill mid-repair resumes from cached
+    verdicts — the already-successful entailment never re-runs, only the
+    interrupted repair does."""
+    import asyncio
+
+    from backend.core import llm
+    from backend.tailor import pipeline as tailor_pipeline
+    from backend.tailor import resume as tailor_resume
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    pkg, _ = db.create_package("p1", version, "hash-a")
+    _fake_compiler(monkeypatch, lambda tex: 1)
+    monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
+
+    fixed = _cited_tailored()[0]
+    broken = json.loads(json.dumps(fixed))
+    broken["experiences"][0]["bullets"][0]["text"] = "Claims too much impact"
+    entail_calls, entail_seen_at_repair = [], []
+    release = asyncio.Event()
+    repair_started = asyncio.Event()
+
+    async def fake_generate(profile, ledger, job, requirements, breakdown,
+                            page_limit):
+        return broken
+
+    async def fake_structured(prompt, schema, task, system_prompt=""):
+        if task == "repair":
+            entail_seen_at_repair.append(len(entail_calls))
+            repair_started.set()
+            await release.wait()
+            return fixed
+        assert task == "entail"
+        entail_calls.append(1)
+        bad = "Claims too much impact" in prompt
+        claim_ids = [json.loads(line)["claim_id"]
+                     for line in prompt.splitlines() if line.startswith("{")]
+        return {"verdicts": [
+            {"claim_id": cid, "supported": not (bad and cid == "exp0:b0"),
+             "reason": "checked"} for cid in claim_ids]}
+
+    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
+    monkeypatch.setattr(llm, "structured", fake_structured)
+
+    worker = asyncio.create_task(tailor_pipeline.run_package(pkg))
+    await asyncio.wait_for(repair_started.wait(), timeout=5)
+    worker.cancel()  # the kill: entailment succeeded, repair in flight
+    await asyncio.gather(worker, return_exceptions=True)
+
+    row = db.get_package(pkg)
+    assert row["status"] == "validating"
+    assert [c["call"] for c in row["stage"]["llm_calls"]] == [
+        "generation", "entailment"]  # repair never returned: no entry
+    cached = row["stage"]["entail_cache"].values()
+    assert any(not v["supported"] for v in cached)  # verdicts ON DISK
+
+    # Restart: cached verdicts carry the first validation — only the
+    # interrupted repair runs again.
+    release.set()
+    assert await tailor_pipeline.run_package(pkg) == "done"
+    assert entail_seen_at_repair == [1, 1]  # both repair starts saw ONE
+    assert len(entail_calls) == 2  # initial + post-repair only
+    prov = db.get_package(pkg)["provenance"]
+    assert [c["call"] for c in prov["llm_calls"]] == [
+        "generation", "entailment", "truth_repair", "entailment"]
+
+
+async def test_persisted_condense_authoritative_when_engine_changes(
+    test_db, tmp_path, monkeypatch
+):
+    """Round-5 Medium: recovery installs the paid condense output before
+    the first compile — even when a changed engine would now fit the
+    ORIGINAL letter, the shipped PDF carries the condensed text."""
+    from backend.core import llm
+    from backend.tailor import pipeline as tailor_pipeline
+    from backend.tailor import resume as tailor_resume
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    pkg, _ = db.create_package("p1", version, "hash-a")
+
+    def overflow_pages(tex):
+        if "Hiring Team" in tex:  # the cover letter
+            return 1 if "A short letter." in tex else 2
+        return 1
+    _fake_compiler(monkeypatch, overflow_pages)
+    monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
+
+    condense_calls, healed = [], [False]
+
+    async def fake_generate(profile, ledger, job, requirements, breakdown,
+                            page_limit):
+        return _cited_tailored()[0]
+
+    async def fake_structured(prompt, schema, task, system_prompt=""):
+        if task == "repair":
+            condense_calls.append(1)
+            return {"paragraphs": [
+                {"text": "A short letter.", "source_ids": []},
+                {"text": "Thanks.", "source_ids": []}]}
+        assert task == "entail"
+        if not healed[0] and "A short letter." in prompt:
+            raise llm.UsageExhausted("weekly limit reached")  # post-condense
+        claim_ids = [json.loads(line)["claim_id"]
+                     for line in prompt.splitlines() if line.startswith("{")]
+        return {"verdicts": [{"claim_id": cid, "supported": True,
+                              "reason": "ok"} for cid in claim_ids]}
+
+    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
+    monkeypatch.setattr(llm, "structured", fake_structured)
+
+    assert await tailor_pipeline.run_package(pkg) == "waiting_usage"
+    assert condense_calls == [1]
+    assert "cover_condensed" in db.get_package(pkg)["stage"]
+
+    # "Engine change": on the restarted process EVERYTHING fits one
+    # page — the original letter would compile fine now.
+    calls = _fake_compiler(monkeypatch, lambda tex: 1)
+    healed[0] = True
+    assert await tailor_pipeline.run_package(pkg) == "done"
+    assert condense_calls == [1]  # still exactly one paid condense
+    cover_texes = [tex for name, tex in calls if name == "cover_letter"]
+    assert cover_texes  # cover really compiled in the restarted process
+    assert all("A short letter." in tex for tex in cover_texes)
+    assert "I would love to join your team." not in cover_texes[-1]
+    row = db.get_package(pkg)
+    letter = row["stage"]["cover_fit"]["tailored"]["cover_letter"]
+    assert letter["paragraphs"][0]["text"] == "A short letter."
 
 
 def test_skills_order_duplicates_rejected_everywhere():

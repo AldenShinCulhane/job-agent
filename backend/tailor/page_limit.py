@@ -288,6 +288,22 @@ async def fit_cover(tailored: dict, profile: dict, ledger: dict,
     downstream failure can lose the spend."""
     tailored = json.loads(json.dumps(tailored))
     layout = cover_mod.DEFAULT_COVER_LAYOUT
+    condensed = False
+
+    if precondensed is not None:
+        # An already-paid condense output is AUTHORITATIVE: install it
+        # before the first compile, so a changed engine or template that
+        # now fits the original letter can never quietly ship content
+        # the condense call was paid to replace. Layout is recomputed
+        # freely below; the content is settled. Its claims still go
+        # through validation (cached verdicts make this free unless the
+        # original attempt died before they persisted).
+        tailored["cover_letter"] = precondensed
+        condensed = True
+        failures = await validate.validate(tailored, profile, ledger,
+                                           entail_cache, record=record)
+        if failures:
+            raise ValidationFailed(failures)
 
     def _compile(current_layout) -> latex.CompileResult:
         letter = tailored["cover_letter"]
@@ -296,7 +312,6 @@ async def fit_cover(tailored: dict, profile: dict, ledger: dict,
         return latex.compile_tex(tex, workdir, jobname="cover_letter")
 
     result = _compile(layout)
-    condensed = False
     if result.pages > 1:
         for step in cover_ladder(layout):
             layout = step
@@ -304,25 +319,20 @@ async def fit_cover(tailored: dict, profile: dict, ledger: dict,
             if result.pages == 1:
                 break
 
-    if result.pages > 1:
-        if precondensed is not None:
-            # The xhigh call already succeeded in a previous attempt —
-            # never pay for it twice (PLAN.md §4.6 no-duplicate-work).
-            shorter = precondensed
-        else:
-            letter = tailored["cover_letter"]
-            prompt = (
-                f"# Cover letter to shorten ({result.pages} pages; must be 1)\n"
-                f"{json.dumps(letter, indent=1)}\n\n"
-                "# Valid source_ids\n"
-                + "\n".join(f"- {fid}: {e['text']}" for fid, e in ledger.items())
-                + "\n\nReturn the shortened paragraphs."
-            )
-            shorter = await llm.structured(prompt, _CONDENSE_SCHEMA,
-                                           task="repair",
-                                           system_prompt=_CONDENSE_SYSTEM)
-            if on_condensed is not None:
-                on_condensed(shorter)  # checkpoint BEFORE revalidation
+    if result.pages > 1 and not condensed:
+        letter = tailored["cover_letter"]
+        prompt = (
+            f"# Cover letter to shorten ({result.pages} pages; must be 1)\n"
+            f"{json.dumps(letter, indent=1)}\n\n"
+            "# Valid source_ids\n"
+            + "\n".join(f"- {fid}: {e['text']}" for fid, e in ledger.items())
+            + "\n\nReturn the shortened paragraphs."
+        )
+        shorter = await llm.structured(prompt, _CONDENSE_SCHEMA,
+                                       task="repair",
+                                       system_prompt=_CONDENSE_SYSTEM)
+        if on_condensed is not None:
+            on_condensed(shorter)  # checkpoint BEFORE revalidation
         condensed = True
         tailored["cover_letter"] = shorter
         # Content rewrite: full revalidation before continuing.

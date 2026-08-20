@@ -236,7 +236,10 @@ async def run_package(package_id: int) -> str:
         # flag, and the asserting stage re-checks it before publish.
         if stage.get("validated_sha") != _content_sha(stage["tailored"]):
             _transition(package_id, "validating")
-            cache = stage.get("entail_cache", {})
+            # setdefault: the recorder persists `stage`, so the cache the
+            # entailment pass mutates must already live inside it — the
+            # ledger entry and its verdicts land in the same write.
+            cache = stage.setdefault("entail_cache", {})
             failures = await validate.validate(stage["tailored"], profile,
                                                ledger, cache,
                                                record=record_entailment)
@@ -276,7 +279,7 @@ async def run_package(package_id: int) -> str:
         # leak into the greeting, output path, or job.md.
         job_snap = stage.get("job_snapshot") or job
 
-        cache = stage.get("entail_cache", {})
+        cache = stage.setdefault("entail_cache", {})
         if "resume_fit" not in stage:
             _transition(package_id, "fitting")
             resume_fit = await page_limit.fit_resume(
