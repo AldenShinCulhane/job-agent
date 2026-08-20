@@ -162,9 +162,33 @@ async function toJson<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>
 }
 
+export interface Settings {
+  resume_page_limit: number
+  engine: EngineStatus
+  latex_engines: string[]
+}
+
+export interface ProbeResult {
+  ok: boolean
+  verified: boolean
+  model?: string | null
+  error?: string
+  detail?: string
+  engine?: EngineStatus
+}
+
 export const api = {
   status: () =>
     fetch('/api/status').then(toJson<{ app: string; engine: EngineStatus }>),
+  getSettings: () => fetch('/api/settings').then(toJson<Settings>),
+  putSettings: (resumePageLimit: number) =>
+    fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ resume_page_limit: resumePageLimit }),
+    }).then(toJson<{ resume_page_limit: number }>),
+  reprobeEngine: () =>
+    fetch('/api/engine/reprobe', { method: 'POST' }).then(toJson<ProbeResult>),
   getProfile: () => fetch('/api/profile').then(toJson<ProfilePayload>),
   uploadResume: (file: File) => {
     const body = new FormData()

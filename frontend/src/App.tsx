@@ -1,44 +1,48 @@
 import { useEffect, useState } from 'react'
 import { api } from './api'
-import type { EngineStatus } from './api'
+import type { EngineStatus, LinkedInStatus } from './api'
+import { engineBadge } from './engineStatus'
+import RecoveryBanners from './RecoveryBanners'
 import Onboarding from './pages/Onboarding'
 import Search from './pages/Search'
+import Settings from './pages/Settings'
 
 const TABS = [
   { id: 'profile', label: 'Profile' },
   { id: 'search', label: 'Search' },
+  { id: 'settings', label: 'Settings' },
 ] as const
 
 type TabId = (typeof TABS)[number]['id']
 
-const STATUS_LABELS: Record<string, { label: string; tone: string }> = {
-  ok: { label: 'Claude ready', tone: 'bg-emerald-100 text-emerald-800' },
-  unprobed: { label: 'Claude not yet probed', tone: 'bg-slate-100 text-slate-600' },
-  waiting_usage_exhausted: {
-    label: 'Waiting — usage limit reached',
-    tone: 'bg-amber-100 text-amber-800',
-  },
-  auth_required: {
-    label: 'Sign in to Claude required',
-    tone: 'bg-rose-100 text-rose-800',
-  },
-  config_error: { label: 'Engine configuration error', tone: 'bg-rose-100 text-rose-800' },
-}
+const STATUS_POLL_MS = 20_000
 
 export default function App() {
   const [engine, setEngine] = useState<EngineStatus | null>(null)
+  const [linkedin, setLinkedin] = useState<LinkedInStatus | null>(null)
   const [tab, setTab] = useState<TabId>('profile')
 
   useEffect(() => {
-    api
-      .status()
-      .then((s) => setEngine(s.engine))
-      .catch(() => setEngine(null))
+    let alive = true
+    const poll = () => {
+      api
+        .status()
+        .then((s) => alive && setEngine(s.engine))
+        .catch(() => alive && setEngine(null))
+      api
+        .linkedinStatus()
+        .then((s) => alive && setLinkedin(s))
+        .catch(() => alive && setLinkedin(null))
+    }
+    poll()
+    const timer = setInterval(poll, STATUS_POLL_MS)
+    return () => {
+      alive = false
+      clearInterval(timer)
+    }
   }, [])
 
-  const badge = engine
-    ? (STATUS_LABELS[engine.status] ?? { label: engine.status, tone: 'bg-slate-100 text-slate-600' })
-    : null
+  const badge = engine ? engineBadge(engine.status) : null
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -59,6 +63,12 @@ export default function App() {
           </span>
         )}
       </header>
+      <RecoveryBanners
+        engine={engine}
+        linkedin={linkedin}
+        onOpenSettings={() => setTab('settings')}
+        onOpenSearch={() => setTab('search')}
+      />
       <nav className="border-b border-slate-200 bg-white px-8">
         <div className="mx-auto flex max-w-7xl gap-6">
           {TABS.map((t) => (
@@ -77,7 +87,7 @@ export default function App() {
         </div>
       </nav>
       <main className="mx-auto max-w-7xl p-8">
-        {tab === 'profile' ? <Onboarding /> : <Search />}
+        {tab === 'profile' ? <Onboarding /> : tab === 'search' ? <Search /> : <Settings />}
       </main>
     </div>
   )

@@ -95,6 +95,30 @@ async def reprobe_engine():
     return await probe_engine()
 
 
+@router.get("/settings")
+async def get_settings():
+    return {
+        "resume_page_limit": tailor_pipeline.resume_page_limit(),
+        "engine": llm.engine_status(),
+        "latex_engines": [name for name, _ in latex.available_engines()],
+    }
+
+
+@router.put("/settings")
+async def put_settings(body: dict):
+    limit = body.get("resume_page_limit")
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 3:
+        raise HTTPException(
+            status_code=422,
+            detail="resume_page_limit must be an integer between 1 and 3.",
+        )
+    # The limit is read once at gate 3 and pinned into each package's
+    # identity, so this change only shapes future selections — packages
+    # already created keep the limit they were born with.
+    db.set_state(tailor_pipeline.PAGE_LIMIT_KEY, str(limit))
+    return {"resume_page_limit": limit}
+
+
 @router.get("/events")
 async def events():
     return StreamingResponse(broker.stream(), media_type="text/event-stream")

@@ -82,3 +82,24 @@ def test_confirm_compiles_and_records_provenance(client):
     assert artifact["pages"] >= 1
     assert (routes.PREVIEW_DIR / f"v{version}" / "resume.pdf").is_file()
     assert client.get("/api/profile").json()["confirmed"] is True
+
+
+def test_settings_roundtrip_and_validation(client):
+    res = client.get("/api/settings")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["resume_page_limit"] == 1  # default
+    assert "status" in body["engine"]
+    assert isinstance(body["latex_engines"], list)
+
+    assert client.put("/api/settings", json={"resume_page_limit": 2}).status_code == 200
+    assert client.get("/api/settings").json()["resume_page_limit"] == 2
+
+    from backend.tailor import pipeline as tailor_pipeline
+
+    assert tailor_pipeline.resume_page_limit() == 2  # gate 3 reads this
+
+    for bad in (0, 4, "2", True, None):
+        res = client.put("/api/settings", json={"resume_page_limit": bad})
+        assert res.status_code == 422, bad
+    assert client.get("/api/settings").json()["resume_page_limit"] == 2
