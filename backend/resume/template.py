@@ -11,11 +11,15 @@ from dataclasses import dataclass
 
 # Recorded in package provenance; bump when this deterministic
 # transformation changes the rendered output.
-TEMPLATE_VERSION = 1
+TEMPLATE_VERSION = 2
 
 # Typographic normalization applied before escaping. pdfLaTeX (2018+) and
 # Tectonic both take UTF-8, but consistent ASCII punctuation renders
 # identically on both engines.
+#
+# A non-breaking space becomes an ordinary space: LaTeX's own `~` would be
+# the faithful translation, but everything here is escaped immediately
+# afterwards, so it would reach the page as a visible tilde.
 _TYPOGRAPHY = {
     "\u2014": "---",
     "\u2013": "--",
@@ -25,7 +29,7 @@ _TYPOGRAPHY = {
     "\u201d": "''",
     "\u2026": "...",
     "\u2022": "",
-    "\u00a0": "~",
+    "\u00a0": " ",
 }
 
 _ESCAPES = {
@@ -91,8 +95,15 @@ def _preamble(layout: Layout) -> str:
 % under pdfTeX; under XeTeX (what tectonic runs) it silently leaves the
 % document in Latin Modern, so load the same URW Helvetica clone as an
 % OpenType face at helvet's own 0.95 scale. Same look either way.
+%
+% T1 is not cosmetic here. In pdfTeX's default OT1 encoding the fonts have
+% no underscore and no ASCII tilde: `\_` is drawn as a rule and `\~{{}}` as
+% an accent, so neither reaches the text layer and an ATS reads "Rust_v2"
+% as "Rustv2". T1 has both as real glyphs, which extract as U+005F and
+% U+007E. XeTeX already gets them from the OpenType face.
 \usepackage{{iftex}}
 \ifPDFTeX
+  \usepackage[T1]{{fontenc}}
   \usepackage[scaled]{{helvet}}
 \else
   \usepackage{{fontspec}}

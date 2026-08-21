@@ -14,7 +14,7 @@ from backend.resume.template import latex_escape
 
 # Recorded in package provenance; bump when this deterministic
 # transformation changes the rendered output.
-TEMPLATE_VERSION = 1
+TEMPLATE_VERSION = 2
 
 # The only closing the app ever renders — LLM output has no say in it,
 # so it bypasses nothing by skipping truth validation.
@@ -52,6 +52,18 @@ def render_cover(profile: dict, job: dict, paragraphs: list[dict],
 
     return rf"""\documentclass[{layout.font_pt}pt,letterpaper]{{article}}
 \usepackage[margin={layout.margin_in}in]{{geometry}}
+% Same reason as the resume template: OT1 has no underscore and no ASCII
+% tilde, so pdfTeX draws them as a rule and an accent and they vanish from
+% the text layer an ATS reads. XeTeX gets them from its Unicode fonts.
+% Latin Modern comes with T1: this document has no font package of its
+% own, and T1 over stock Computer Modern falls back to Type 3 bitmaps
+% wherever cm-super is not installed — which would cost the text layer
+% far more than the two characters it just bought.
+\usepackage{{iftex}}
+\ifPDFTeX
+  \usepackage{{lmodern}}
+  \usepackage[T1]{{fontenc}}
+\fi
 \usepackage{{parskip}}
 \setlength{{\parskip}}{{{layout.par_skip_pt}pt}}
 \usepackage[hidelinks]{{hyperref}}

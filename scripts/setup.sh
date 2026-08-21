@@ -105,21 +105,22 @@ else
   fail "uv sync failed — re-run 'uv sync' manually to see the error"
 fi
 
-# The real question about a LaTeX engine: can it typeset THIS template?
+# The real question about a LaTeX engine: can it typeset THIS app's two
+# templates? A package is a resume AND a cover letter.
 # tectonic's first run also downloads its support bundle here, so a later
 # package generation is not the first time the network is needed.
 if [ -n "$LATEX_FOUND" ]; then
-  echo "  ...    test-compiling the resume template (tectonic's first run downloads its support bundle)"
+  echo "  ...    test-compiling the resume and cover-letter templates (tectonic's first run downloads its support bundle)"
   SMOKE_OUT=$(uv run python -m backend.tailor.smoke_pdf 2>&1)
   SMOKE_STATUS=$?
   printf '%s\n' "$SMOKE_OUT" | while IFS= read -r line; do
     [ -n "$line" ] && printf "         %s\n" "$line"
   done
   if [ "$SMOKE_STATUS" -eq 0 ]; then
-    ok "PDF generation (resume template compiles)"
+    ok "PDF generation (both templates compile, text layer readable)"
   else
     PDF_BROKEN=1
-    warn "no installed LaTeX engine can typeset the resume template — resume and cover-letter PDFs WILL fail. tectonic must be 0.17+ (0.16.x aborts on this template): macOS: brew install tectonic | Linux: https://tectonic-typesetting.github.io/install.html — or install a TeX Live pdflatex. Re-check with: uv run python -m backend.tailor.smoke_pdf"
+    warn "no installed LaTeX engine can typeset the app's templates — resume and cover-letter PDFs WILL fail. tectonic must be 0.17+ (0.16.x aborts on this template): macOS: brew install tectonic | Linux: https://tectonic-typesetting.github.io/install.html — or install a TeX Live pdflatex. Re-check with: uv run python -m backend.tailor.smoke_pdf"
   fi
 fi
 

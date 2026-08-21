@@ -78,6 +78,14 @@ def content_bounds(pdf_path: Path) -> list[dict | None]:
     measures at the page origin, y0 collapses to 0, and last-page
     fullness reads ~0.96 for any document — silently disabling the
     sparse-page balance pass on pdfTeX output.
+
+    The box is anchored to where each run STARTS: measuring how far a run
+    then advances would mean decoding font-encoded bytes against embedded
+    metrics. Vertically that is exact — a line's baseline and its ascent
+    are both at the start — and vertical is all `last_page_fullness`, the
+    only caller, asks for. Horizontally x1 is the rightmost run origin,
+    not the right edge of the ink, so a page whose lines all begin at the
+    same margin reports zero width.
     """
     bounds: list[dict | None] = []
     for page in PdfReader(str(pdf_path)).pages:

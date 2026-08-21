@@ -73,9 +73,10 @@ how to install it. The pieces:
 | Playwright Chromium | LinkedIn browser | installed by setup when needed |
 
 An installed LaTeX engine is not always a working one — Tectonic 0.16.x
-aborts on this template's fonts. Setup test-compiles the real template with
-every engine it finds and warns if none can produce a PDF. Re-check any time
-with:
+aborts on this template's fonts. Setup test-compiles both real templates —
+resume and cover letter — with every engine it finds, reads the text layer
+back to confirm the PDF is machine-readable, and warns if none can produce
+one. Re-check any time with:
 
 ```bash
 uv run python -m backend.tailor.smoke_pdf

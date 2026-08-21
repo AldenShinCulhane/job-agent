@@ -5,6 +5,7 @@ import json
 import pytest
 
 from backend.core import db
+from backend.tests.pdfbuild import one_page_pdf
 
 pytestmark = pytest.mark.anyio
 
@@ -636,42 +637,22 @@ async def test_fit_cover_ladder_then_condense_then_fail(tmp_path, monkeypatch):
         await page_limit.fit_cover(tailored, PROFILE, ledger, {}, JOB, tmp_path)
 
 
-def _one_page_pdf(content: str, width: int = 612, height: int = 792) -> bytes:
-    """A minimal, valid one-page PDF wrapping a literal content stream."""
-    body = content.encode("latin-1")
-    objects = [
-        b"<</Type/Catalog/Pages 2 0 R>>",
-        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
-        (f"<</Type/Page/Parent 2 0 R/MediaBox[0 0 {width} {height}]"
-         "/Resources<</Font<</F1 5 0 R>>>>/Contents 4 0 R>>").encode("latin-1"),
-        b"<</Length " + str(len(body)).encode() + b">>stream\n" + body + b"\nendstream",
-        b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
-    ]
-    out = bytearray(b"%PDF-1.4\n")
-    offsets = []
-    for number, obj in enumerate(objects, start=1):
-        offsets.append(len(out))
-        out += f"{number} 0 obj".encode() + obj + b"endobj\n"
-    xref = len(out)
-    out += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
-    for offset in offsets:
-        out += f"{offset:010d} 00000 n \n".encode()
-    out += (f"trailer<</Size {len(objects) + 1}/Root 1 0 R>>\n"
-            f"startxref\n{xref}\n%%EOF\n").encode()
-    return bytes(out)
-
-
 def test_content_bounds_ignores_a_rule_drawn_mid_line(tmp_path):
-    """Regression: pdfTeX renders an underscore (and every \\rule) as a
-    `q .. cm .. Q` block. Landing back in a text object after one used to
-    leave pypdf's memoized text matrix at the identity, so the following
-    run measured at the page origin, y0 collapsed to 0 and last-page
-    fullness read ~0.96 no matter what the page held. This content stream
-    is that exact shape, byte for byte in structure."""
+    """Regression: pdfTeX renders every `\\rule` as a `q .. cm .. Q`
+    block. Landing back in a text object after one used to leave pypdf's
+    memoized text matrix at the identity, so the following run measured
+    at the page origin, y0 collapsed to 0 and last-page fullness read
+    ~0.96 no matter what the page held. This content stream is that exact
+    shape, byte for byte in structure.
+
+    The template no longer feeds it an underscore to draw — T1 has a real
+    glyph — but rules themselves are not going anywhere, and the fix has
+    to hold for any PDF the fitter measures. Hence a hand-built page: no
+    engine, no encoding, just the shape."""
     from backend.tailor import page_limit
 
     pdf = tmp_path / "rule.pdf"
-    pdf.write_bytes(_one_page_pdf(
+    pdf.write_bytes(one_page_pdf(
         "BT\n/F1 12 Tf\n100 700 Td [(Top)] TJ\nET\n"
         "BT\n/F1 12 Tf\n100 500 Td [(Left)] TJ\nET\n"
         "q\n1 0 0 1 200 500 cm\n[]0 d 0 J 0.4 w 0 0 m 3 0 l S\nQ\n"
@@ -693,7 +674,7 @@ def test_content_bounds_skips_kerning_only_runs(tmp_path):
     from backend.tailor import page_limit
 
     pdf = tmp_path / "kern.pdf"
-    pdf.write_bytes(_one_page_pdf(
+    pdf.write_bytes(one_page_pdf(
         "BT\n/F1 12 Tf\n100 700 Td [(Top)] TJ\nET\n"
         "BT\n/F1 12 Tf\n100 100 Td [-278] TJ\nET\n"
     ))
@@ -762,9 +743,6 @@ def test_sample_resume_fullness_comes_from_its_real_content(tmp_path):
 
     if not latex.available_engines():
         pytest.skip("no LaTeX engine installed")
-    # The trigger is a rule drawn inside a text object; pdfTeX draws one
-    # for this underscore. Keep the fixture that exercises it.
-    assert "_" in SAMPLE_PROFILE["experiences"][0]["bullets"][0]
 
     result = latex.compile_tex(render(SAMPLE_PROFILE), tmp_path, jobname="resume")
     box = page_limit.content_bounds(result.pdf_path)[-1]

@@ -335,43 +335,97 @@ def test_sample_profile_compiles_to_one_page(tmp_path):
     assert result.pdf_path.stat().st_size > 1000
 
 
-@pytest.mark.skipif(
-    shutil.which("tectonic") is None and shutil.which("pdflatex") is None,
-    reason="no LaTeX engine installed",
-)
-def test_sample_profile_pdf_extracts_its_special_characters(tmp_path):
-    """The PDF has to carry readable Unicode, not just look right — an
-    ATS reads the text layer. pdfTeX gets that from glyphtounicode;
-    tectonic (XeTeX) gets it from the OpenType fonts, and nothing else
-    in the suite would notice a font swap that broke the mapping.
+_ENGINES = latex.available_engines()
 
-    Whitespace is engine-specific (kerning becomes spaces differently),
-    so compare with it removed. Two characters are deliberately absent
-    below: pdfTeX draws `\\_` as a rule and `\\~{}` as an accent, so those
-    two do not survive extraction on every engine.
+# Every character the escaper emits, in the strings that carry it, exactly
+# as the text layer must read them back once whitespace is removed. No
+# omissions: an ATS reads this, so a character that does not extract is a
+# character the resume does not contain as far as the employer's filter is
+# concerned.
+_RESUME_TEXT = (
+    "JaneDoe",
+    "AI&LLMSystems",                              # escaped ampersand
+    "jane@example.com",
+    "Acme&Sons{Ltd}",                             # escaped braces
+    "Cutcostsby50%usingC#&Rust_v2~magic~",        # percent, hash, _, ~
+    "Shipped3serviceswith99.9%uptime",
+    "Builta$100pipelinewith1-pageenforcement",    # escaped dollar
+    "Dean’sList",                                 # curly apostrophe
+    "Mar2024–Present",                            # en dash
+    "Python,TypeScript,C#",
+)
+
+_COVER_JOB = {"company": "Acme & Sons {Ltd}", "title": "Engineer"}
+_COVER_PARAGRAPHS = [
+    {"text": "I cut costs by 50% using C# & Rust_v2 ~magic~ for $100.",
+     "source_ids": []},
+    {"text": "Shipping 3 services at 99.9% uptime is the work I want more of.",
+     "source_ids": []},
+]
+_COVER_TEXT = (
+    "JaneDoe",
+    "jane@example.com",
+    "DearAcme&Sons{Ltd}HiringTeam,",
+    "Icutcostsby50%usingC#&Rust_v2~magic~for$100.",
+    "Sincerely,",
+)
+
+
+def _text_layer(engine: str, binary: str, tex: str, workdir, jobname: str) -> str:
+    """Compile with one named engine and return its text layer, packed.
+
+    Whitespace is engine-specific — the two engines turn kerning into
+    spaces differently — so it is stripped before comparison.
+
+    An engine that cannot typeset the template at all is skipped rather
+    than failed: that is a broken installation, not a template defect,
+    and `backend.tailor.smoke_pdf` (which setup.sh runs) is what reports
+    it loudly. This host's tectonic 0.16.9 is exactly that case; the
+    Linux container and the clean-environment run cover tectonic.
     """
     from pypdf import PdfReader
 
-    result = latex.compile_tex(render(SAMPLE_PROFILE), tmp_path, jobname="resume")
-    text = PdfReader(str(result.pdf_path)).pages[0].extract_text()
-    packed = "".join(text.split())
+    tex_path = workdir / f"{jobname}.tex"
+    tex_path.write_text(tex)
+    try:
+        result = latex.compile_with(engine, binary, tex_path, workdir, jobname,
+                                    timeout_s=latex.FIRST_RUN_TIMEOUT_S)
+    except latex.CompileError as exc:
+        pytest.skip(f"{engine} cannot typeset this template here: {exc}")
+    assert result.pages == 1
+    return "".join(PdfReader(str(result.pdf_path)).pages[0].extract_text().split())
 
-    for expected in (
-        "JaneDoe",
-        "AI&LLMSystems",                       # LaTeX-escaped ampersand
-        "jane@example.com",
-        "Acme&Sons{Ltd}",                      # escaped braces
-        "Cutcostsby50%usingC#&Rust",           # percent and hash
-        "Shipped3serviceswith99.9%uptime",
-        "Builta$100pipelinewith1-pageenforcement",   # escaped dollar
-        "Dean’sList",                          # curly apostrophe
-        "Mar2024–Present",                     # en dash
-        "Python,TypeScript,C#",
-    ):
-        assert expected in packed, f"{expected!r} missing from extracted text"
+
+@pytest.mark.parametrize("engine,binary", _ENGINES,
+                         ids=[name for name, _ in _ENGINES])
+def test_resume_pdf_text_layer_reads_back_on_every_engine(engine, binary, tmp_path):
+    """The PDF has to carry readable Unicode, not just look right.
+
+    Run per engine, not through the fallback chain: the two get their
+    Unicode mapping from different places (pdfTeX from T1 + glyphtounicode,
+    XeTeX from the OpenType face), so a break in one is invisible if the
+    other can answer for it.
+    """
+    packed = _text_layer(engine, binary, render(SAMPLE_PROFILE), tmp_path, "resume")
+    for expected in _RESUME_TEXT:
+        assert expected in packed, f"{expected!r} missing from {engine} text layer"
 
     # Markdown emphasis markers are rendered, never printed.
     assert "**" not in packed
+
+
+@pytest.mark.parametrize("engine,binary", _ENGINES,
+                         ids=[name for name, _ in _ENGINES])
+def test_cover_pdf_text_layer_reads_back_on_every_engine(engine, binary, tmp_path):
+    """A package is a resume AND a cover letter, and the cover letter has
+    its own preamble. Nothing else in the suite compiles it with a real
+    engine, so a cover-only encoding break would ship."""
+    from backend.tailor import cover
+
+    tex = cover.render_cover(SAMPLE_PROFILE, _COVER_JOB, _COVER_PARAGRAPHS)
+    packed = _text_layer(engine, binary, tex, tmp_path, "cover")
+    for expected in _COVER_TEXT:
+        assert expected in packed, f"{expected!r} missing from {engine} text layer"
 
 
 # --- engine smoke check (setup.sh's "can this engine build a resume?") ------
@@ -409,7 +463,50 @@ def test_engine_smoke_rejects_a_pdf_with_no_text_layer(tmp_path, monkeypatch):
         lambda *a, **k: latex.CompileResult(pdf_path=blank, pages=1, engine="fake"),
     )
     reason = smoke_pdf.check_engine("fake", "/fake/fake", tmp_path)
-    assert reason == "produced a PDF with no readable text layer"
+    assert reason == "resume: produced a PDF with no readable text layer"
+
+
+def test_engine_smoke_rejects_a_text_layer_missing_a_character(tmp_path, monkeypatch):
+    """The failure this round fixed was invisible to a page count and to
+    a "has some text" check: the page looked right and the text layer had
+    dropped the underscore. Setup has to catch that, so the smoke check
+    reads specific characters back."""
+    from backend.tailor import smoke_pdf
+    from backend.tests.pdfbuild import text_pdf
+
+    damaged = tmp_path / "damaged.pdf"
+    # What OT1 pdfTeX produced: the rule and the accent leave no character.
+    damaged.write_bytes(text_pdf("Cut costs with Rustv2 for $100 (2 hours)"))
+
+    monkeypatch.setattr(
+        smoke_pdf.latex, "compile_with",
+        lambda *a, **k: latex.CompileResult(pdf_path=damaged, pages=1, engine="fake"),
+    )
+    reason = smoke_pdf.check_engine("fake", "/fake/fake", tmp_path)
+    assert reason is not None
+    assert "Rust_v2" in reason and "$100(~2hours)" in reason
+    assert "ATS" in reason
+
+
+def test_engine_smoke_reports_a_cover_only_failure(tmp_path, monkeypatch):
+    """A package is both documents. An engine that builds the resume and
+    fails the cover letter ships nothing, so the check must not stop at
+    the resume."""
+    from backend.tailor import smoke_pdf
+    from backend.tests.pdfbuild import text_pdf
+
+    good = tmp_path / "good.pdf"
+    good.write_bytes(text_pdf("Cut costs with Rust_v2 for $100 (~2 hours)"))
+
+    def compile_with(engine, binary, tex_path, workdir, jobname, timeout_s=None):
+        if jobname == "cover":
+            raise latex.CompileError(f"{engine} failed (exit 1)", "! Undefined ...")
+        return latex.CompileResult(pdf_path=good, pages=1, engine=engine)
+
+    monkeypatch.setattr(smoke_pdf.latex, "compile_with", compile_with)
+    reason = smoke_pdf.check_engine("fake", "/fake/fake", tmp_path)
+    assert reason is not None
+    assert reason.startswith("cover: ") and "exit 1" in reason
 
 
 def test_engine_smoke_reports_no_engine_installed(monkeypatch, capsys):
