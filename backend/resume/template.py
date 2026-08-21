@@ -87,8 +87,19 @@ def _preamble(layout: Layout) -> str:
 \usepackage[english]{{babel}}
 \usepackage{{tabularx}}
 \usepackage{{fontawesome5}}
-\usepackage[scaled]{{helvet}}
-\input{{glyphtounicode}}
+% The sans face, per engine. helvet's Type 1 substitution only applies
+% under pdfTeX; under XeTeX (what tectonic runs) it silently leaves the
+% document in Latin Modern, so load the same URW Helvetica clone as an
+% OpenType face at helvet's own 0.95 scale. Same look either way.
+\usepackage{{iftex}}
+\ifPDFTeX
+  \usepackage[scaled]{{helvet}}
+\else
+  \usepackage{{fontspec}}
+  \setsansfont{{texgyreheros}}[Extension=.otf, Scale=0.95,
+    UprightFont=*-regular, BoldFont=*-bold, ItalicFont=*-italic,
+    BoldItalicFont=*-bolditalic]
+\fi
 
 \pagestyle{{fancy}}
 \fancyhf{{}}
@@ -113,8 +124,15 @@ def _preamble(layout: Layout) -> str:
 }}{{}}{{0em}}{{}}[\color{{black}}\titlerule \vspace{{-5pt}}]
 \titlespacing*{{\section}}{{0pt}}{{{layout.section_before_pt}pt}}{{{layout.section_after_pt}pt}}
 
-% Machine-readable / ATS-parsable PDF
-\pdfgentounicode=1
+% Machine-readable / ATS-parsable PDF. Both of these are pdfTeX
+% primitives: under XeTeX they are undefined, and touching them aborts the
+% whole compile ("! Undefined control sequence. \pdfglyphtounicode").
+% XeTeX gets the same property from the OpenType face above, which carries
+% its own Unicode mapping.
+\ifPDFTeX
+  \input{{glyphtounicode}}
+  \pdfgentounicode=1
+\fi
 
 \newcommand{{\resumeItem}}[1]{{
   \item\small{{

@@ -41,6 +41,12 @@ class ValidationFailed(Exception):
         self.failures = failures
 
 
+def _transform(matrix, x: float, y: float) -> tuple[float, float]:
+    """Apply a PDF affine matrix [a b c d e f] to a point."""
+    a, b, c, d, e, f = (float(v) for v in matrix[:6])
+    return a * x + c * y + e, b * x + d * y + f
+
+
 def content_bounds(pdf_path: Path) -> list[dict | None]:
     """Per-page content bounding box {x0, y0, x1, y1} from text
     coordinates (PDF user space, bottom-left origin); None for a page
@@ -56,12 +62,18 @@ def content_bounds(pdf_path: Path) -> list[dict | None]:
             nonlocal seen
             if not text.strip():
                 return
-            x, y = float(tm[4]), float(tm[5])
+            # Text-space -> user space via the text matrix, then user space
+            # -> page space via the current transformation matrix. Skipping
+            # the cm step only looks right for engines that leave it at
+            # identity: pdfTeX does, xdvipdfmx (XeTeX/tectonic) does not,
+            # and its pages then measure as a third as full as they are.
+            x, y = _transform(cm, *_transform(tm, 0.0, 0.0))
+            _, y_top = _transform(cm, *_transform(tm, 0.0, float(font_size or 0)))
             seen = True
             box["x0"] = min(box["x0"], x)
             box["y0"] = min(box["y0"], y)
             box["x1"] = max(box["x1"], x)
-            box["y1"] = max(box["y1"], y + float(font_size or 0))
+            box["y1"] = max(box["y1"], y_top)
 
         page.extract_text(visitor_text=visitor)
         bounds.append(box if seen else None)

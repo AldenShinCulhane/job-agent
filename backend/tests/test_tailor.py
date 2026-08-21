@@ -654,6 +654,35 @@ def test_content_bounds_measures_real_pdf(tmp_path):
     fullness = page_limit.last_page_fullness(result.pdf_path)
     assert 0.0 < fullness < 1.0
 
+    # Whatever engine produced it, the box is in page coordinates. XeTeX
+    # output measured a third of a page too short until the current
+    # transformation matrix was applied, and its box ran negative.
+    from pypdf import PdfReader
+
+    page = PdfReader(str(result.pdf_path)).pages[0]
+    width = float(page.mediabox.width)
+    height = float(page.mediabox.height)
+    assert 0 <= box["x0"] and box["x1"] <= width
+    assert 0 <= box["y0"] and box["y1"] <= height
+
+
+def test_pdf_matrix_transform_composes_translation_and_scale():
+    """content_bounds maps text-space points through the text matrix and
+    then the page CTM; pdfTeX leaves the CTM at identity, xdvipdfmx does
+    not, so the composition is what makes the two engines comparable."""
+    from backend.tailor.page_limit import _transform
+
+    identity = [1, 0, 0, 1, 0, 0]
+    assert _transform(identity, 3.0, 4.0) == (3.0, 4.0)
+    # Pure translation, as pdfTeX emits it.
+    assert _transform([1, 0, 0, 1, 72, 720], 0.0, 0.0) == (72.0, 720.0)
+    # Scale + translation, as xdvipdfmx emits it: a point one font-size up
+    # must land one scaled font-size up.
+    assert _transform([2, 0, 0, 2, 10, 20], 0.0, 5.0) == (10.0, 30.0)
+    # Composition order matters: text matrix first, then the CTM.
+    tm, cm = [1, 0, 0, 1, 100, 200], [1, 0, 0, 1, -36, -231]
+    assert _transform(cm, *_transform(tm, 0.0, 0.0)) == (64.0, -31.0)
+
 
 def test_packages_to_resume_excludes_terminal_states(test_db):
     """Restart recovery picks up mid-flight packages in batch order and
