@@ -163,6 +163,10 @@ flight at the moment of the kill runs again).
 uv run job-agent                        # backend + built frontend on :8700
 cd frontend && npm run dev              # optional: Vite dev server w/ HMR, proxies /api
 uv run python -m backend.tests.smoke_llm  # live engine smoke test (uses your subscription)
+
+# clean-Ubuntu fresh-clone test (setup -> build -> boot -> Chromium launch):
+docker run --rm -v "$PWD":/src:ro -v "$PWD/scripts/ci":/scratch:ro \
+  ubuntu:24.04 bash /scratch/ubuntu_freshclone.sh
 ```
 
 `PLAN.md` is the working spec. Architecture in short: FastAPI backend
