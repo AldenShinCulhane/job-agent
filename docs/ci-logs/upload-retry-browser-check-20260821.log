@@ -1,0 +1,4 @@
+[ok] failure shown inline; file input cleared for a same-file retry
+[ok] same-file retry reached the API and the app advanced
+provenance: head=b5e5525f440eeb353214d2ad9d493b088f7c7ce1 date=2026-08-21T18:29:07Z base_url=http://127.0.0.1:8700 os=darwin
+=== UPLOAD RETRY BROWSER CHECK PASS
