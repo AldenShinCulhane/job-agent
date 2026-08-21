@@ -706,8 +706,9 @@ def _maybe_resume_packages() -> bool:
 
 
 def _spawn_search(run_id: int) -> bool:
-    """One worker per run, ever: a second Start/Resume for a run that is
-    already being driven is a no-op. Returns whether a task was spawned."""
+    """At most one concurrent worker per run: a second Start/Resume for a
+    run that is already being driven is a no-op (a finished worker's slot
+    is reusable). Returns whether a task was spawned."""
     existing = _search_tasks.get(run_id)
     if existing is not None and not existing.done():
         return False

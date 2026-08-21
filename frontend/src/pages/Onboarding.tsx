@@ -198,7 +198,16 @@ export default function Onboarding() {
             accept=".pdf,.docx"
             className="hidden"
             disabled={busy !== null}
-            onChange={(e) => e.target.files?.[0] && upload(e.target.files[0])}
+            onChange={(e) => {
+              const file = e.target.files?.[0]
+              // Reset the input as soon as the file is captured: a failed
+              // upload (usage limit, unsupported file) leaves the same
+              // file selected, and re-picking it fires no change event —
+              // the retry would look dead. An empty value makes the next
+              // pick a real change, same file or not.
+              e.target.value = ''
+              if (file) upload(file)
+            }}
           />
         </label>
         {error && <p className="mt-4 text-sm text-rose-600">{error}</p>}
