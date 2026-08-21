@@ -7,7 +7,7 @@ v22.23.2
 uv 0.12.5 (aarch64-unknown-linux-gnu)
 Tectonic 0.17.0
 === [4/8] fresh clone + setup.sh
-provenance: cloned-from=/src ref=v2-linkedin-webapp head=a3f85d26ccfbb3f4d690dca0fe89b08a19f73b3a date=2026-08-21T22:34:04Z os=Ubuntu 24.04.4 LTS arch=aarch64
+provenance: cloned-from=/src ref=v2-linkedin-webapp head=9379441f62d6dc98aba52e5383859c2484e9fa3c date=2026-08-21T23:44:38Z os=Ubuntu 24.04.4 LTS arch=aarch64
 Job Agent setup
 
 1. Core toolchain
@@ -47,5 +47,5 @@ chromium launched, version: 151.0.7922.34
 === [8/8] backend test suite in this container
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-216 passed, 1 warning in 44.68s
+220 passed, 1 warning in 12.74s
 === UBUNTU FRESH-CLONE TEST PASS

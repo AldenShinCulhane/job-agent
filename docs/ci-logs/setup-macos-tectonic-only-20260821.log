@@ -1,6 +1,6 @@
 setup.sh with pdflatex removed from PATH — the reviewer's scenario: a machine whose ONLY LaTeX engine is a tectonic that cannot typeset this template (0.16.9).
 PATH holds symlinks to every Homebrew binary EXCEPT pdflatex/pdftex/xelatex/lualatex/latex, plus ~/.local/bin and the system dirs.
-provenance: repo=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=a3f85d26ccfbb3f4d690dca0fe89b08a19f73b3a date=2026-08-21T22:32:54Z os=macOS-26.6.1 arch=arm64 non-log-changes=0
+provenance: repo=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=9379441f62d6dc98aba52e5383859c2484e9fa3c date=2026-08-21T23:44:49Z os=macOS-26.6.1 arch=arm64 uncommitted-changes=0
 
 Job Agent setup
 
