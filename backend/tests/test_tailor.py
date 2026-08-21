@@ -1209,6 +1209,69 @@ async def test_package_pins_page_limit_at_creation(
     assert db.get_package(pkg)["provenance"]["page_limit"] == 2
 
 
+async def test_resumed_package_keeps_pinned_limit_after_settings_change(
+    test_db, tmp_path, monkeypatch
+):
+    """A package interrupted mid-flight and resumed AFTER a settings
+    change still fits against its pinned limit — the new global limit
+    shapes only packages selected after the change."""
+    from backend.api import routes
+    from backend.core import llm
+    from backend.tailor import page_limit as page_limit_mod
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    monkeypatch.setattr(routes, "_maybe_resume_packages", lambda: True)
+
+    db.set_state(tailor_pipeline.PAGE_LIMIT_KEY, "1")
+    pkg = (await routes.packages_generate({"job_ids": ["p1"]}))["package_ids"][0]
+    assert db.get_package(pkg)["page_limit"] == 1
+
+    generate_calls, _ = _tailor_env(monkeypatch, tmp_path)
+
+    async def dying_structured(prompt, schema, task, system_prompt=""):
+        raise llm.AuthRequired("Not logged in")
+
+    monkeypatch.setattr(llm, "structured", dying_structured)
+    assert await tailor_pipeline.run_package(pkg) == "engine_blocked"
+    parked = db.get_package(pkg)
+    assert parked["status"] == "queued"
+    assert "tailored" in parked["stage"]  # generation checkpointed
+
+    # The user raises the global limit while the package is parked.
+    db.set_state(tailor_pipeline.PAGE_LIMIT_KEY, "2")
+
+    async def healthy_structured(prompt, schema, task, system_prompt=""):
+        claim_ids = [json.loads(line)["claim_id"]
+                     for line in prompt.splitlines() if line.startswith("{")]
+        return {"verdicts": [{"claim_id": cid, "supported": True,
+                              "reason": "ok"} for cid in claim_ids]}
+
+    monkeypatch.setattr(llm, "structured", healthy_structured)
+    seen_limits = []
+    real_fit = page_limit_mod.fit_resume
+
+    async def spy_fit(tailored, profile, ledger, cache, limit, workdir, **kw):
+        seen_limits.append(limit)
+        return await real_fit(tailored, profile, ledger, cache, limit,
+                              workdir, **kw)
+
+    monkeypatch.setattr(page_limit_mod, "fit_resume", spy_fit)
+    assert await tailor_pipeline.run_package(pkg) == "done"
+    assert seen_limits == [1]  # pinned, not the new global
+    assert generate_calls == ["p1"]  # resume never regenerates
+    assert db.get_package(pkg)["provenance"]["page_limit"] == 1
+
+    # A NEW selection after the change pins the new limit.
+    second = await routes.packages_generate({"job_ids": ["p1"]})
+    assert second["created"] == 1
+    new_pkg = second["package_ids"][0]
+    assert new_pkg != pkg
+    assert db.get_package(new_pkg)["page_limit"] == 2
+
+
 async def test_package_waits_for_derived_inputs(test_db, tmp_path, monkeypatch):
     """A package selected before scoring finished waits — zero LLM spend,
     no permanent requirements=None package — and resumes once the

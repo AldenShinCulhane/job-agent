@@ -546,6 +546,30 @@ async def test_connect_reclaims_only_the_latest_run(test_db, no_delays, monkeypa
     assert db.get_search_run(old_run)["status"] == "stopped_auth"
 
 
+async def test_connect_reclaims_captcha_stopped_run(test_db, no_delays, monkeypatch):
+    """Gate 2 rule, checkpoint flavor: after the user solves the captcha
+    in the browser window and presses Connect, the stopped search resumes
+    by itself — one worker, no extra Resume click, no new gate."""
+    from backend.api import routes
+
+    run_id = _seed_orphaned_run()
+    db.update_search_run(run_id, status="stopped_captcha", message="checkpoint hit")
+
+    fake = FakeLifecycleSource(browser_pages=[SEARCH_FALLBACK_HTML, NO_RESULTS_HTML])
+    monkeypatch.setattr(routes.sources, "source", fake)
+    await routes._connect_only()
+
+    task = routes._search_tasks.get(run_id)
+    assert task is not None  # reclaimed automatically
+    assert routes._spawn_search(run_id) is False  # never a second driver
+    await task
+
+    run = db.get_search_run(run_id)
+    assert run["status"] == "done"
+    assert run["collected"] == 4  # resumed at the saved offset, no rework
+    assert run["message"] is None  # checkpoint banner cleared
+
+
 async def test_capped_run_resumes_on_startup_when_budget_available(
     test_db, no_delays, monkeypatch
 ):

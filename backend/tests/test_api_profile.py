@@ -110,3 +110,54 @@ def test_settings_roundtrip_and_validation(client):
         res = client.put("/api/settings", json={"resume_page_limit": bad})
         assert res.status_code == 422, bad
     assert client.get("/api/settings").json()["resume_page_limit"] == 2**31 - 1
+
+
+def test_status_polls_are_pure_and_cover_recovery_states(client, monkeypatch):
+    """The two 20-second polls behind the recovery banners — GET
+    /api/status and GET /api/linkedin/status — are read-only: no worker
+    spawn, no run resume, no engine-state write, in any app state. They
+    also carry every status value the banners key on."""
+    import sqlite3
+    from datetime import datetime, timedelta, timezone
+
+    from backend.api import routes
+    from backend.sources.linkedin.supervisor import supervisor
+
+    def snapshot():
+        with sqlite3.connect(db.DB_PATH) as conn:
+            return sorted(conn.execute("SELECT key, value FROM engine_state"))
+
+    tasks_before = dict(routes._search_tasks)
+
+    # Engine-side banner states surface verbatim on /api/status.
+    for status in ("auth_required", "config_error", "waiting_usage_exhausted"):
+        db.set_state("engine_status", status)
+        db.set_state("last_error", f"probe says {status}")
+        before = snapshot()
+        for _ in range(3):  # a poll is repeatable with zero side effects
+            body = client.get("/api/status").json()
+            assert body["engine"]["status"] == status
+            assert body["engine"]["last_error"] == f"probe says {status}"
+        assert snapshot() == before
+
+    # The usage countdown derives from persisted retry_at — polling never
+    # clears or rearms it.
+    retry_at = (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat()
+    db.set_state("retry_at", retry_at)
+    first = client.get("/api/status").json()["engine"]["retry_in_seconds"]
+    second = client.get("/api/status").json()["engine"]["retry_in_seconds"]
+    assert 0 < second <= first <= 120
+    assert db.get_state("retry_at") == retry_at
+
+    # LinkedIn-side banner states surface verbatim on /api/linkedin/status.
+    for state in ("captcha_stop", "logged_out"):
+        monkeypatch.setattr(supervisor, "state", state)
+        monkeypatch.setattr(supervisor, "detail", "checkpoint hit")
+        before = snapshot()
+        for _ in range(3):
+            body = client.get("/api/linkedin/status").json()
+            assert body == {"state": state, "detail": "checkpoint hit"}
+        assert snapshot() == before
+
+    # No poll ever started or resumed a worker.
+    assert dict(routes._search_tasks) == tasks_before
