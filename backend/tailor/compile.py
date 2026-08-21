@@ -14,6 +14,10 @@ from pathlib import Path
 from pypdf import PdfReader
 
 _COMPILE_TIMEOUT_S = 120
+# Tectonic downloads its support bundle during its first compile on a
+# machine, which is far slower than any later one. A setup-time check
+# must wait that out rather than report a working engine as broken.
+FIRST_RUN_TIMEOUT_S = 900
 
 
 class CompileError(Exception):
@@ -47,7 +51,8 @@ def page_count(pdf_path: Path) -> int:
     return len(PdfReader(str(pdf_path)).pages)
 
 
-def _run_engine(engine: str, binary: str, tex_path: Path, workdir: Path) -> str:
+def _run_engine(engine: str, binary: str, tex_path: Path, workdir: Path,
+                timeout_s: int = _COMPILE_TIMEOUT_S) -> str:
     if engine == "tectonic":
         commands = [[binary, "--outdir", str(workdir), str(tex_path)]]
     else:
@@ -62,12 +67,12 @@ def _run_engine(engine: str, binary: str, tex_path: Path, workdir: Path) -> str:
         # fallback loop in compile_tex never reaches the next engine.
         try:
             proc = subprocess.run(
-                command, capture_output=True, text=True, timeout=_COMPILE_TIMEOUT_S,
+                command, capture_output=True, text=True, timeout=timeout_s,
                 cwd=workdir,
             )
         except subprocess.TimeoutExpired:
             raise CompileError(
-                f"{engine} timed out after {_COMPILE_TIMEOUT_S}s", output[-2000:]
+                f"{engine} timed out after {timeout_s}s", output[-2000:]
             )
         except OSError as exc:
             raise CompileError(f"{engine} failed to launch: {exc}", output[-2000:])
@@ -78,11 +83,11 @@ def _run_engine(engine: str, binary: str, tex_path: Path, workdir: Path) -> str:
 
 
 def compile_with(engine: str, binary: str, tex_path: Path, workdir: Path,
-                 jobname: str) -> CompileResult:
+                 jobname: str, timeout_s: int = _COMPILE_TIMEOUT_S) -> CompileResult:
     """One engine, one attempt. Every failure mode — nonzero exit, no
     PDF, unreadable PDF — leaves as CompileError, so callers that iterate
     engines can treat them all the same way."""
-    output = _run_engine(engine, binary, tex_path, workdir)
+    output = _run_engine(engine, binary, tex_path, workdir, timeout_s)
     pdf_path = workdir / f"{jobname}.pdf"
     if not pdf_path.is_file():
         raise CompileError(f"{engine} produced no PDF", output[-2000:])

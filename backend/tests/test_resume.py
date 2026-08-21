@@ -215,7 +215,7 @@ def test_scanned_pdf_triggers_ocr_call(tmp_path, monkeypatch):
 
 # --- engine fallback ordering (no real engines involved) --------------------
 
-def _fake_engine_success(engine, binary, tex_path, workdir):
+def _fake_engine_success(engine, binary, tex_path, workdir, timeout_s=None):
     from pypdf import PdfWriter
 
     writer = PdfWriter()
@@ -229,7 +229,7 @@ def test_cached_engine_failure_falls_back_to_remaining_engines(tmp_path, monkeyp
     engines = [("tectonic", "/fake/tectonic"), ("pdflatex", "/fake/pdflatex")]
     calls: list[str] = []
 
-    def run(engine, binary, tex_path, workdir):
+    def run(engine, binary, tex_path, workdir, timeout_s=None):
         calls.append(engine)
         if engine == "tectonic":
             raise latex.CompileError("tectonic failed (exit -6)")
@@ -249,7 +249,7 @@ def test_cached_engine_tried_first(tmp_path, monkeypatch):
     engines = [("tectonic", "/fake/tectonic"), ("pdflatex", "/fake/pdflatex")]
     calls: list[str] = []
 
-    def run(engine, binary, tex_path, workdir):
+    def run(engine, binary, tex_path, workdir, timeout_s=None):
         calls.append(engine)
         return _fake_engine_success(engine, binary, tex_path, workdir)
 
@@ -298,7 +298,7 @@ def test_cached_engine_timeout_falls_back_to_remaining_engines(tmp_path, monkeyp
 def test_corrupt_pdf_falls_back_to_remaining_engines(tmp_path, monkeypatch):
     engines = [("tectonic", "/fake/tectonic"), ("pdflatex", "/fake/pdflatex")]
 
-    def run(engine, binary, tex_path, workdir):
+    def run(engine, binary, tex_path, workdir, timeout_s=None):
         if engine == "tectonic":
             # Engine "succeeds" but emits garbage — unreadable PDF.
             (workdir / f"{tex_path.stem}.pdf").write_bytes(b"not a pdf")
@@ -382,7 +382,7 @@ def test_engine_smoke_reports_a_failing_engine(tmp_path, monkeypatch):
     check compiles the real template, so setup can say so."""
     from backend.tailor import smoke_pdf
 
-    def boom(engine, binary, tex_path, workdir, jobname):
+    def boom(engine, binary, tex_path, workdir, jobname, timeout_s=None):
         raise latex.CompileError(f"{engine} failed (exit -6)", "note: Running TeX ...")
 
     monkeypatch.setattr(smoke_pdf.latex, "compile_with", boom)

@@ -53,7 +53,8 @@ def check_engine(engine: str, binary: str, workdir: Path) -> str | None:
     tex_path = workdir / "smoke.tex"
     tex_path.write_text(template.render(SMOKE_PROFILE))
     try:
-        result = latex.compile_with(engine, binary, tex_path, workdir, "smoke")
+        result = latex.compile_with(engine, binary, tex_path, workdir, "smoke",
+                                    timeout_s=latex.FIRST_RUN_TIMEOUT_S)
     except latex.CompileError as exc:
         tail = " | ".join(exc.log_tail.strip().splitlines()[-3:])
         return f"{exc}{' — ' + tail if tail else ''}"
