@@ -23,6 +23,18 @@ def test_db(tmp_path, monkeypatch):
     return db
 
 
+def _create_package(job_id, profile_version, jd_hash, page_limit=1):
+    """db.create_package pinned to the running code's template versions —
+    what the gate-3 route does, so recovery does not read these packages
+    as built by a superseded template."""
+    from backend.tailor import pipeline as tailor_pipeline
+
+    resume_tpl, cover_tpl = tailor_pipeline.template_versions()
+    return db.create_package(job_id, profile_version, jd_hash, page_limit,
+                             template_version=resume_tpl,
+                             cover_template_version=cover_tpl)
+
+
 def _seed_job(job_id="p1", jd_hash="hash-a"):
     db.upsert_job({
         "job_id": job_id, "title": "Backend Engineer",
@@ -37,23 +49,36 @@ def _seed_job(job_id="p1", jd_hash="hash-a"):
 # --- Package rows: identity, idempotence, state persistence ------------------
 
 def test_package_identity_is_job_profile_hash(test_db):
-    """One package per (job, profile version, JD hash): re-creating
-    returns the existing row; changed inputs create a new package."""
+    """One package per (job, profile version, JD hash, page limit,
+    template versions): re-creating returns the existing row; any
+    changed input creates a new package."""
     _seed_job()
-    pkg1, created1 = db.create_package("p1", 4, "hash-a")
-    pkg2, created2 = db.create_package("p1", 4, "hash-a")
+    pkg1, created1 = _create_package("p1", 4, "hash-a")
+    pkg2, created2 = _create_package("p1", 4, "hash-a")
     assert created1 is True and created2 is False
     assert pkg1 == pkg2
 
-    pkg3, created3 = db.create_package("p1", 5, "hash-a")  # new profile
-    pkg4, created4 = db.create_package("p1", 4, "hash-b")  # edited posting
-    assert created3 and created4
-    assert len({pkg1, pkg3, pkg4}) == 3
+    pkg3, created3 = _create_package("p1", 5, "hash-a")  # new profile
+    pkg4, created4 = _create_package("p1", 4, "hash-b")  # edited posting
+    pkg5, created5 = _create_package("p1", 4, "hash-a", 2)  # new page limit
+    # An upgraded resume template, then an upgraded cover template. Each
+    # is a different document, so each is a different package.
+    pkg6, created6 = db.create_package("p1", 4, "hash-a", 1,
+                                       template_version=99,
+                                       cover_template_version=1)
+    pkg7, created7 = db.create_package("p1", 4, "hash-a", 1,
+                                       template_version=99,
+                                       cover_template_version=99)
+    assert all([created3, created4, created5, created6, created7])
+    assert len({pkg1, pkg3, pkg4, pkg5, pkg6, pkg7}) == 6
+
+    row = db.get_package(pkg6)
+    assert row["template_version"] == 99 and row["cover_template_version"] == 1
 
 
 def test_package_update_and_stage_roundtrip(test_db):
     _seed_job()
-    pkg, _ = db.create_package("p1", 4, "hash-a")
+    pkg, _ = _create_package("p1", 4, "hash-a")
     row = db.get_package(pkg)
     assert row["status"] == "queued"
     assert row["stage"] == {} and row["provenance"] == {}
@@ -79,8 +104,8 @@ def test_package_update_and_stage_roundtrip(test_db):
 def test_list_packages_carries_job_display_fields(test_db):
     _seed_job("p1")
     _seed_job("p2", jd_hash="hash-b")
-    db.create_package("p1", 4, "hash-a")
-    db.create_package("p2", 4, "hash-b")
+    _create_package("p1", 4, "hash-a")
+    _create_package("p2", 4, "hash-b")
     rows = db.list_packages()
     assert [r["job_id"] for r in rows] == ["p2", "p1"]  # newest first
     assert rows[0]["company"] == "Example Widgets Inc."
@@ -791,7 +816,7 @@ def test_packages_to_resume_excludes_terminal_states(test_db):
         ("done", "failed", "generating", "queued", "waiting_usage"), start=1
     ):
         _seed_job(f"p{i}")
-        pkg, _ = db.create_package(f"p{i}", 4, "hash-a")
+        pkg, _ = _create_package(f"p{i}", 4, "hash-a")
         db.update_package(pkg, status=status)
     resumable = db.packages_to_resume()
     assert [p["job_id"] for p in resumable] == ["p3", "p4", "p5"]
@@ -860,7 +885,7 @@ async def test_package_end_to_end_publishes_and_never_regenerates(
                   breakdown={"match_reasons": ["Strong Python overlap"],
                              "gap_reasons": []})
     generate_calls, entail_calls = _tailor_env(monkeypatch, tmp_path)
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
 
     assert await tailor_pipeline.run_package(pkg) == "done"
     row = db.get_package(pkg)
@@ -889,6 +914,186 @@ async def test_package_end_to_end_publishes_and_never_regenerates(
     assert generate_calls == ["p1"] and entail_calls == ["entail"]
 
 
+def test_template_upgrade_makes_the_next_selection_a_new_package(
+    test_db, tmp_path, monkeypatch
+):
+    """A published package is immutable, so an improved template can only
+    reach a job the user already generated by making the next selection a
+    NEW package. Through the gate-3 route, end to end: v1 completes, the
+    templates advance, the same job/profile/posting/page-limit selection
+    creates a different package, the v1 row and its PDF are untouched,
+    and the new provenance records the new versions."""
+    import asyncio
+    from pathlib import Path
+
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from backend.api import routes
+    from backend.resume import template as resume_template
+    from backend.tailor import cover as cover_mod
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    generate_calls, _ = _tailor_env(monkeypatch, tmp_path)
+    # The route spawns the worker; this test drives the package itself so
+    # each run is observable.
+    monkeypatch.setattr(routes, "_maybe_resume_packages", lambda: None)
+    app = FastAPI()
+    app.include_router(routes.router, prefix="/api")
+    client = TestClient(app)
+
+    first = client.post("/api/packages/generate", json={"job_ids": ["p1"]})
+    assert first.status_code == 200 and first.json()["created"] == 1
+    v1 = first.json()["package_ids"][0]
+    assert asyncio.run(tailor_pipeline.run_package(v1)) == "done"
+
+    v1_row = db.get_package(v1)
+    assert v1_row["template_version"] == resume_template.TEMPLATE_VERSION
+    assert v1_row["cover_template_version"] == cover_mod.TEMPLATE_VERSION
+    v1_pdf = Path(v1_row["output_dir"]) / "resume.pdf"
+    v1_bytes = v1_pdf.read_bytes()
+    v1_updated, v1_prov = v1_row["updated_at"], v1_row["provenance"]
+
+    # Same inputs, same templates: still one package, nothing regenerated.
+    repeat = client.post("/api/packages/generate", json={"job_ids": ["p1"]})
+    assert repeat.json() == {"package_ids": [v1], "created": 0}
+
+    # The templates are upgraded (this round: T1 encoding, so the text
+    # layer carries characters the v1 documents dropped).
+    monkeypatch.setattr(resume_template, "TEMPLATE_VERSION",
+                        resume_template.TEMPLATE_VERSION + 1)
+    monkeypatch.setattr(cover_mod, "TEMPLATE_VERSION",
+                        cover_mod.TEMPLATE_VERSION + 1)
+
+    second = client.post("/api/packages/generate", json={"job_ids": ["p1"]})
+    v2 = second.json()["package_ids"][0]
+    assert second.json()["created"] == 1 and v2 != v1
+    assert asyncio.run(tailor_pipeline.run_package(v2)) == "done"
+    assert generate_calls == ["p1", "p1"]  # genuinely rebuilt, not reused
+
+    # The v1 package is history: same status, same row, same bytes.
+    old = db.get_package(v1)
+    assert old["status"] == "done" and old["updated_at"] == v1_updated
+    assert old["provenance"] == v1_prov
+    assert old["template_version"] == resume_template.TEMPLATE_VERSION - 1
+    assert v1_pdf.read_bytes() == v1_bytes
+
+    new = db.get_package(v2)
+    assert new["output_dir"] != old["output_dir"]
+    assert new["template_version"] == resume_template.TEMPLATE_VERSION
+    assert new["provenance"]["template_version"] == resume_template.TEMPLATE_VERSION
+    assert (new["provenance"]["cover_template_version"]
+            == cover_mod.TEMPLATE_VERSION)
+
+
+def test_template_upgrade_supersedes_only_unfinished_packages(
+    test_db, tmp_path, monkeypatch
+):
+    """Startup after an upgrade: a package queued under the old templates
+    would otherwise finish by rendering the new ones into a row whose
+    identity says otherwise. It is superseded with a way out; the done
+    package beside it is untouched and still downloadable."""
+    from backend.api import routes
+    from backend.resume import template as resume_template
+    from backend.tailor import cover as cover_mod
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_job("p2", jd_hash="hash-b")
+    _seed_derived("p1", version)
+    finished, _ = _create_package("p1", version, "hash-a")
+    db.update_package(finished, status="done", output_dir="/tmp/old-package")
+    unfinished, _ = _create_package("p2", version, "hash-b")
+    db.update_package(unfinished, status="generating")
+
+    monkeypatch.setattr(resume_template, "TEMPLATE_VERSION",
+                        resume_template.TEMPLATE_VERSION + 1)
+    monkeypatch.setattr(cover_mod, "TEMPLATE_VERSION",
+                        cover_mod.TEMPLATE_VERSION + 1)
+    monkeypatch.setattr(routes.sources.source, "current_state", lambda: "idle")
+    monkeypatch.setattr(routes, "_package_worker_task", None)
+    monkeypatch.setattr(routes, "_maybe_resume_packages", lambda: None)
+
+    routes.recover_search_runs()
+
+    stale = db.get_package(unfinished)
+    assert stale["status"] == "failed"
+    assert "re-select the job" in stale["error"]
+    kept = db.get_package(finished)
+    assert kept["status"] == "done" and kept["output_dir"] == "/tmp/old-package"
+    assert kept["error"] is None
+
+
+def test_package_identity_migration_keeps_published_rows(tmp_path, monkeypatch):
+    """Databases written before the template versions joined package
+    identity hold real packages whose PDFs are on disk. The migration
+    rebuilds the table without losing one, pinning each row to the
+    versions its own provenance records — or to 1 where it predates the
+    record."""
+    import sqlite3
+
+    monkeypatch.setattr(db, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "legacy.sqlite3")
+    db.init()
+
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.executescript("""
+        DROP TABLE packages;
+        CREATE TABLE packages (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id          TEXT NOT NULL,
+            profile_version INTEGER NOT NULL,
+            jd_hash         TEXT NOT NULL,
+            page_limit      INTEGER NOT NULL DEFAULT 1,
+            status          TEXT NOT NULL DEFAULT 'queued',
+            stage_json      TEXT,
+            error           TEXT,
+            retry_count     INTEGER NOT NULL DEFAULT 0,
+            provenance_json TEXT,
+            output_dir      TEXT,
+            created_at      TEXT NOT NULL,
+            updated_at      TEXT NOT NULL,
+            UNIQUE (job_id, profile_version, jd_hash, page_limit)
+        );
+    """)
+    conn.execute(
+        "INSERT INTO packages (id, job_id, profile_version, jd_hash, "
+        "page_limit, status, provenance_json, output_dir, created_at, "
+        "updated_at) VALUES (7, 'p1', 4, 'hash-a', 1, 'done', ?, "
+        "'/out/p1', 't0', 't1')",
+        (json.dumps({"template_version": 1, "cover_template_version": 1,
+                     "resume_pages": 1}),),
+    )
+    conn.execute(
+        "INSERT INTO packages (id, job_id, profile_version, jd_hash, "
+        "page_limit, status, created_at, updated_at) "
+        "VALUES (8, 'p2', 4, 'hash-b', 2, 'queued', 't0', 't1')"
+    )
+    conn.commit()
+    conn.close()
+
+    db.init()  # the upgrade
+
+    kept = db.get_package(7)
+    assert kept["status"] == "done" and kept["output_dir"] == "/out/p1"
+    assert kept["provenance"]["resume_pages"] == 1
+    assert kept["template_version"] == 1 and kept["cover_template_version"] == 1
+    predating = db.get_package(8)
+    assert predating["page_limit"] == 2 and predating["status"] == "queued"
+    assert predating["template_version"] == 1
+    assert {row["id"] for row in db.list_packages()} <= {7, 8}
+
+    # And identity is genuinely wider now: same four old inputs, newer
+    # templates, new row.
+    fresh, created = db.create_package("p1", 4, "hash-a", 1,
+                                       template_version=2,
+                                       cover_template_version=2)
+    assert created is True and fresh != 7
+
+
 async def test_restart_mid_batch_completes_without_duplicate_generation(
     test_db, tmp_path, monkeypatch
 ):
@@ -906,7 +1111,7 @@ async def test_restart_mid_batch_completes_without_duplicate_generation(
     for i in (1, 2, 3):
         _seed_job(f"p{i}")
         _seed_derived(f"p{i}", version)
-        pkg, _ = db.create_package(f"p{i}", version, "hash-a")
+        pkg, _ = _create_package(f"p{i}", version, "hash-a")
         packages.append(pkg)
     generate_calls, _ = _tailor_env(monkeypatch, tmp_path)
 
@@ -953,7 +1158,7 @@ async def test_batch_failure_is_isolated_to_its_package(
     for i in (1, 2, 3):
         _seed_job(f"p{i}")
         _seed_derived(f"p{i}", version)
-        pkg, _ = db.create_package(f"p{i}", version, "hash-a")
+        pkg, _ = _create_package(f"p{i}", version, "hash-a")
         packages.append(pkg)
 
     def behavior(job):
@@ -979,7 +1184,7 @@ async def test_usage_exhausted_is_durable_and_batch_resumes(
     for i in (1, 2, 3):
         _seed_job(f"p{i}")
         _seed_derived(f"p{i}", version)
-        pkg, _ = db.create_package(f"p{i}", version, "hash-a")
+        pkg, _ = _create_package(f"p{i}", version, "hash-a")
         packages.append(pkg)
     healed = False
 
@@ -1013,7 +1218,7 @@ async def test_usage_retry_timer_resumes_batch_without_manual_kick(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
 
     calls = []
 
@@ -1060,7 +1265,7 @@ async def test_engine_blocked_parks_package_queued_and_stops_batch(
     for i in (1, 2):
         _seed_job(f"p{i}")
         _seed_derived(f"p{i}", version)
-        pkg, _ = db.create_package(f"p{i}", version, "hash-a")
+        pkg, _ = _create_package(f"p{i}", version, "hash-a")
         packages.append(pkg)
 
     def behavior(job):
@@ -1084,7 +1289,7 @@ async def test_validation_failure_after_repair_fails_package(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
     _tailor_env(monkeypatch, tmp_path)
 
     async def always_failing(tailored, profile, ledger, cache, record=None):
@@ -1114,7 +1319,7 @@ async def test_package_fails_when_posting_changed_before_generation(
 
     version = _confirm_profile()
     _seed_job("p1")
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
     db.save_job_detail("p1", "Rewritten posting.", "hash-new")  # edited
     generate_calls, _ = _tailor_env(monkeypatch, tmp_path)
     assert await tailor_pipeline.run_package(pkg) == "failed"
@@ -1168,7 +1373,7 @@ async def test_publish_dirs_are_immutable_per_package(
     _seed_job("p1")
     _seed_derived("p1", version)
     _tailor_env(monkeypatch, tmp_path)
-    pkg1, _ = db.create_package("p1", version, "hash-a")
+    pkg1, _ = _create_package("p1", version, "hash-a")
     assert await tailor_pipeline.run_package(pkg1) == "done"
     dir1 = db.get_package(pkg1)["output_dir"]
     from pathlib import Path
@@ -1179,7 +1384,7 @@ async def test_publish_dirs_are_immutable_per_package(
     # The posting is edited: new hash, new derived inputs, new package.
     db.save_job_detail("p1", "New text.", "hash-b")
     _seed_derived("p1", version, jd_hash="hash-b")
-    pkg2, created = db.create_package("p1", version, "hash-b")
+    pkg2, created = _create_package("p1", version, "hash-b")
     assert created and pkg2 != pkg1
     assert await tailor_pipeline.run_package(pkg2) == "done"
     dir2 = db.get_package(pkg2)["output_dir"]
@@ -1208,7 +1413,7 @@ async def test_restart_during_cover_condense_reuses_persisted_fits(
     _seed_job("p1")
     _seed_derived("p1", version)
     db.set_state("pinned_model", "claude-fable-5")
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
 
     def pages(tex):
         if "Hiring Team" in tex:  # the cover letter
@@ -1300,7 +1505,7 @@ async def test_restart_after_fitting_needs_no_llm(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
     generate_calls, entail_calls = _tailor_env(monkeypatch, tmp_path)
 
     tripped = []
@@ -1459,7 +1664,7 @@ async def test_package_waits_for_derived_inputs(test_db, tmp_path, monkeypatch):
 
     version = _confirm_profile()
     _seed_job("p1")  # description cached, but no requirements/score yet
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
     generate_calls, _ = _tailor_env(monkeypatch, tmp_path)
 
     assert await tailor_pipeline.run_batch() == "waiting_inputs"
@@ -1510,7 +1715,7 @@ async def test_engine_blocked_packages_recover_automatically(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
 
     blocked = True
 
@@ -1572,7 +1777,7 @@ async def test_posting_change_mid_generation_supersedes_package(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
     _tailor_env(monkeypatch, tmp_path)
 
     release = asyncio.Event()
@@ -1597,7 +1802,7 @@ async def test_posting_change_mid_generation_supersedes_package(
     assert row["output_dir"] is None  # nothing stale was ever published
 
     # The new posting is a fresh input set — a new package is available.
-    pkg2, created = db.create_package("p1", version, "hash-new")
+    pkg2, created = _create_package("p1", version, "hash-new")
     assert created and pkg2 != pkg
 
 
@@ -1615,9 +1820,9 @@ async def test_profile_change_mid_fitting_supersedes_package(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
     _seed_job("p2", jd_hash="hash-a")  # no derived inputs: waits
-    waiting_pkg, _ = db.create_package("p2", version, "hash-a")
+    waiting_pkg, _ = _create_package("p2", version, "hash-a")
     _tailor_env(monkeypatch, tmp_path)
 
     release = asyncio.Event()
@@ -1652,7 +1857,7 @@ async def test_posting_change_leaves_done_packages_alone(
     _seed_job("p1")
     _seed_derived("p1", version)
     _tailor_env(monkeypatch, tmp_path)
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
     assert await tailor_pipeline.run_package(pkg) == "done"
 
     db.save_job_detail("p1", "Edited later.", "hash-later")
@@ -1674,7 +1879,7 @@ async def test_captcha_stop_does_not_block_package_recovery(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
     db.update_package(pkg, status="generating")  # died mid-generation
     _tailor_env(monkeypatch, tmp_path)
     monkeypatch.setattr(routes.sources.source, "current_state",
@@ -1702,7 +1907,7 @@ async def test_shipped_documents_must_match_cached_verdicts(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
     generate_calls, entail_calls = _tailor_env(monkeypatch, tmp_path)
 
     tripped = []
@@ -1750,7 +1955,7 @@ async def test_provenance_and_jobmd_publish_from_snapshots(
                   breakdown={"match_reasons": ["Original overlap"],
                              "gap_reasons": []})
     db.set_state("pinned_model", "claude-fable-5")
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
     _tailor_env(monkeypatch, tmp_path)
 
     tripped = []
@@ -1801,7 +2006,7 @@ async def test_job_card_change_after_generation_stays_pinned(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
     _tailor_env(monkeypatch, tmp_path)
 
     tripped = []
@@ -1882,7 +2087,7 @@ async def test_condense_survives_entailment_failure_without_respend(
     _seed_job("p1")
     _seed_derived("p1", version)
     db.set_state("pinned_model", "claude-fable-5")
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
 
     def pages(tex):
         if "Hiring Team" in tex:  # the cover letter
@@ -1951,7 +2156,7 @@ async def test_repair_metadata_survives_revalidation_interruption(
     _seed_job("p1")
     _seed_derived("p1", version)
     db.set_state("pinned_model", "claude-fable-5")
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
     _fake_compiler(monkeypatch, lambda tex: 1)
     monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
 
@@ -2044,7 +2249,7 @@ async def test_second_repair_round_recovers_package(
     _seed_job("p1")
     _seed_derived("p1", version)
     db.set_state("pinned_model", "claude-fable-5")
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
     _fake_compiler(monkeypatch, lambda tex: 1)
     monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
 
@@ -2090,7 +2295,7 @@ async def test_restart_after_second_repair_never_repeats_repairs(
     _seed_job("p1")
     _seed_derived("p1", version)
     db.set_state("pinned_model", "claude-fable-5")
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
     _fake_compiler(monkeypatch, lambda tex: 1)
     monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
 
@@ -2149,7 +2354,7 @@ async def test_entailment_verdicts_persist_with_checkpoint(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
     _fake_compiler(monkeypatch, lambda tex: 1)
     monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
 
@@ -2218,7 +2423,7 @@ async def test_persisted_condense_authoritative_when_engine_changes(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    pkg, _ = db.create_package("p1", version, "hash-a")
+    pkg, _ = _create_package("p1", version, "hash-a")
 
     def overflow_pages(tex):
         if "Hiring Team" in tex:  # the cover letter

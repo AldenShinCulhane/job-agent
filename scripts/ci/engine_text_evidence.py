@@ -18,6 +18,10 @@ Nothing here starts the app, touches `.data`, or calls the LLM.
 
 This host's own tectonic is 0.16.9, which aborts on the resume template;
 pass the 0.17.0 binary by path to reproduce the tectonic column.
+
+Exit codes: 0 every named engine typeset both documents and every
+required fragment came back · 1 something did not · 2 no engine to
+exercise.
 """
 
 import argparse
@@ -84,15 +88,22 @@ def old_fullness(pdf_path: Path) -> tuple[float, list[str]]:
 
 
 def report(kind: str, tex: str, engine: str, binary: str, expected: tuple,
-           workdir: Path) -> None:
+           workdir: Path) -> bool:
+    """Print the evidence for one document; True when it is good news.
+
+    A reproducer that always exits 0 proves nothing, so every way this
+    can go wrong — no engine, a failed compile, a page count that is not
+    1, a text layer missing a required fragment — has to reach the exit
+    status, not just the log.
+    """
     tex_path = workdir / f"{kind}.tex"
     tex_path.write_text(tex)
     try:
         result = latex.compile_with(engine, binary, tex_path, workdir, kind,
                                     timeout_s=latex.FIRST_RUN_TIMEOUT_S)
     except latex.CompileError as exc:
-        print(f"=== {engine} / {kind}: COMPILE FAILED — {exc}")
-        return
+        print(f"=== {engine} / {kind}: COMPILE FAILED — {exc}\n")
+        return False
 
     reader = PdfReader(str(result.pdf_path))
     height = float(reader.pages[-1].mediabox.height)
@@ -124,6 +135,7 @@ def report(kind: str, tex: str, engine: str, binary: str, expected: tuple,
     print(fonts.stdout.strip() if fonts.returncode == 0
           else "    (pdffonts not installed)")
     print()
+    return not missing and result.pages == 1
 
 
 def main() -> int:
@@ -134,6 +146,9 @@ def main() -> int:
     args = parser.parse_args()
     engines = [tuple(spec.split("=", 1)) for spec in args.engine] or \
         latex.available_engines()
+    if not engines:
+        print("no LaTeX engine to exercise — pass --engine NAME=BINARY")
+        return 2
 
     head = subprocess.run(["git", "-C", str(REPO), "rev-parse", "HEAD"],
                           capture_output=True, text=True).stdout.strip()
@@ -159,10 +174,17 @@ def main() -> int:
         ("cover", cover_mod.render_cover(SAMPLE_PROFILE, _COVER_JOB,
                                          _COVER_PARAGRAPHS), _COVER_TEXT),
     )
+    failures = []
     for engine, binary in engines:
         for kind, tex, expected in documents:
             with tempfile.TemporaryDirectory() as tmp:
-                report(kind, tex, engine, binary, expected, Path(tmp))
+                if not report(kind, tex, engine, binary, expected, Path(tmp)):
+                    failures.append(f"{engine}/{kind}")
+    if failures:
+        print(f"FAILED: {', '.join(failures)}")
+        return 1
+    print(f"OK: {len(engines)} engine(s) x {len(documents)} document(s), "
+          "every required text fragment present")
     return 0
 
 

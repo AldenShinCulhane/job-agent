@@ -85,20 +85,23 @@ CREATE TABLE IF NOT EXISTS job_scores (
     scored_at           TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS packages (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id          TEXT NOT NULL,
-    profile_version INTEGER NOT NULL,
-    jd_hash         TEXT NOT NULL,
-    page_limit      INTEGER NOT NULL DEFAULT 1,
-    status          TEXT NOT NULL DEFAULT 'queued',
-    stage_json      TEXT,
-    error           TEXT,
-    retry_count     INTEGER NOT NULL DEFAULT 0,
-    provenance_json TEXT,
-    output_dir      TEXT,
-    created_at      TEXT NOT NULL,
-    updated_at      TEXT NOT NULL,
-    UNIQUE (job_id, profile_version, jd_hash, page_limit)
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id                TEXT NOT NULL,
+    profile_version       INTEGER NOT NULL,
+    jd_hash               TEXT NOT NULL,
+    page_limit            INTEGER NOT NULL DEFAULT 1,
+    template_version      INTEGER NOT NULL DEFAULT 1,
+    cover_template_version INTEGER NOT NULL DEFAULT 1,
+    status                TEXT NOT NULL DEFAULT 'queued',
+    stage_json            TEXT,
+    error                 TEXT,
+    retry_count           INTEGER NOT NULL DEFAULT 0,
+    provenance_json       TEXT,
+    output_dir            TEXT,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL,
+    UNIQUE (job_id, profile_version, jd_hash, page_limit,
+            template_version, cover_template_version)
 );
 """
 
@@ -113,6 +116,34 @@ _MIGRATIONS = (
 )
 
 
+def _widen_package_identity(conn) -> None:
+    """Add the template versions to package identity, keeping every row.
+
+    SQLite cannot widen a UNIQUE constraint in place, and unlike the
+    page-limit change this table now holds real packages — their PDFs are
+    on disk and must stay exactly as published. So: rename, recreate,
+    copy across. Existing rows are pinned to the versions their own
+    provenance records, or to 1 when they predate that record; either
+    way they keep the identity they were built under, and a selection
+    made under newer templates becomes a new package instead of silently
+    returning the old documents.
+    """
+    conn.execute("ALTER TABLE packages RENAME TO packages_pre_tpl_version")
+    conn.executescript(_SCHEMA)
+    conn.execute(
+        "INSERT INTO packages (id, job_id, profile_version, jd_hash, "
+        "page_limit, template_version, cover_template_version, status, "
+        "stage_json, error, retry_count, provenance_json, output_dir, "
+        "created_at, updated_at) "
+        "SELECT id, job_id, profile_version, jd_hash, page_limit, "
+        "COALESCE(json_extract(provenance_json, '$.template_version'), 1), "
+        "COALESCE(json_extract(provenance_json, '$.cover_template_version'), 1), "
+        "status, stage_json, error, retry_count, provenance_json, "
+        "output_dir, created_at, updated_at FROM packages_pre_tpl_version"
+    )
+    conn.execute("DROP TABLE packages_pre_tpl_version")
+
+
 def init() -> None:
     DATA_DIR.mkdir(mode=0o700, exist_ok=True)
     os.chmod(DATA_DIR, 0o700)  # mkdir mode is subject to umask; enforce
@@ -125,7 +156,10 @@ def init() -> None:
                 conn.execute("PRAGMA table_info(packages)").fetchall()}
         if cols and "page_limit" not in cols:
             conn.execute("DROP TABLE packages")
+            cols = set()
         conn.executescript(_SCHEMA)
+        if cols and "template_version" not in cols:
+            _widen_package_identity(conn)
         for statement in _MIGRATIONS:
             try:
                 conn.execute(statement)
@@ -691,19 +725,25 @@ def get_action_count(day: str) -> int:
 
 # --- Packages (tailoring state machine, PLAN.md §4.5/§4.6) ------------------
 # A package is keyed by exactly the inputs its documents were built from:
-# (job_id, profile_version, jd_hash, page_limit). Re-selecting the same
-# job with the same inputs returns the existing row — a completed
-# package is never regenerated. A new profile version, an edited posting
-# (hash change), or a different page limit is a different package; the
+# (job_id, profile_version, jd_hash, page_limit, template_version,
+# cover_template_version). Re-selecting the same job with the same inputs
+# returns the existing row — a completed package is never regenerated. A
+# new profile version, an edited posting (hash change), a different page
+# limit, or an upgraded document template is a different package; the
 # limit is pinned at creation so a later settings change can never make
-# the generation prompt and the fitter disagree. `stage_json` persists
+# the generation prompt and the fitter disagree, and the template
+# versions are pinned for the same reason plus one more: a published
+# package is immutable, so the only way an improved template can reach a
+# job the user already generated is by making the next selection a new
+# package. `stage_json` persists
 # per-stage intermediate data (tailored JSON, validation verdicts,
 # fitted documents) so a restart resumes at the stage boundary instead
 # of re-spending LLM calls; `provenance_json` records what actually
 # built the artifacts (PLAN.md §4.6).
 
 _PACKAGE_COLUMNS = (
-    "id", "job_id", "profile_version", "jd_hash", "page_limit", "status",
+    "id", "job_id", "profile_version", "jd_hash", "page_limit",
+    "template_version", "cover_template_version", "status",
     "stage_json", "error", "retry_count", "provenance_json", "output_dir",
     "created_at", "updated_at",
 )
@@ -719,27 +759,60 @@ def _package_row_to_dict(row) -> dict:
 
 
 def create_package(job_id: str, profile_version: int, jd_hash: str,
-                   page_limit: int = 1) -> tuple[int, bool]:
-    """(package id, created). Idempotent per (job, profile, hash, page
-    limit): an existing package — whatever its status — is returned, not
-    duplicated."""
+                   page_limit: int = 1, *, template_version: int,
+                   cover_template_version: int) -> tuple[int, bool]:
+    """(package id, created). Idempotent per identity: an existing
+    package — whatever its status — is returned, not duplicated.
+
+    The template versions have no default on purpose. They are the
+    running code's, and a caller that forgets them would pin a package to
+    documents it was not built from.
+    """
     now = datetime.now(timezone.utc).isoformat()
+    identity = (job_id, profile_version, jd_hash, page_limit,
+                template_version, cover_template_version)
     with _connect() as conn:
         cursor = conn.execute(
             "INSERT INTO packages (job_id, profile_version, jd_hash, "
-            "page_limit, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(job_id, profile_version, jd_hash, page_limit) "
-            "DO NOTHING",
-            (job_id, profile_version, jd_hash, page_limit, now, now),
+            "page_limit, template_version, cover_template_version, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(job_id, profile_version, jd_hash, page_limit, "
+            "template_version, cover_template_version) DO NOTHING",
+            (*identity, now, now),
         )
         if cursor.rowcount > 0:
             return cursor.lastrowid, True
         row = conn.execute(
             "SELECT id FROM packages WHERE job_id = ? AND profile_version = ? "
-            "AND jd_hash = ? AND page_limit = ?",
-            (job_id, profile_version, jd_hash, page_limit),
+            "AND jd_hash = ? AND page_limit = ? AND template_version = ? "
+            "AND cover_template_version = ?", identity,
         ).fetchone()
         return row[0], False
+
+
+def supersede_outdated_template_packages(template_version: int,
+                                         cover_template_version: int) -> int:
+    """Fail unfinished packages pinned to superseded templates; returns
+    the count.
+
+    An upgrade can land between a package being queued and being built.
+    Finishing it would render the new templates into a row whose identity
+    says otherwise, and the provenance would disagree with the key. Same
+    treatment as a profile change: unfinished work is superseded, the
+    user re-selects, and done packages are history — untouched, still
+    downloadable, still exactly the documents they shipped.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    with _connect() as conn:
+        cursor = conn.execute(
+            "UPDATE packages SET status = 'failed', error = ?, updated_at = ? "
+            "WHERE (template_version != ? OR cover_template_version != ?) "
+            "AND status NOT IN ('done', 'failed')",
+            ("superseded: the document templates were upgraded before the "
+             "package finished; re-select the job to build a new package",
+             now, template_version, cover_template_version),
+        )
+        return cursor.rowcount
 
 
 def get_package(package_id: int) -> dict | None:

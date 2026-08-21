@@ -74,6 +74,14 @@ def test_typography_normalized():
     assert latex_escape("a—b–c ’d “e” •f") == "a---b--c 'd ``e'' f"
 
 
+def test_non_breaking_space_becomes_a_space_not_a_tilde():
+    r"""It used to normalize to LaTeX's `~`, which the escaping pass in
+    the same function then turned into `\textasciitilde{}` — so a resume
+    carrying a non-breaking space printed a visible tilde."""
+    assert latex_escape("10\u00a0GB in 5\u00a0min") == "10 GB in 5 min"
+    assert "textasciitilde" not in latex_escape("10\u00a0GB")
+
+
 def test_bold_markers_survive_escaping():
     assert rich("Shipped **3 services** & more") == r"Shipped \textbf{3 services} \& more"
 

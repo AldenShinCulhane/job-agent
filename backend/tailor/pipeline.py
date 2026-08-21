@@ -47,6 +47,12 @@ def resume_page_limit() -> int:
         return 1
 
 
+def template_versions() -> tuple[int, int]:
+    """(resume, cover) template versions of the running code — pinned
+    into package identity, and recorded again in provenance."""
+    return template.TEMPLATE_VERSION, cover_mod.TEMPLATE_VERSION
+
+
 # Truth repair is bounded: at most this many repair rounds over a
 # package's whole life. The append-only call ledger is the durable
 # attempt counter, so a restart resumes with the rounds already spent —

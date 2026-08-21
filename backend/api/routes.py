@@ -857,6 +857,15 @@ def recover_search_runs() -> list[int]:
     # when there is no stall. The package stall gets the same treatment.
     _arm_stall_recovery()
     _arm_package_stall_recovery()
+    # An upgrade can land between a package being queued and being built.
+    # Retire those before anything resumes them: their identity pins
+    # templates this code no longer renders. Done packages are history
+    # and stay exactly as published.
+    resume_tpl, cover_tpl = tailor_pipeline.template_versions()
+    retired = db.supersede_outdated_template_packages(resume_tpl, cover_tpl)
+    if retired:
+        log.info("superseded %d unfinished package(s) built for older "
+                 "document templates", retired)
     # Mid-flight packages resume before the captcha check too: tailoring
     # needs no browser, so a LinkedIn checkpoint must not strand a
     # package queue that was mid-generation when the process died.
@@ -1066,13 +1075,18 @@ async def packages_generate(body: dict):
     # The page limit is read ONCE here and pinned into each package's
     # identity — generation and fitting use only the pinned value, and a
     # later settings change makes a future selection a new package
-    # instead of silently returning this one.
+    # instead of silently returning this one. The document templates are
+    # pinned the same way: published packages are immutable, so a
+    # selection made after a template upgrade has to become a new package
+    # or the improvement could never reach a job already generated.
     limit = tailor_pipeline.resume_page_limit()
+    resume_tpl, cover_tpl = tailor_pipeline.template_versions()
     created = 0
     package_ids = []
     for job in jobs:
         package_id, was_created = db.create_package(
-            job["job_id"], version, job["description_hash"], limit)
+            job["job_id"], version, job["description_hash"], limit,
+            template_version=resume_tpl, cover_template_version=cover_tpl)
         package_ids.append(package_id)
         created += int(was_created)
     _maybe_resume_packages()
