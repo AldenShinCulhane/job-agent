@@ -55,6 +55,8 @@ and follow the Linux steps inside it).
 ```bash
 git clone <this-repo> && cd job-agent
 ./scripts/setup.sh                                    # checks/installs everything, tells you what's missing
+# If setup.sh had to install uv, this shell can't see it yet — open a new
+# terminal, or: export PATH="$HOME/.local/bin:$PATH"
 uv run python -m backend.core.claude_cli auth login   # sign in with your Claude subscription (first time only)
 uv run job-agent                                      # → http://127.0.0.1:8700
 ```

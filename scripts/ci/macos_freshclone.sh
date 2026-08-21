@@ -17,6 +17,9 @@
 # Port 8700 must be free — stop any running instance first.
 set -euo pipefail
 export TERM=dumb  # keep terminal escapes out of retained logs
+# setup.sh may install uv into ~/.local/bin; do what it tells the user to do
+# so the boot step below can find a freshly installed uv.
+export PATH="$HOME/.local/bin:$PATH"
 
 SRC="$(cd "$(dirname "$0")/../.." && pwd -P)"
 PARENT="${1:-${TMPDIR:-/tmp}}"
@@ -68,9 +71,18 @@ for _ in $(seq 1 40); do
 done
 
 echo "=== [4/5] health"
-echo "status:   $(curl -sf http://127.0.0.1:$PORT/api/status)"
-echo "settings: $(curl -sf http://127.0.0.1:$PORT/api/settings)"
-curl -sf "http://127.0.0.1:$PORT/" | head -c 60 && echo " ...HTML ok"
+# Each check must fail loudly: an empty answer printed as if it were data
+# would let a dead server look like a pass.
+STATUS=$(curl -sf "http://127.0.0.1:$PORT/api/status") || {
+  echo "FAIL: /api/status never answered"; echo "--- server log:"
+  tail -20 "$WORK/server.log"; exit 1; }
+echo "status:   $STATUS"
+SETTINGS=$(curl -sf "http://127.0.0.1:$PORT/api/settings") || {
+  echo "FAIL: /api/settings never answered"; exit 1; }
+echo "settings: $SETTINGS"
+HTML=$(curl -sf "http://127.0.0.1:$PORT/" | head -c 60) || {
+  echo "FAIL: built UI not served"; exit 1; }
+echo "$HTML ...HTML ok"
 ls -ld .data | awk '{print ".data perms:", $1}'
 
 echo "=== [5/5] real Chromium launch"

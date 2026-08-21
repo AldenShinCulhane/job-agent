@@ -25,12 +25,14 @@ echo
 echo "1. Core toolchain"
 
 # --- uv (installed automatically — it manages the Python side) -------------
+UV_JUST_INSTALLED=0
 if command -v uv >/dev/null 2>&1; then
   ok "uv $(uv --version | awk '{print $2}')"
 else
   echo "  installing uv (https://astral.sh/uv) ..."
   if curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null 2>&1 && command -v uv >/dev/null 2>&1; then
     ok "uv installed to ~/.local/bin"
+    UV_JUST_INSTALLED=1
   else
     fail "uv install failed — install manually: curl -LsSf https://astral.sh/uv/install.sh | sh"
   fi
@@ -146,5 +148,10 @@ if [ "$WARNINGS" -gt 0 ]; then
   echo "${BOLD}Setup finished with $WARNINGS warning(s)${RESET} — optional features affected (details above)."
 else
   echo "${BOLD}Setup complete.${RESET}"
+fi
+if [ "$UV_JUST_INSTALLED" -eq 1 ]; then
+  echo "uv was installed into ~/.local/bin, which THIS shell does not know about yet."
+  echo "Run this first (or just open a new terminal):"
+  echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
 fi
 echo "Start the app with: uv run job-agent   (then open http://127.0.0.1:8700)"
