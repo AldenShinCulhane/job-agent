@@ -92,14 +92,19 @@ def test_settings_roundtrip_and_validation(client):
     assert "status" in body["engine"]
     assert isinstance(body["latex_engines"], list)
 
-    assert client.put("/api/settings", json={"resume_page_limit": 2}).status_code == 200
-    assert client.get("/api/settings").json()["resume_page_limit"] == 2
+    # Any strictly positive integer is a valid N (PLAN.md), not a preset.
+    for good in (2, 4, 100):
+        assert (
+            client.put("/api/settings", json={"resume_page_limit": good}).status_code
+            == 200
+        )
+        assert client.get("/api/settings").json()["resume_page_limit"] == good
 
     from backend.tailor import pipeline as tailor_pipeline
 
-    assert tailor_pipeline.resume_page_limit() == 2  # gate 3 reads this
+    assert tailor_pipeline.resume_page_limit() == 100  # gate 3 reads this
 
-    for bad in (0, 4, "2", True, None):
+    for bad in (0, -1, "2", True, False, None, 2**31):
         res = client.put("/api/settings", json={"resume_page_limit": bad})
         assert res.status_code == 422, bad
-    assert client.get("/api/settings").json()["resume_page_limit"] == 2
+    assert client.get("/api/settings").json()["resume_page_limit"] == 100

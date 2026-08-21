@@ -37,10 +37,20 @@ else
 fi
 
 # --- Node / npm (frontend build) -------------------------------------------
+# Vite requires ^20.19 or >=22.12 — a bare "Node 20" is not enough.
 if command -v npm >/dev/null 2>&1; then
-  ok "node $(node --version) / npm $(npm --version)"
+  NODE_V=$(node --version | sed 's/^v//')
+  NODE_MAJOR=${NODE_V%%.*}
+  NODE_MINOR=$(printf '%s' "$NODE_V" | cut -d. -f2)
+  if { [ "$NODE_MAJOR" -eq 20 ] && [ "$NODE_MINOR" -ge 19 ]; } \
+     || { [ "$NODE_MAJOR" -eq 22 ] && [ "$NODE_MINOR" -ge 12 ]; } \
+     || [ "$NODE_MAJOR" -ge 23 ]; then
+    ok "node v$NODE_V / npm $(npm --version)"
+  else
+    fail "node v$NODE_V is too old for the frontend build — need ^20.19 or >=22.12: macOS: brew install node | Ubuntu/Debian: https://nodejs.org or NodeSource | nvm install 22"
+  fi
 else
-  fail "Node.js not found — install Node 20+: macOS: brew install node | Ubuntu/Debian: sudo apt install nodejs npm | or https://nodejs.org"
+  fail "Node.js not found — install Node 20.19+ or 22.12+: macOS: brew install node | Ubuntu/Debian: https://nodejs.org or NodeSource | nvm install 22"
 fi
 
 # --- LaTeX engine (PDF generation) -----------------------------------------
@@ -103,6 +113,15 @@ if uv run python -c "import playwright" >/dev/null 2>&1; then
     ok "Playwright Chromium"
   else
     fail "Playwright browser install failed — re-run 'uv run playwright install chromium'"
+  fi
+  # Linux needs Chromium's system libraries too (the download alone
+  # won't launch without them). install-deps uses apt and may need root.
+  if [ "$(uname -s)" = "Linux" ]; then
+    if uv run playwright install-deps chromium >/dev/null 2>&1; then
+      ok "Chromium system dependencies"
+    else
+      warn "Chromium system libraries missing — run: sudo env \"PATH=\$PATH\" \$(command -v uv) run playwright install-deps chromium"
+    fi
   fi
 fi
 

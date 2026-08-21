@@ -150,10 +150,12 @@ Every stop state is autonomous-by-default and visible: a banner explains
 what happened and the way out. Claude usage limit → pauses and resumes
 itself; Claude sign-in expired → banner with the login command
 (Settings has a re-check button); LinkedIn checkpoint → search stops
-cleanly, you solve it in the browser window and press Resume; LinkedIn
-session expired → reconnect from the Search tab. Interrupted work —
-including a killed server mid-generation — resumes from its last
-checkpoint without repeating paid LLM calls.
+cleanly, you solve it in the browser window and press Connect — the
+search then resumes on its own; LinkedIn session expired → reconnect
+from the Search tab. Interrupted work — including a killed server
+mid-generation — resumes from its last checkpoint: no completed,
+checkpointed LLM call is ever repeated (only a call that was still in
+flight at the moment of the kill runs again).
 
 ## Development
 
@@ -167,3 +169,9 @@ uv run python -m backend.tests.smoke_llm  # live engine smoke test (uses your su
 (SQLite state, SSE progress), React + Vite + Tailwind frontend, Playwright
 supervisor for LinkedIn, Tectonic/pdflatex for PDFs, Claude Agent SDK for
 all reasoning.
+
+## License
+
+[MIT](LICENSE). Note the redistributor caveat above: shipping a product
+that offers claude.ai sign-in needs Anthropic's approval regardless of
+this code's license.

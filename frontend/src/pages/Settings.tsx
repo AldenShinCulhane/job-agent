@@ -71,24 +71,28 @@ export default function Settings() {
           <label className="text-sm font-medium" htmlFor="page-limit">
             Resume page limit
           </label>
-          <select
+          <input
             id="page-limit"
-            className="rounded border border-slate-300 px-2 py-1 text-sm"
-            value={limit}
+            type="number"
+            min={1}
+            step={1}
+            className="w-20 rounded border border-slate-300 px-2 py-1 text-sm"
+            value={Number.isNaN(limit) ? '' : limit}
             onChange={(e) => {
-              setLimit(Number(e.target.value))
+              setLimit(e.target.value === '' ? NaN : Number(e.target.value))
               setSaved(false)
             }}
-          >
-            {[1, 2, 3].map((n) => (
-              <option key={n} value={n}>
-                {n} page{n > 1 ? 's' : ''}
-              </option>
-            ))}
-          </select>
+          />
+          <span className="text-sm text-slate-500">
+            page{limit === 1 ? '' : 's'}
+          </span>
           <button
             className="rounded bg-slate-900 px-3 py-1 text-sm font-medium text-white disabled:opacity-40"
-            disabled={limit === settings.resume_page_limit}
+            disabled={
+              !Number.isInteger(limit) ||
+              limit < 1 ||
+              limit === settings.resume_page_limit
+            }
             onClick={() => void save()}
           >
             Save

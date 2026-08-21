@@ -54,7 +54,7 @@ export default function RecoveryBanners({
     banners.push({
       key: 'li-captcha',
       tone: 'bg-rose-50 text-rose-800 border-rose-200',
-      text: 'LinkedIn checkpoint hit — solve it in the browser window, then resume the search. The app never bypasses checkpoints.',
+      text: 'LinkedIn checkpoint hit — solve it in the browser window, then press Connect; the search resumes on its own. The app never bypasses checkpoints.',
       action: { label: 'Go to Search', run: onOpenSearch },
     })
   }
