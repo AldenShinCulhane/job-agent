@@ -1,26 +1,41 @@
 """Browser check (PLAN.md M5, 'invalid upload' recovery): a failed resume
 upload must be retriable with the SAME file from the same input element.
 
-Runs the real built UI in Chromium against a running app, with every
-/api/* response mocked (sanitized sample data only — no real profile or
-LinkedIn data is fetched or rendered). The first upload attempt is
-answered 503 (usage limit), the second 200.
+By default this starts its own disposable server from THIS checkout, so
+the bundle under test is provably the code at the printed SHA:
 
-Two things are asserted, and only together do they prove the retry path:
+  * the worktree must be clean (otherwise HEAD does not describe the
+    source that gets built) — override with --allow-dirty, which downgrades
+    the log to operator-attested;
+  * the frontend is rebuilt from that source immediately before serving;
+  * `uv run job-agent` from this checkout serves that build, and is shut
+    down when the check finishes.
+
+Passing --base-url instead points the check at a server this script did
+not start. That cannot bind the served bundle to any SHA, so the run is
+labelled operator-attested.
+
+Every /api/* response is mocked with sanitized sample data — no real
+profile or LinkedIn data is fetched or rendered. The first upload attempt
+is answered 503 (usage limit), the second 200. Two things are asserted,
+and only together do they prove the retry path:
 
 1. After the failed attempt the file input's value is EMPTY. This is the
-   DOM precondition browsers require: an input whose value still holds
-   the previous path fires no `change` event when the user picks that
-   same file again, so the retry would silently do nothing.
+   DOM precondition browsers require: an input whose value still holds the
+   previous path fires no `change` event when the user picks that same
+   file again, so the retry would silently do nothing.
 2. A second selection of the same file reaches the API and the app
    advances to the profile view.
 
 Scope note: Playwright's set_input_files always dispatches `change`, even
-when the same file is re-selected, so assertion 2 alone cannot
-distinguish a fixed input from a broken one — assertion 1 is what covers
-the same-file case.
+when the same file is re-selected, so assertion 2 alone cannot distinguish
+a fixed input from a broken one — assertion 1 is what covers the same-file
+case. (Against the pre-fix bundle assertion 1 fails with
+"file input still holds 'C:\\fakepath\\resume.pdf'".)
 
-Usage: uv run python scripts/ci/upload_retry_browser_check.py [base_url]
+Usage:
+  uv run python scripts/ci/upload_retry_browser_check.py [--allow-dirty]
+  uv run python scripts/ci/upload_retry_browser_check.py --base-url URL
 """
 
 import asyncio
@@ -28,12 +43,17 @@ import json
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 from playwright.async_api import async_playwright
 
-BASE_URL = (sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8700").rstrip("/")
+REPO = Path(__file__).resolve().parents[2]
+PORT = 8700
+SELF_SERVED_URL = f"http://127.0.0.1:{PORT}"
 
 SAMPLE_PROFILE = {
     "name": "Jordan Sample",
@@ -56,13 +76,30 @@ ENGINE_WAITING = {"status": "waiting_usage_exhausted", "model": "claude-fable-5"
 USAGE_503 = {"detail": "UsageExhausted: usage limit cooldown: retry in 300s"}
 
 
-async def main() -> int:
+def git(*args: str) -> str:
+    return subprocess.run(["git", *args], capture_output=True, text=True,
+                          cwd=REPO, check=True).stdout.strip()
+
+
+def wait_for_health(url: str, timeout: float = 60.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"{url}/api/status", timeout=2) as r:
+                if r.status == 200:
+                    return True
+        except (urllib.error.URLError, OSError):
+            time.sleep(1)
+    return False
+
+
+async def run_check(base_url: str) -> None:
     uploads: list[str] = []
     resume_pdf = Path(tempfile.mkdtemp()) / "resume.pdf"
     resume_pdf.write_bytes(b"%PDF-1.4\n% sanitized placeholder\n%%EOF\n")
 
     async def route(r):
-        path = r.request.url.split(BASE_URL)[-1].split("?")[0]
+        path = r.request.url.split(base_url)[-1].split("?")[0]
         if path == "/api/profile/upload":
             uploads.append(r.request.method)
             if len(uploads) == 1:  # usage limit on the first attempt
@@ -92,7 +129,7 @@ async def main() -> int:
         browser = await pw.chromium.launch()
         page = await browser.new_page(viewport={"width": 1280, "height": 900})
         await page.route("**/*", route)
-        await page.goto(BASE_URL + "/")
+        await page.goto(base_url + "/")
         await page.wait_for_selector("text=Upload your resume")
 
         # Attempt 1 — the usage limit rejects it.
@@ -111,15 +148,64 @@ async def main() -> int:
 
         await browser.close()
 
-    head = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
-                          text=True, cwd=Path(__file__).resolve().parents[2])
+
+def main() -> int:
+    args = sys.argv[1:]
+    external = None
+    if "--base-url" in args:
+        external = args[args.index("--base-url") + 1].rstrip("/")
+    allow_dirty = "--allow-dirty" in args
+
+    if external:
+        print(f"[warn] testing {external}, a server this check did not start — "
+              "the served bundle is NOT bound to any SHA (operator-attested)")
+        asyncio.run(run_check(external))
+        binding = "operator-attested (external base-url)"
+        served = external
+    else:
+        dirty = git("status", "--porcelain")
+        if dirty and not allow_dirty:
+            print("[FAIL] worktree is dirty, so HEAD would not describe the "
+                  "bundle under test:\n" + dirty)
+            return 1
+        print("=== [1/3] rebuilding the frontend from this checkout")
+        subprocess.run(["npm", "run", "build"], cwd=REPO / "frontend",
+                       check=True, stdout=subprocess.DEVNULL)
+        print("=== [2/3] starting a disposable server from this checkout")
+        if wait_for_health(SELF_SERVED_URL, timeout=2):
+            print(f"[FAIL] something is already serving {SELF_SERVED_URL} — "
+                  "stop it so this check can serve its own build")
+            return 1
+        server = subprocess.Popen(["uv", "run", "job-agent"], cwd=REPO,
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL)
+        try:
+            if not wait_for_health(SELF_SERVED_URL):
+                print("[FAIL] server did not become healthy")
+                return 1
+            print("=== [3/3] browser check")
+            asyncio.run(run_check(SELF_SERVED_URL))
+        finally:
+            server.terminate()
+            try:
+                server.wait(timeout=20)
+            except subprocess.TimeoutExpired:
+                server.kill()
+        binding = ("SHA-bound: clean worktree, frontend rebuilt from this "
+                   "checkout, served by this checkout's own entrypoint")
+        if allow_dirty and dirty:
+            binding = "operator-attested (--allow-dirty with local edits)"
+        served = SELF_SERVED_URL
+
     print("provenance:",
-          f"head={head.stdout.strip()[:40]}",
+          f"head={git('rev-parse', 'HEAD')}",
+          f"ref={git('rev-parse', '--abbrev-ref', 'HEAD')}",
           f"date={datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ}",
-          f"base_url={BASE_URL}",
-          f"os={sys.platform}")
+          f"served={served}",
+          f"os={sys.platform}-{subprocess.run(['uname', '-m'], capture_output=True, text=True).stdout.strip()}")
+    print("binding:", binding)
     print("=== UPLOAD RETRY BROWSER CHECK PASS")
     return 0
 
 
-raise SystemExit(asyncio.run(main()))
+raise SystemExit(main())

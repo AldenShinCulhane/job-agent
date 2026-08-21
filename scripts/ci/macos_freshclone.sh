@@ -2,38 +2,60 @@
 # Fresh-clone test on macOS (PLAN.md M5): clone -> setup.sh -> boot with the
 # documented entrypoint -> API health -> real Playwright Chromium launch.
 #
-# Scope, stated up front: this is a fresh CHECKOUT on the host, so it uses
+# Scope, stated up front: run directly, this clones onto the host and uses
 # whatever toolchain the host already has (uv, Node, LaTeX, Playwright's
-# browser cache). It proves a clean clone installs its own dependencies,
-# builds, boots and runs on macOS — it does NOT prove a first-install of
-# system dependencies on a bare machine. The Ubuntu container run
-# (scripts/ci/ubuntu_freshclone.sh) is what covers the from-nothing path.
+# browser cache). That is fresh-CHECKOUT evidence, not clean-machine
+# evidence. For a from-nothing run — empty HOME, system-only PATH, no
+# Homebrew, no shared caches, Node fetched from nodejs.org — use
+# scripts/ci/macos_cleanenv_freshclone.sh, which sets that environment up
+# and then calls this script.
 #
-# Usage: scripts/ci/macos_freshclone.sh [workdir]
+# Usage: scripts/ci/macos_freshclone.sh [parent-dir]
+#   parent-dir  existing directory to create the throwaway workdir under
+#               (default: $TMPDIR). A uniquely named directory is created
+#               with mktemp -d; nothing pre-existing is ever removed.
 # Port 8700 must be free — stop any running instance first.
 set -euo pipefail
+export TERM=dumb  # keep terminal escapes out of retained logs
 
-SRC="$(cd "$(dirname "$0")/../.." && pwd)"
-WORK="${1:-$(mktemp -d /tmp/job-agent-freshclone.XXXXXX)}"
-CLONE="$WORK/job-agent"
+SRC="$(cd "$(dirname "$0")/../.." && pwd -P)"
+PARENT="${1:-${TMPDIR:-/tmp}}"
 PORT=8700
 
 echo "=== [1/5] preflight"
 [ "$(uname -s)" = "Darwin" ] || { echo "not macOS"; exit 1; }
+[ -d "$PARENT" ] || { echo "parent dir does not exist: $PARENT"; exit 1; }
+PARENT="$(cd "$PARENT" && pwd -P)"
+
+# The workdir is created fresh by mktemp, so it can never be an existing
+# path the caller cares about. Refuse anyway if it would sit on top of the
+# source checkout — this script must never be able to delete or overwrite
+# the repository it is testing.
+case "$SRC/" in
+  "$PARENT"/*) echo "refusing: $PARENT contains the source checkout $SRC"; exit 1 ;;
+esac
+case "$PARENT/" in
+  "$SRC"/*) echo "refusing: $PARENT is inside the source checkout $SRC"; exit 1 ;;
+esac
+[ "$PARENT" != "$SRC" ] || { echo "refusing: parent dir is the source checkout"; exit 1; }
+
+WORK="$(mktemp -d "$PARENT/job-agent-freshclone.XXXXXX")"
+CLONE="$WORK/job-agent"   # inside a directory mktemp just created: empty
 if lsof -ti ":$PORT" >/dev/null 2>&1; then
   echo "port $PORT is in use — stop the running app first"; exit 1
 fi
 sw_vers | tr '\n' ' '; echo "arch=$(uname -m)"
+echo "workdir: $WORK (left in place — this script never deletes anything)"
 
 echo "=== [2/5] fresh clone + setup.sh"
-rm -rf "$CLONE"
 git clone -q "$SRC" "$CLONE"
 cd "$CLONE"
 echo "provenance: cloned-from=$(git remote get-url origin)" \
      "ref=$(git rev-parse --abbrev-ref HEAD)" \
      "head=$(git rev-parse HEAD)" \
      "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-     "os=$(sw_vers -productName)-$(sw_vers -productVersion) arch=$(uname -m)"
+     "os=$(sw_vers -productName)-$(sw_vers -productVersion) arch=$(uname -m)" \
+     "home=$HOME"
 ./scripts/setup.sh
 
 echo "=== [3/5] boot with the documented entrypoint"

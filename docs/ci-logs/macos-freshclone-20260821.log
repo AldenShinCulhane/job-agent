@@ -2,7 +2,7 @@
 ProductName:		macOS ProductVersion:		26.6.1 BuildVersion:		25G76 arch=arm64
 === [2/5] fresh clone + setup.sh
 provenance: cloned-from=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=b5e5525f440eeb353214d2ad9d493b088f7c7ce1 date=2026-08-21T18:29:27Z os=macOS-26.6.1 arch=arm64
-Job Agent setup
+Job Agent setup
 
 1. Core toolchain
   [ok]   uv 0.12.5
@@ -21,7 +21,7 @@ Job Agent setup
 3. Claude sign-in (uses your Claude subscription — no API key)
   [warn] not signed in — run: uv run python -m backend.core.claude_cli auth login
 
-Setup finished with 1 warning(s) — optional features affected (details above).
+Setup finished with 1 warning(s) — optional features affected (details above).
 Start the app with: uv run job-agent   (then open http://127.0.0.1:8700)
 === [3/5] boot with the documented entrypoint
 === [4/5] health
