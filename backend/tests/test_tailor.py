@@ -636,6 +636,71 @@ async def test_fit_cover_ladder_then_condense_then_fail(tmp_path, monkeypatch):
         await page_limit.fit_cover(tailored, PROFILE, ledger, {}, JOB, tmp_path)
 
 
+def _one_page_pdf(content: str, width: int = 612, height: int = 792) -> bytes:
+    """A minimal, valid one-page PDF wrapping a literal content stream."""
+    body = content.encode("latin-1")
+    objects = [
+        b"<</Type/Catalog/Pages 2 0 R>>",
+        b"<</Type/Pages/Kids[3 0 R]/Count 1>>",
+        (f"<</Type/Page/Parent 2 0 R/MediaBox[0 0 {width} {height}]"
+         "/Resources<</Font<</F1 5 0 R>>>>/Contents 4 0 R>>").encode("latin-1"),
+        b"<</Length " + str(len(body)).encode() + b">>stream\n" + body + b"\nendstream",
+        b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for number, obj in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{number} 0 obj".encode() + obj + b"endobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n0000000000 65535 f \n".encode()
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += (f"trailer<</Size {len(objects) + 1}/Root 1 0 R>>\n"
+            f"startxref\n{xref}\n%%EOF\n").encode()
+    return bytes(out)
+
+
+def test_content_bounds_ignores_a_rule_drawn_mid_line(tmp_path):
+    """Regression: pdfTeX renders an underscore (and every \\rule) as a
+    `q .. cm .. Q` block. Landing back in a text object after one used to
+    leave pypdf's memoized text matrix at the identity, so the following
+    run measured at the page origin, y0 collapsed to 0 and last-page
+    fullness read ~0.96 no matter what the page held. This content stream
+    is that exact shape, byte for byte in structure."""
+    from backend.tailor import page_limit
+
+    pdf = tmp_path / "rule.pdf"
+    pdf.write_bytes(_one_page_pdf(
+        "BT\n/F1 12 Tf\n100 700 Td [(Top)] TJ\nET\n"
+        "BT\n/F1 12 Tf\n100 500 Td [(Left)] TJ\nET\n"
+        "q\n1 0 0 1 200 500 cm\n[]0 d 0 J 0.4 w 0 0 m 3 0 l S\nQ\n"
+        "BT\n/F1 12 Tf\n220 500 Td [(Right)] TJ\nET\n"
+    ))
+
+    box = page_limit.content_bounds(pdf)[0]
+    assert box is not None
+    # The run after the rule is at y=500, not at the origin.
+    assert box["y0"] == 500.0 and box["x0"] == 100.0
+    assert box["x1"] == 220.0 and box["y1"] == 712.0
+    # Measured height, not a full page: 212pt of content on 792pt.
+    assert page_limit.last_page_fullness(pdf) == pytest.approx(212 / 792)
+
+
+def test_content_bounds_skips_kerning_only_runs(tmp_path):
+    """A `TJ` can carry nothing but kerning numbers; that paints no ink
+    and must not stretch the box."""
+    from backend.tailor import page_limit
+
+    pdf = tmp_path / "kern.pdf"
+    pdf.write_bytes(_one_page_pdf(
+        "BT\n/F1 12 Tf\n100 700 Td [(Top)] TJ\nET\n"
+        "BT\n/F1 12 Tf\n100 100 Td [-278] TJ\nET\n"
+    ))
+    box = page_limit.content_bounds(pdf)[0]
+    assert box is not None and box["y0"] == 700.0
+
+
 def test_content_bounds_measures_real_pdf(tmp_path):
     from backend.tailor import compile as latex
     from backend.tailor import page_limit
@@ -682,6 +747,63 @@ def test_pdf_matrix_transform_composes_translation_and_scale():
     # Composition order matters: text matrix first, then the CTM.
     tm, cm = [1, 0, 0, 1, 100, 200], [1, 0, 0, 1, -36, -231]
     assert _transform(cm, *_transform(tm, 0.0, 0.0)) == (64.0, -31.0)
+
+
+def test_sample_resume_fullness_comes_from_its_real_content(tmp_path):
+    """The whole sample resume through the real engine: the measured box
+    must sit inside the text block, not start at the page origin. With
+    the stale-matrix bug this page measured 0.963 full on pdflatex — over
+    SPARSE_FULLNESS, so the balance pass below never ran on any
+    document."""
+    from backend.tailor import compile as latex
+    from backend.tailor import page_limit
+    from backend.resume.template import render
+    from backend.tests.test_resume import SAMPLE_PROFILE
+
+    if not latex.available_engines():
+        pytest.skip("no LaTeX engine installed")
+    # The trigger is a rule drawn inside a text object; pdfTeX draws one
+    # for this underscore. Keep the fixture that exercises it.
+    assert "_" in SAMPLE_PROFILE["experiences"][0]["bullets"][0]
+
+    result = latex.compile_tex(render(SAMPLE_PROFILE), tmp_path, jobname="resume")
+    box = page_limit.content_bounds(result.pdf_path)[-1]
+    assert box is not None
+
+    from pypdf import PdfReader
+
+    page = PdfReader(str(result.pdf_path)).pages[-1]
+    height = float(page.mediabox.height)
+    # No run at the origin: the lowest line is inside the bottom margin,
+    # and the highest is under the top edge.
+    assert box["y0"] > 72 and box["y1"] < height
+    fullness = page_limit.last_page_fullness(result.pdf_path)
+    assert fullness == pytest.approx((box["y1"] - box["y0"]) / height)
+    # A one-page resume this short is nowhere near full; 0.963 was the
+    # phantom's signature.
+    assert 0.2 < fullness < 0.6
+
+
+async def test_real_fit_balances_a_sparse_page(tmp_path):
+    """End-to-end on the real engine, no LLM: a short resume measures
+    sparse, so fit_resume runs its one balance pass, and keeps the looser
+    layout because the page measurably fills more."""
+    from backend.resume import template
+    from backend.tailor import compile as latex
+    from backend.tailor import page_limit
+
+    if not latex.available_engines():
+        pytest.skip("no LaTeX engine installed")
+
+    tailored = _tailored()
+    fit = await page_limit.fit_resume(tailored, PROFILE, {}, {}, 1, tmp_path)
+
+    assert fit.result.pages == 1 and fit.trimmed == []
+    # The balance pass ran and its result was kept: nothing is trimmed
+    # here, so the only way the layout can differ from the default is the
+    # measured sparse-page relax.
+    assert fit.layout == page_limit.resume_relaxed(template.DEFAULT_LAYOUT)
+    assert page_limit.last_page_fullness(fit.result.pdf_path) < 1.0
 
 
 def test_packages_to_resume_excludes_terminal_states(test_db):

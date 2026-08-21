@@ -47,35 +47,77 @@ def _transform(matrix, x: float, y: float) -> tuple[float, float]:
     return a * x + c * y + e, b * x + d * y + f
 
 
+# Operators that paint glyphs. `'` and `"` also move to the next line
+# first, so their glyphs land one leading BELOW the matrix we are handed.
+_SHOW_TEXT_OPS = (b"Tj", b"TJ", b"'", b'"')
+
+
+def _shows_glyphs(operands: list) -> bool:
+    """True when a text-showing operator carries at least one glyph.
+    `TJ` mixes glyph strings with kerning numbers, and a run can be all
+    kerning; the strings are font-encoded bytes, so this deliberately
+    stops at "some glyph" rather than trying to decode them."""
+    for operand in operands:
+        if isinstance(operand, (bytes, str)) and operand:
+            return True
+        if isinstance(operand, list) and _shows_glyphs(operand):
+            return True
+    return False
+
+
 def content_bounds(pdf_path: Path) -> list[dict | None]:
     """Per-page content bounding box {x0, y0, x1, y1} from text
     coordinates (PDF user space, bottom-left origin); None for a page
-    with no text."""
+    with no text.
+
+    Measured at the text-showing operators themselves, off pypdf's live
+    graphics/text matrices. The obvious route — `visitor_text` — hands
+    back MEMOIZED matrices that are only refreshed on some operators,
+    and a `q .. cm .. Q` block inside a text object (pdfTeX emits one for
+    every rule) leaves them stale at the identity: the following run then
+    measures at the page origin, y0 collapses to 0, and last-page
+    fullness reads ~0.96 for any document — silently disabling the
+    sparse-page balance pass on pdfTeX output.
+    """
     bounds: list[dict | None] = []
     for page in PdfReader(str(pdf_path)).pages:
         box = {"x0": float("inf"), "y0": float("inf"),
                "x1": float("-inf"), "y1": float("-inf")}
         seen = False
+        state = {"font_size": 0.0, "leading": 0.0}
 
-        def visitor(text, cm, tm, font_dict, font_size,
-                    box=box) -> None:  # noqa: ANN001 — pypdf callback shape
+        def before(operator, operands, cm, tm,
+                   box=box, state=state) -> None:  # noqa: ANN001 — pypdf callback shape
             nonlocal seen
-            if not text.strip():
+            if operator == b"Tf" and len(operands) >= 2:
+                state["font_size"] = float(operands[1])
                 return
+            if operator == b"TL" and operands:
+                state["leading"] = float(operands[0])
+                return
+            if operator == b"TD" and len(operands) >= 2:
+                state["leading"] = -float(operands[1])
+                return
+            if operator not in _SHOW_TEXT_OPS or not _shows_glyphs(operands):
+                return
+            tm = [float(v) for v in tm[:6]]
+            if operator in (b"'", b'"'):  # implicit T* before showing
+                tm[4] -= tm[2] * state["leading"]
+                tm[5] -= tm[3] * state["leading"]
             # Text-space -> user space via the text matrix, then user space
             # -> page space via the current transformation matrix. Skipping
             # the cm step only looks right for engines that leave it at
             # identity: pdfTeX does, xdvipdfmx (XeTeX/tectonic) does not,
             # and its pages then measure as a third as full as they are.
             x, y = _transform(cm, *_transform(tm, 0.0, 0.0))
-            _, y_top = _transform(cm, *_transform(tm, 0.0, float(font_size or 0)))
+            _, y_top = _transform(cm, *_transform(tm, 0.0, state["font_size"]))
             seen = True
             box["x0"] = min(box["x0"], x)
             box["y0"] = min(box["y0"], y)
             box["x1"] = max(box["x1"], x)
             box["y1"] = max(box["y1"], y_top)
 
-        page.extract_text(visitor_text=visitor)
+        page.extract_text(visitor_operand_before=before)
         bounds.append(box if seen else None)
     return bounds
 

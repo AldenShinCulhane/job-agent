@@ -56,12 +56,21 @@ else
 fi
 
 # --- LaTeX engine (PDF generation) -----------------------------------------
-if command -v tectonic >/dev/null 2>&1; then
-  ok "tectonic $(tectonic --version 2>/dev/null | head -1 | awk '{print $2}')"
-elif command -v pdflatex >/dev/null 2>&1; then
-  ok "pdflatex found (tectonic preferred but not required)"
-else
-  warn "no LaTeX engine — needed for PDF generation. Install tectonic: macOS: brew install tectonic | Linux: https://tectonic-typesetting.github.io/install.html (or a TeX Live pdflatex)"
+# Presence and version only. Whether an engine can actually typeset the
+# resume is decided by a real test compile in step 2 — that needs the
+# Python dependencies, and a version number does not answer the question
+# (tectonic 0.16.x reports fine and aborts on this template's fonts).
+LATEX_FOUND=""
+PDF_BROKEN=0
+for engine in tectonic pdflatex; do
+  if command -v "$engine" >/dev/null 2>&1; then
+    LATEX_FOUND="${LATEX_FOUND}${engine} "
+    ok "$engine found — $("$engine" --version 2>/dev/null | head -1) (test-compiled in step 2)"
+  fi
+done
+if [ -z "$LATEX_FOUND" ]; then
+  PDF_BROKEN=1
+  warn "no LaTeX engine — needed for PDF generation. Install tectonic 0.17+: macOS: brew install tectonic | Linux: https://tectonic-typesetting.github.io/install.html (or a TeX Live pdflatex)"
 fi
 
 # --- OCR stack (scanned-resume fallback) -----------------------------------
@@ -94,6 +103,24 @@ if uv sync >/dev/null 2>&1; then
   ok "Python dependencies (uv sync)"
 else
   fail "uv sync failed — re-run 'uv sync' manually to see the error"
+fi
+
+# The real question about a LaTeX engine: can it typeset THIS template?
+# tectonic's first run also downloads its support bundle here, so a later
+# package generation is not the first time the network is needed.
+if [ -n "$LATEX_FOUND" ]; then
+  echo "  ...    test-compiling the resume template (tectonic's first run downloads its support bundle)"
+  SMOKE_OUT=$(uv run python -m backend.tailor.smoke_pdf 2>&1)
+  SMOKE_STATUS=$?
+  printf '%s\n' "$SMOKE_OUT" | while IFS= read -r line; do
+    [ -n "$line" ] && printf "         %s\n" "$line"
+  done
+  if [ "$SMOKE_STATUS" -eq 0 ]; then
+    ok "PDF generation (resume template compiles)"
+  else
+    PDF_BROKEN=1
+    warn "no installed LaTeX engine can typeset the resume template — resume and cover-letter PDFs WILL fail. tectonic must be 0.17+ (0.16.x aborts on this template): macOS: brew install tectonic | Linux: https://tectonic-typesetting.github.io/install.html — or install a TeX Live pdflatex. Re-check with: uv run python -m backend.tailor.smoke_pdf"
+  fi
 fi
 
 if (cd frontend && npm ci --no-fund --no-audit >/dev/null 2>&1); then
@@ -144,7 +171,9 @@ if [ "$FAILURES" -gt 0 ]; then
   echo "${BOLD}Setup finished with failures${RESET} — fix the [FAIL] items and re-run."
   exit 1
 fi
-if [ "$WARNINGS" -gt 0 ]; then
+if [ "$PDF_BROKEN" -eq 1 ]; then
+  echo "${BOLD}Setup finished with $WARNINGS warning(s)${RESET} — including NO WORKING LaTeX ENGINE: the app runs, but every resume and cover-letter PDF will fail (details above)."
+elif [ "$WARNINGS" -gt 0 ]; then
   echo "${BOLD}Setup finished with $WARNINGS warning(s)${RESET} — optional features affected (details above)."
 else
   echo "${BOLD}Setup complete.${RESET}"

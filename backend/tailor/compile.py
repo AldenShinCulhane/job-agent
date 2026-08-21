@@ -77,6 +77,24 @@ def _run_engine(engine: str, binary: str, tex_path: Path, workdir: Path) -> str:
     return output
 
 
+def compile_with(engine: str, binary: str, tex_path: Path, workdir: Path,
+                 jobname: str) -> CompileResult:
+    """One engine, one attempt. Every failure mode — nonzero exit, no
+    PDF, unreadable PDF — leaves as CompileError, so callers that iterate
+    engines can treat them all the same way."""
+    output = _run_engine(engine, binary, tex_path, workdir)
+    pdf_path = workdir / f"{jobname}.pdf"
+    if not pdf_path.is_file():
+        raise CompileError(f"{engine} produced no PDF", output[-2000:])
+    try:
+        pages = page_count(pdf_path)
+    except Exception as exc:  # corrupt output counts as an engine failure
+        raise CompileError(
+            f"{engine} produced an unreadable PDF: {exc}", output[-2000:]
+        ) from exc
+    return CompileResult(pdf_path=pdf_path, pages=pages, engine=engine)
+
+
 def compile_tex(tex_source: str, workdir: Path, jobname: str = "document") -> CompileResult:
     """Compile with the first engine that works (tectonic preferred,
     pdflatex fallback; last known-good engine moves to the front).
@@ -98,23 +116,12 @@ def compile_tex(tex_source: str, workdir: Path, jobname: str = "document") -> Co
     errors: list[CompileError] = []
     for engine, binary in engines:
         try:
-            output = _run_engine(engine, binary, tex_path, workdir)
+            result = compile_with(engine, binary, tex_path, workdir, jobname)
         except CompileError as exc:
             errors.append(exc)
             continue
-        pdf_path = workdir / f"{jobname}.pdf"
-        if not pdf_path.is_file():
-            errors.append(CompileError(f"{engine} produced no PDF", output[-2000:]))
-            continue
-        try:
-            pages = page_count(pdf_path)
-        except Exception as exc:  # corrupt output counts as an engine failure
-            errors.append(
-                CompileError(f"{engine} produced an unreadable PDF: {exc}", output[-2000:])
-            )
-            continue
         _working_engine = (engine, binary)
-        return CompileResult(pdf_path=pdf_path, pages=pages, engine=engine)
+        return result
 
     summary = "; ".join(str(e) for e in errors)
     raise CompileError(f"all LaTeX engines failed: {summary}", errors[-1].log_tail)

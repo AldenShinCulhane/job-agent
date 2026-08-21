@@ -333,3 +333,100 @@ def test_sample_profile_compiles_to_one_page(tmp_path):
     assert result.pages == 1
     assert result.engine in ("tectonic", "pdflatex")
     assert result.pdf_path.stat().st_size > 1000
+
+
+@pytest.mark.skipif(
+    shutil.which("tectonic") is None and shutil.which("pdflatex") is None,
+    reason="no LaTeX engine installed",
+)
+def test_sample_profile_pdf_extracts_its_special_characters(tmp_path):
+    """The PDF has to carry readable Unicode, not just look right — an
+    ATS reads the text layer. pdfTeX gets that from glyphtounicode;
+    tectonic (XeTeX) gets it from the OpenType fonts, and nothing else
+    in the suite would notice a font swap that broke the mapping.
+
+    Whitespace is engine-specific (kerning becomes spaces differently),
+    so compare with it removed. Two characters are deliberately absent
+    below: pdfTeX draws `\\_` as a rule and `\\~{}` as an accent, so those
+    two do not survive extraction on every engine.
+    """
+    from pypdf import PdfReader
+
+    result = latex.compile_tex(render(SAMPLE_PROFILE), tmp_path, jobname="resume")
+    text = PdfReader(str(result.pdf_path)).pages[0].extract_text()
+    packed = "".join(text.split())
+
+    for expected in (
+        "JaneDoe",
+        "AI&LLMSystems",                       # LaTeX-escaped ampersand
+        "jane@example.com",
+        "Acme&Sons{Ltd}",                      # escaped braces
+        "Cutcostsby50%usingC#&Rust",           # percent and hash
+        "Shipped3serviceswith99.9%uptime",
+        "Builta$100pipelinewith1-pageenforcement",   # escaped dollar
+        "Dean’sList",                          # curly apostrophe
+        "Mar2024–Present",                     # en dash
+        "Python,TypeScript,C#",
+    ):
+        assert expected in packed, f"{expected!r} missing from extracted text"
+
+    # Markdown emphasis markers are rendered, never printed.
+    assert "**" not in packed
+
+
+# --- engine smoke check (setup.sh's "can this engine build a resume?") ------
+
+def test_engine_smoke_reports_a_failing_engine(tmp_path, monkeypatch):
+    """A version number is not an answer: tectonic 0.16.9 typesets a
+    one-line article and aborts (SIGABRT) on this template. The smoke
+    check compiles the real template, so setup can say so."""
+    from backend.tailor import smoke_pdf
+
+    def boom(engine, binary, tex_path, workdir, jobname):
+        raise latex.CompileError(f"{engine} failed (exit -6)", "note: Running TeX ...")
+
+    monkeypatch.setattr(smoke_pdf.latex, "compile_with", boom)
+    reason = smoke_pdf.check_engine("tectonic", "/fake/tectonic", tmp_path)
+    assert reason is not None
+    assert "exit -6" in reason and "Running TeX" in reason
+
+
+def test_engine_smoke_rejects_a_pdf_with_no_text_layer(tmp_path, monkeypatch):
+    """An engine that emits a blank page has not typeset anything —
+    catching that is the whole point of reading the text back."""
+    from pypdf import PdfWriter
+
+    from backend.tailor import smoke_pdf
+
+    blank = tmp_path / "smoke.pdf"
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    with open(blank, "wb") as fh:
+        writer.write(fh)
+
+    monkeypatch.setattr(
+        smoke_pdf.latex, "compile_with",
+        lambda *a, **k: latex.CompileResult(pdf_path=blank, pages=1, engine="fake"),
+    )
+    reason = smoke_pdf.check_engine("fake", "/fake/fake", tmp_path)
+    assert reason == "produced a PDF with no readable text layer"
+
+
+def test_engine_smoke_reports_no_engine_installed(monkeypatch, capsys):
+    from backend.tailor import smoke_pdf
+
+    monkeypatch.setattr(smoke_pdf.latex, "available_engines", list)
+    assert smoke_pdf.main() == 2
+    assert "no LaTeX engine installed" in capsys.readouterr().out
+
+
+@pytest.mark.skipif(
+    shutil.which("tectonic") is None and shutil.which("pdflatex") is None,
+    reason="no LaTeX engine installed",
+)
+def test_engine_smoke_passes_with_a_real_engine(capsys):
+    """The check setup.sh runs, against whatever is actually installed."""
+    from backend.tailor import smoke_pdf
+
+    assert smoke_pdf.main() == 0
+    assert "ok" in capsys.readouterr().out

@@ -68,9 +68,18 @@ how to install it. The pieces:
 |---|---|---|
 | [uv](https://docs.astral.sh/uv/) | Python environment | yes (auto-installed) |
 | Node.js 20+ / npm | frontend build | yes |
-| [Tectonic](https://tectonic-typesetting.github.io) or pdflatex | PDF typesetting | for PDF generation |
+| [Tectonic](https://tectonic-typesetting.github.io) **0.17+** or pdflatex | PDF typesetting | for PDF generation |
 | Tesseract + OCRmyPDF (+ Ghostscript) | scanned-resume OCR fallback | only for image-based PDFs |
 | Playwright Chromium | LinkedIn browser | installed by setup when needed |
+
+An installed LaTeX engine is not always a working one — Tectonic 0.16.x
+aborts on this template's fonts. Setup test-compiles the real template with
+every engine it finds and warns if none can produce a PDF. Re-check any time
+with:
+
+```bash
+uv run python -m backend.tailor.smoke_pdf
+```
 
 ## Claude subscription — no API keys
 
@@ -169,7 +178,8 @@ uv run job-agent                        # backend + built frontend on :8700
 cd frontend && npm run dev              # optional: Vite dev server w/ HMR, proxies /api
 uv run python -m backend.tests.smoke_llm  # live engine smoke test (uses your subscription)
 
-# clean-Ubuntu fresh-clone test (setup -> build -> boot -> Chromium launch):
+# clean-Ubuntu fresh-clone test
+# (setup -> build -> boot -> health -> Chromium launch -> backend test suite):
 docker run --rm -v "$PWD":/src:ro -v "$PWD/scripts/ci":/scratch:ro \
   ubuntu:24.04 bash /scratch/ubuntu_freshclone.sh
 ```
