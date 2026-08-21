@@ -12,14 +12,19 @@
 #   * Playwright      -> sandbox (Chromium downloaded fresh)
 #   * Node.js         -> fetched from nodejs.org into the sandbox, which is
 #                        what setup.sh tells a user without Node to do
+#   * Tectonic        -> fetched from its GitHub release into the sandbox,
+#                        so PDF generation is actually available here
 #
 # What is NOT scrubbed, and therefore NOT proven: the macOS install itself.
 # The kernel, system frameworks and Xcode command line tools (git, curl,
 # make) are the host's. This is a clean ENVIRONMENT on an existing macOS
 # install — it is not a pristine machine or an ephemeral CI runner.
 #
-# LaTeX and the OCR stack are deliberately absent here: setup.sh should
-# warn about them and continue, since they are optional for boot.
+# One toolchain stays absent on purpose: the OCR stack (Tesseract,
+# OCRmyPDF, Ghostscript), which ships no official standalone macOS binary
+# and is only needed for scanned image-only resumes. setup.sh must warn
+# about it and continue, and the run below is therefore NOT evidence about
+# the OCR fallback path.
 #
 # Usage: scripts/ci/macos_cleanenv_freshclone.sh [parent-dir]
 # Port 8700 must be free — stop any running instance first.
@@ -65,6 +70,15 @@ curl -fsSL "https://nodejs.org/dist/latest-v22.x/$NODE_TARBALL" \
   | tar -xz -C "$SANDBOX/tools"
 export PATH="$SANDBOX/tools/${NODE_TARBALL%.tar.gz}/bin:$PATH"
 echo "node $(node --version) / npm $(npm --version) (from $NODE_TARBALL)"
+
+echo "=== [0c/6] Tectonic from its GitHub release (PDF generation)"
+case "$ARCH" in arm64) TECT_ARCH=aarch64 ;; x86_64) TECT_ARCH=x86_64 ;; esac
+TECT_URL=$(curl -fsSL https://api.github.com/repos/tectonic-typesetting/tectonic/releases/latest \
+  | grep -o "https://[^\"]*${TECT_ARCH}-apple-darwin\.tar\.gz" | head -1)
+[ -n "$TECT_URL" ] || { echo "could not resolve a tectonic release for $ARCH"; exit 1; }
+curl -fsSL "$TECT_URL" | tar -xz -C "$SANDBOX/tools"
+export PATH="$SANDBOX/tools:$PATH"
+echo "tectonic $(tectonic --version | awk '{print $2}') (from $(basename "$TECT_URL"))"
 
 echo "=== [1/6] handing off to the fresh-clone test in this environment"
 exec "$SRC/scripts/ci/macos_freshclone.sh" "$SANDBOX/work"

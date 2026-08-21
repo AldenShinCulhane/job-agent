@@ -1,6 +1,7 @@
 #!/bin/bash
 # Fresh-clone test on macOS (PLAN.md M5): clone -> setup.sh -> boot with the
-# documented entrypoint -> API health -> real Playwright Chromium launch.
+# documented entrypoint -> API health -> real Playwright Chromium launch ->
+# the backend test suite, run in that environment.
 #
 # Scope, stated up front: run directly, this clones onto the host and uses
 # whatever toolchain the host already has (uv, Node, LaTeX, Playwright's
@@ -25,7 +26,7 @@ SRC="$(cd "$(dirname "$0")/../.." && pwd -P)"
 PARENT="${1:-${TMPDIR:-/tmp}}"
 PORT=8700
 
-echo "=== [1/5] preflight"
+echo "=== [1/6] preflight"
 [ "$(uname -s)" = "Darwin" ] || { echo "not macOS"; exit 1; }
 [ -d "$PARENT" ] || { echo "parent dir does not exist: $PARENT"; exit 1; }
 PARENT="$(cd "$PARENT" && pwd -P)"
@@ -50,7 +51,7 @@ fi
 sw_vers | tr '\n' ' '; echo "arch=$(uname -m)"
 echo "workdir: $WORK (left in place — this script never deletes anything)"
 
-echo "=== [2/5] fresh clone + setup.sh"
+echo "=== [2/6] fresh clone + setup.sh"
 git clone -q "$SRC" "$CLONE"
 cd "$CLONE"
 echo "provenance: cloned-from=$(git remote get-url origin)" \
@@ -61,7 +62,7 @@ echo "provenance: cloned-from=$(git remote get-url origin)" \
      "home=$HOME"
 ./scripts/setup.sh
 
-echo "=== [3/5] boot with the documented entrypoint"
+echo "=== [3/6] boot with the documented entrypoint"
 nohup uv run job-agent >"$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null || true' EXIT
@@ -70,7 +71,7 @@ for _ in $(seq 1 40); do
   sleep 1
 done
 
-echo "=== [4/5] health"
+echo "=== [4/6] health"
 # Each check must fail loudly: an empty answer printed as if it were data
 # would let a dead server look like a pass.
 STATUS=$(curl -sf "http://127.0.0.1:$PORT/api/status") || {
@@ -85,7 +86,7 @@ HTML=$(curl -sf "http://127.0.0.1:$PORT/" | head -c 60) || {
 echo "$HTML ...HTML ok"
 ls -ld .data | awk '{print ".data perms:", $1}'
 
-echo "=== [5/5] real Chromium launch"
+echo "=== [5/6] real Chromium launch"
 uv run python - <<'EOF'
 from playwright.sync_api import sync_playwright
 
@@ -97,5 +98,9 @@ with sync_playwright() as pw:
     print("chromium launched, version:", browser.version)
     browser.close()
 EOF
+
+echo "=== [6/6] backend test suite in this environment"
+uv run pytest backend/tests -q 2>&1 | tail -3 || {
+  echo "FAIL: backend test suite did not pass in this environment"; exit 1; }
 
 echo "=== MACOS FRESH-CLONE TEST PASS"

@@ -1,24 +1,23 @@
 """Browser check (PLAN.md M5, 'invalid upload' recovery): a failed resume
 upload must be retriable with the SAME file from the same input element.
 
-By default this starts its own disposable server from THIS checkout, so
-the bundle under test is provably the code at the printed SHA:
+Isolation, which matters more than convenience here: this check never runs
+the app's backend. It captures HEAD first, clones THIS repository into a
+throwaway directory, pins that clone to the captured SHA, builds the
+frontend there, and serves the built files with a static file server on an
+ephemeral port bound to 127.0.0.1. Nothing touches the working checkout's
+.data, no startup recovery runs, no search or package worker can resume,
+and no subscription call is possible. Every /api/* response the page sees
+is a Playwright mock with sanitized sample data.
 
-  * the worktree must be clean (otherwise HEAD does not describe the
-    source that gets built) — override with --allow-dirty, which downgrades
-    the log to operator-attested;
-  * the frontend is rebuilt from that source immediately before serving;
-  * `uv run job-agent` from this checkout serves that build, and is shut
-    down when the check finishes.
+That also makes the SHA claim airtight: the SHA is read before any build,
+the bundle is built from a checkout pinned to exactly that SHA, and the
+same captured SHA is what the log prints. Edits to the working checkout
+during the run cannot change what was tested (they are simply not under
+test — the check says so when the worktree is dirty).
 
-Passing --base-url instead points the check at a server this script did
-not start. That cannot bind the served bundle to any SHA, so the run is
-labelled operator-attested.
-
-Every /api/* response is mocked with sanitized sample data — no real
-profile or LinkedIn data is fetched or rendered. The first upload attempt
-is answered 503 (usage limit), the second 200. Two things are asserted,
-and only together do they prove the retry path:
+The first upload attempt is answered 503 (usage limit), the second 200.
+Two things are asserted, and only together do they prove the retry path:
 
 1. After the failed attempt the file input's value is EMPTY. This is the
    DOM precondition browsers require: an input whose value still holds the
@@ -34,12 +33,16 @@ case. (Against the pre-fix bundle assertion 1 fails with
 "file input still holds 'C:\\fakepath\\resume.pdf'".)
 
 Usage:
-  uv run python scripts/ci/upload_retry_browser_check.py [--allow-dirty]
+  uv run python scripts/ci/upload_retry_browser_check.py
   uv run python scripts/ci/upload_retry_browser_check.py --base-url URL
+      (tests a server this script did not build or start: the served
+       bundle is bound to nothing, so the run is operator-attested)
 """
 
 import asyncio
+import contextlib
 import json
+import socket
 import subprocess
 import sys
 import tempfile
@@ -52,8 +55,6 @@ from pathlib import Path
 from playwright.async_api import async_playwright
 
 REPO = Path(__file__).resolve().parents[2]
-PORT = 8700
-SELF_SERVED_URL = f"http://127.0.0.1:{PORT}"
 
 SAMPLE_PROFILE = {
     "name": "Jordan Sample",
@@ -76,20 +77,26 @@ ENGINE_WAITING = {"status": "waiting_usage_exhausted", "model": "claude-fable-5"
 USAGE_503 = {"detail": "UsageExhausted: usage limit cooldown: retry in 300s"}
 
 
-def git(*args: str) -> str:
+def git(*args: str, cwd: Path = REPO) -> str:
     return subprocess.run(["git", *args], capture_output=True, text=True,
-                          cwd=REPO, check=True).stdout.strip()
+                          cwd=cwd, check=True).stdout.strip()
 
 
-def wait_for_health(url: str, timeout: float = 60.0) -> bool:
+def free_port() -> int:
+    with contextlib.closing(socket.socket()) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def wait_for(url: str, timeout: float = 30.0) -> bool:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(f"{url}/api/status", timeout=2) as r:
+            with urllib.request.urlopen(url, timeout=2) as r:
                 if r.status == 200:
                     return True
         except (urllib.error.URLError, OSError):
-            time.sleep(1)
+            time.sleep(0.5)
     return False
 
 
@@ -151,59 +158,80 @@ async def run_check(base_url: str) -> None:
 
 def main() -> int:
     args = sys.argv[1:]
-    external = None
     if "--base-url" in args:
         external = args[args.index("--base-url") + 1].rstrip("/")
-    allow_dirty = "--allow-dirty" in args
-
-    if external:
-        print(f"[warn] testing {external}, a server this check did not start — "
-              "the served bundle is NOT bound to any SHA (operator-attested)")
+        print(f"[warn] testing {external}: this check neither built nor started "
+              "it, so the served bundle is bound to no SHA (operator-attested)")
         asyncio.run(run_check(external))
-        binding = "operator-attested (external base-url)"
-        served = external
-    else:
-        dirty = git("status", "--porcelain")
-        if dirty and not allow_dirty:
-            print("[FAIL] worktree is dirty, so HEAD would not describe the "
-                  "bundle under test:\n" + dirty)
-            return 1
-        print("=== [1/3] rebuilding the frontend from this checkout")
-        subprocess.run(["npm", "run", "build"], cwd=REPO / "frontend",
-                       check=True, stdout=subprocess.DEVNULL)
-        print("=== [2/3] starting a disposable server from this checkout")
-        if wait_for_health(SELF_SERVED_URL, timeout=2):
-            print(f"[FAIL] something is already serving {SELF_SERVED_URL} — "
-                  "stop it so this check can serve its own build")
-            return 1
-        server = subprocess.Popen(["uv", "run", "job-agent"], cwd=REPO,
-                                  stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL)
-        try:
-            if not wait_for_health(SELF_SERVED_URL):
-                print("[FAIL] server did not become healthy")
-                return 1
-            print("=== [3/3] browser check")
-            asyncio.run(run_check(SELF_SERVED_URL))
-        finally:
-            server.terminate()
-            try:
-                server.wait(timeout=20)
-            except subprocess.TimeoutExpired:
-                server.kill()
-        binding = ("SHA-bound: clean worktree, frontend rebuilt from this "
-                   "checkout, served by this checkout's own entrypoint")
-        if allow_dirty and dirty:
-            binding = "operator-attested (--allow-dirty with local edits)"
-        served = SELF_SERVED_URL
+        print("provenance:", f"served={external}",
+              f"date={datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ}")
+        print("binding: operator-attested (external base-url)")
+        print("=== UPLOAD RETRY BROWSER CHECK PASS")
+        return 0
 
+    # 1. Pin the SHA before anything is built, so nothing that happens
+    #    later can change which commit this log is about.
+    sha = git("rev-parse", "HEAD")
+    ref = git("rev-parse", "--abbrev-ref", "HEAD")
+    dirty = git("status", "--porcelain")
+    if dirty:
+        print("[note] the working checkout has uncommitted changes; they are "
+              f"NOT under test — this run tests committed {sha[:12]}:\n{dirty}")
+
+    work = Path(tempfile.mkdtemp(prefix="job-agent-uploadcheck."))
+    clone = work / "checkout"
+    print(f"=== [1/4] isolated checkout pinned to {sha[:12]} ({work})")
+    subprocess.run(["git", "clone", "--quiet", "--shared", str(REPO), str(clone)],
+                   check=True)
+    subprocess.run(["git", "-C", str(clone), "checkout", "--quiet", "--detach", sha],
+                   check=True)
+    got = git("rev-parse", "HEAD", cwd=clone)
+    if got != sha:
+        print(f"[FAIL] isolated checkout is at {got}, expected {sha}")
+        return 1
+
+    print("=== [2/4] building the frontend inside the isolated checkout")
+    subprocess.run(["npm", "ci", "--no-fund", "--no-audit"], cwd=clone / "frontend",
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["npm", "run", "build"], cwd=clone / "frontend",
+                   check=True, stdout=subprocess.DEVNULL)
+
+    # 3. Serve the built files only. The app's backend is never started:
+    #    it would open the working checkout's .data and run startup
+    #    recovery, which can resume packages, scoring and LinkedIn work.
+    port = free_port()
+    base_url = f"http://127.0.0.1:{port}"
+    dist = clone / "frontend" / "dist"
+    print(f"=== [3/4] serving {dist.relative_to(clone)} statically on {base_url} "
+          "(no backend, no .data, no recovery)")
+    server = subprocess.Popen(
+        [sys.executable, "-m", "http.server", str(port), "--bind", "127.0.0.1",
+         "--directory", str(dist)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        if not wait_for(base_url + "/"):
+            print("[FAIL] static server did not come up")
+            return 1
+        print("=== [4/4] browser check")
+        asyncio.run(run_check(base_url))
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            server.kill()
+
+    arch = subprocess.run(["uname", "-m"], capture_output=True, text=True).stdout.strip()
     print("provenance:",
-          f"head={git('rev-parse', 'HEAD')}",
-          f"ref={git('rev-parse', '--abbrev-ref', 'HEAD')}",
+          f"head={sha}",
+          f"ref={ref}",
           f"date={datetime.now(timezone.utc):%Y-%m-%dT%H:%M:%SZ}",
-          f"served={served}",
-          f"os={sys.platform}-{subprocess.run(['uname', '-m'], capture_output=True, text=True).stdout.strip()}")
-    print("binding:", binding)
+          f"served={base_url}",
+          f"os={sys.platform}-{arch}")
+    print("binding: SHA-bound — bundle built from an isolated checkout pinned "
+          f"to {sha[:12]} (captured before the build) and served statically; "
+          "the app backend was never started")
+    print(f"workdir left in place: {work}")
     print("=== UPLOAD RETRY BROWSER CHECK PASS")
     return 0
 
