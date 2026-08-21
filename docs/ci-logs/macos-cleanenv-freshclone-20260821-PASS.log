@@ -1,7 +1,7 @@
 === [0/6] sandbox
-sandbox: /Users/alden/.cache/job-agent-cleanenv.tcbYTu (left in place — nothing is ever deleted)
+sandbox: /Users/alden/.cache/job-agent-cleanenv.319mVo (left in place — nothing is ever deleted)
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
-HOME=/Users/alden/.cache/job-agent-cleanenv.tcbYTu/home
+HOME=/Users/alden/.cache/job-agent-cleanenv.319mVo/home
   absent: uv
   absent: node
   absent: npm
@@ -11,19 +11,21 @@ HOME=/Users/alden/.cache/job-agent-cleanenv.tcbYTu/home
   absent: ocrmypdf
 === [0b/6] Node.js from nodejs.org (setup.sh's instruction for a host without Node)
 node v22.23.2 / npm 10.9.8 (from node-v22.23.2-darwin-arm64.tar.gz)
+=== [0c/6] Tectonic from its GitHub release (PDF generation)
+tectonic 0.17.0 (from tectonic-0.17.0-aarch64-apple-darwin.tar.gz)
 === [1/6] handing off to the fresh-clone test in this environment
-=== [1/5] preflight
+=== [1/6] preflight
 ProductName:		macOS ProductVersion:		26.6.1 BuildVersion:		25G76 arch=arm64
-workdir: /Users/alden/.cache/job-agent-cleanenv.tcbYTu/work/job-agent-freshclone.2dq1tu (left in place — this script never deletes anything)
-=== [2/5] fresh clone + setup.sh
-provenance: cloned-from=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=3ff7ff0759a54d51fa28558089641fe94bc6f6c6 date=2026-08-21T18:49:15Z os=macOS-26.6.1 arch=arm64 home=/Users/alden/.cache/job-agent-cleanenv.tcbYTu/home
+workdir: /Users/alden/.cache/job-agent-cleanenv.319mVo/work/job-agent-freshclone.HNSRjj (left in place — this script never deletes anything)
+=== [2/6] fresh clone + setup.sh
+provenance: cloned-from=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=83ba02eb9fb833aa0c9a33293ac5a021f90f2978 date=2026-08-21T19:29:25Z os=macOS-26.6.1 arch=arm64 home=/Users/alden/.cache/job-agent-cleanenv.319mVo/home
 Job Agent setup
 
 1. Core toolchain
   installing uv (https://astral.sh/uv) ...
   [ok]   uv installed to ~/.local/bin
   [ok]   node v22.23.2 / npm 10.9.8
-  [warn] no LaTeX engine — needed for PDF generation. Install tectonic: macOS: brew install tectonic | Linux: https://tectonic-typesetting.github.io/install.html (or a TeX Live pdflatex)
+  [ok]   tectonic 0.17.0
   [warn] tesseract not found — needed only for scanned (image-based) resume PDFs. macOS: brew install tesseract | Ubuntu/Debian: sudo apt install tesseract-ocr
   [warn] ocrmypdf not found — needed only for scanned resume PDFs. macOS: brew install ocrmypdf | Ubuntu/Debian: sudo apt install ocrmypdf
   [warn] ghostscript not found — required by ocrmypdf. macOS: brew install ghostscript | Ubuntu/Debian: sudo apt install ghostscript
@@ -37,20 +39,24 @@ Job Agent setup
 3. Claude sign-in (uses your Claude subscription — no API key)
   [warn] not signed in — run: uv run python -m backend.core.claude_cli auth login
 
-Setup finished with 5 warning(s) — optional features affected (details above).
+Setup finished with 4 warning(s) — optional features affected (details above).
 uv was installed into ~/.local/bin, which THIS shell does not know about yet.
 Run this first (or just open a new terminal):
   export PATH="$HOME/.local/bin:$PATH"
 Start the app with: uv run job-agent   (then open http://127.0.0.1:8700)
-=== [3/5] boot with the documented entrypoint
-=== [4/5] health
+=== [3/6] boot with the documented entrypoint
+=== [4/6] health
 status:   {"app":"job-agent","engine":{"status":"unprobed","model":null,"retry_in_seconds":null,"last_error":null}}
-settings: {"resume_page_limit":1,"engine":{"status":"unprobed","model":null,"retry_in_seconds":null,"last_error":null},"latex_engines":[]}
+settings: {"resume_page_limit":1,"engine":{"status":"unprobed","model":null,"retry_in_seconds":null,"last_error":null},"latex_engines":["tectonic"]}
 <!doctype html>
 <html lang="en">
   <head>
     <meta charset= ...HTML ok
 .data perms: drwx------@
-=== [5/5] real Chromium launch
+=== [5/6] real Chromium launch
 chromium launched, version: 151.0.7922.34
+=== [6/6] backend test suite in this environment
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+204 passed, 1 warning in 36.09s
 === MACOS FRESH-CLONE TEST PASS
