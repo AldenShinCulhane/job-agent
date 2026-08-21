@@ -1,6 +1,8 @@
 # Job Agent v2 — LinkedIn-Native Tailoring Studio
 
-**Status:** Approved for M0 (working spec, rev 4 — final planning revision)
+**Status:** Approved for M0 (working spec, rev 4 — final planning revision;
+rev 5 amends one M5 acceptance criterion only, owner-approved 2026-08-21 —
+see M5 in §6)
 **Branch:** `v2-linkedin-webapp`
 **Goal:** Fundamentally rework job-agent from a hiring.cafe CLI pipeline into a generalized, cloneable web app: anyone uploads their resume, searches LinkedIn jobs, sees them scored in a nice UI, selects the ones they want, and gets tailored LaTeX-typeset resume + cover letter PDFs.
 
@@ -233,7 +235,7 @@ Each milestone independently runnable/testable; no milestone requires user decis
 - **M2 — LinkedIn session + search.** Criteria: login flow with persistent supervisor-owned session; a search **collects all available results up to the configured cap, deduplicates, caches, and resumes across restarts** without re-login; selector parsing passes against sanitized HTML fixtures (live account only for smoke); detail-cache TTL + hash-change re-fetch exercised.
 - **M3 — Normalization, scoring + job UI.** Criteria: normalization cached by JD hash (hash change invalidates the dependent cascade); deterministic scores reproducible run-to-run; **scoring quality asserted against a small labeled fixture set** — exact skill match, skill aliases, false substring matches (e.g. "Java" vs "JavaScript"), YoE boundary cases, missing requirements, education matching — with expected ordering and filter behavior; `deterministic_score` stored separately from optional `llm_rerank`, baseline never overwritten; LLM explanations on demand; scored list renders < 2 s from cache; sort/filter/select work.
 - **M4 — Tailoring pipeline.** Criteria: 5 selected jobs → 5 complete packages unattended; **restart-mid-batch test** — kill the app mid-generation, restart, batch completes with no duplicated work; 20-job stress batch asserts **truth validation passes, resume ≤ N, cover == 1, and failure isolation** (an induced failure affects only its package). Max-effort escalation evaluated here (kept only if it measurably helps).
-- **M5 — Polish & generalization.** Criteria: onboarding UX; recovery banners (login expired, captcha stop, usage exhausted, claude not authenticated, invalid upload); settings page; README + screenshots; fresh-clone test on a clean machine (macOS and Linux; WSL documented).
+- **M5 — Polish & generalization.** Criteria: onboarding UX; recovery banners (login expired, captcha stop, usage exhausted, claude not authenticated, invalid upload); settings page; README + screenshots; fresh-clone test with no hidden host state on both platforms — a clean *environment* on macOS (empty HOME, system-only PATH, no Homebrew, every dependency fetched from upstream) and a clean *container* on Linux; WSL documented. **Rev 5 (owner-approved, 2026-08-21):** this criterion originally read "fresh-clone test on a clean machine (macOS and Linux)". Both runs are retained in `docs/ci-logs/`. Pristine-hardware or ephemeral-runner testing is explicitly out of scope for a local personal tool: the macOS runs share the host's kernel, system frameworks and Xcode command line tools, and no claim of a pristine-image run is made anywhere.
 
 ---
 
