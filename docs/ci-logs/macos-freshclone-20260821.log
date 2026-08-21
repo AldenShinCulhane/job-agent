@@ -1,8 +1,8 @@
 === [1/6] preflight
 ProductName:		macOS ProductVersion:		26.6.1 BuildVersion:		25G76 arch=arm64
-workdir: /Users/alden/.cache/job-agent-freshclone.dQ8yXG (left in place — this script never deletes anything)
+workdir: /Users/alden/.cache/job-agent-freshclone.UQyz0O (left in place — this script never deletes anything)
 === [2/6] fresh clone + setup.sh
-provenance: cloned-from=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=b33d4fbb9dd48cb72356778a128615207ea691a5 date=2026-08-21T21:08:51Z os=macOS-26.6.1 arch=arm64 home=/Users/alden
+provenance: cloned-from=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=a3f85d26ccfbb3f4d690dca0fe89b08a19f73b3a date=2026-08-21T22:37:21Z os=macOS-26.6.1 arch=arm64 home=/Users/alden
 Job Agent setup
 
 1. Core toolchain
@@ -16,10 +16,10 @@ Job Agent setup
 
 2. Project dependencies
   [ok]   Python dependencies (uv sync)
-  ...    test-compiling the resume template (tectonic's first run downloads its support bundle)
-         tectonic: FAILED — tectonic failed (exit -6) — note: Running TeX ...
+  ...    test-compiling the resume and cover-letter templates (tectonic's first run downloads its support bundle)
+         tectonic: FAILED — resume: tectonic failed (exit -6) — note: Running TeX ...
          pdflatex: ok
-  [ok]   PDF generation (resume template compiles)
+  [ok]   PDF generation (both templates compile, text layer readable)
   [ok]   frontend dependencies (npm ci)
   [ok]   frontend built (frontend/dist)
   [ok]   Playwright Chromium
@@ -43,5 +43,5 @@ chromium launched, version: 151.0.7922.34
 === [6/6] backend test suite in this environment
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-213 passed, 1 warning in 26.44s
+217 passed, 1 skipped, 1 warning in 18.49s
 === MACOS FRESH-CLONE TEST PASS

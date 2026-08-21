@@ -7,7 +7,7 @@ v22.23.2
 uv 0.12.5 (aarch64-unknown-linux-gnu)
 Tectonic 0.17.0
 === [4/8] fresh clone + setup.sh
-provenance: cloned-from=/src ref=v2-linkedin-webapp head=b33d4fbb9dd48cb72356778a128615207ea691a5 date=2026-08-21T21:06:49Z os=Ubuntu 24.04.4 LTS arch=aarch64
+provenance: cloned-from=/src ref=v2-linkedin-webapp head=a3f85d26ccfbb3f4d690dca0fe89b08a19f73b3a date=2026-08-21T22:34:04Z os=Ubuntu 24.04.4 LTS arch=aarch64
 Job Agent setup
 
 1. Core toolchain
@@ -20,9 +20,9 @@ Job Agent setup
 
 2. Project dependencies
   [ok]   Python dependencies (uv sync)
-  ...    test-compiling the resume template (tectonic's first run downloads its support bundle)
+  ...    test-compiling the resume and cover-letter templates (tectonic's first run downloads its support bundle)
          tectonic: ok
-  [ok]   PDF generation (resume template compiles)
+  [ok]   PDF generation (both templates compile, text layer readable)
   [ok]   frontend dependencies (npm ci)
   [ok]   frontend built (frontend/dist)
   [ok]   Playwright Chromium
@@ -47,5 +47,5 @@ chromium launched, version: 151.0.7922.34
 === [8/8] backend test suite in this container
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-213 passed, 1 warning in 47.55s
+216 passed, 1 warning in 44.68s
 === UBUNTU FRESH-CLONE TEST PASS

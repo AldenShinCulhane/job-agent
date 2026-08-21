@@ -1,38 +1,70 @@
-Cross-engine geometry + font evidence for the last-page-fullness fix.
+Cross-engine geometry, font and text-layer evidence.
 
-provenance: repo=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=b33d4fbb9dd48cb72356778a128615207ea691a5 date=2026-08-21T21:07:29Z os=macOS-26.6.1 arch=arm64
-document:   backend/tests/test_resume.py::SAMPLE_PROFILE via backend/resume/template.py
-engines:    pdfTeX 3.141592653-2.6-1.40.29 (TeX Live 2026/Homebrew) | Tectonic 0.17.0
-note:       tectonic 0.17.0 here is the binary the clean-environment run
-            fetches from upstream; this host's own tectonic is 0.16.9 and
-            aborts on this template (SIGABRT), which is why the run below
-            invokes the 0.17.0 binary by path.
+provenance: repo=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=a3f85d26ccfbb3f4d690dca0fe89b08a19f73b3a date=2026-08-21T22:32:07Z os=Darwin-26.6.1 arch=arm64 worktree=clean
+document:   backend/tests/test_resume.py::SAMPLE_PROFILE through backend/resume/template.py and backend/tailor/cover.py
+engines:    pdflatex (pdflatex), tectonic (/Users/alden/.cache/job-agent-cleanenv.319mVo/tools/tectonic)
 
-=== pdflatex: 1 page(s), page height 792.0
-    content box   x0=36.259 y0=489.396 x1=527.125 y1=762.688
-    fullness BEFORE (pypdf visitor_text) = 0.9630
-    fullness AFTER  (this branch)        = 0.3451
-    SPARSE_FULLNESS = 0.35 -> balance pass fires: before=False after=True
-    runs the old code placed at the page origin: ['v2 ˜magic˜']
+=== pdflatex / resume: 1 page(s), page height 792.0
+    content box   x0=36.259 y0=489.612 x1=527.125 y1=762.876
+    fullness, pre-11edbca algorithm = 0.3450
+    fullness, this branch           = 0.3450
+    SPARSE_FULLNESS = 0.35 -> balance pass fires: pre=True now=True
+    runs the old algorithm placed at the page origin: []
+    text layer: 10/10 required fragments present
+      [ok  ] JaneDoe
+      [ok  ] AI&LLMSystems
+      [ok  ] jane@example.com
+      [ok  ] Acme&Sons{Ltd}
+      [ok  ] Cutcostsby50%usingC#&Rust_v2~magic~
+      [ok  ] Shipped3serviceswith99.9%uptime
+      [ok  ] Builta$100pipelinewith1-pageenforcement
+      [ok  ] Dean’sList
+      [ok  ] Mar2024–Present
+      [ok  ] Python,TypeScript,C#
 name                                 type              encoding         emb sub uni object ID
 ------------------------------------ ----------------- ---------------- --- --- --- ---------
-LUYQWG+NimbusSanL-Bold               Type 1            Custom           yes yes yes     28  0
+PUXEWB+NimbusSanL-Bold               Type 1            Custom           yes yes yes     28  0
 QSFJVA+FontAwesome5Free-Solid        Type 1            Custom           yes yes yes     29  0
-ZFLSDB+NimbusSanL-Regu               Type 1            Custom           yes yes yes     30  0
-LRJHTD+CMSY9                         Type 1            Builtin          yes yes yes     31  0
-QSFJVA+FontAwesome5Free-Solid        Type 1            Custom           yes yes yes     32  0
-PNYVII+FontAwesome5Brands-Regular    Type 1            Custom           yes yes yes     33  0
-AMMHYO+CMBSY10                       Type 1            Builtin          yes yes yes     34  0
-ZMLGLJ+NimbusSanL-ReguItal           Type 1            Custom           yes yes yes     35  0
-QHOACP+CMSY10                        Type 1            Builtin          yes yes yes     36  0
-ZIDBBK+CMSY6                         Type 1            Builtin          yes yes yes     37  0
+XSRIAG+NimbusSanL-Regu               Type 1            Custom           yes yes yes     30  0
+QSFJVA+FontAwesome5Free-Solid        Type 1            Custom           yes yes yes     31  0
+PNYVII+FontAwesome5Brands-Regular    Type 1            Custom           yes yes yes     32  0
+RILLKR+NimbusSanL-ReguItal           Type 1            Custom           yes yes yes     33  0
+ZIDBBK+CMSY6                         Type 1            Builtin          yes yes yes     34  0
+XDJWFC+CMSY10                        Type 1            Builtin          yes yes yes     35  0
 
-=== tectonic: 1 page(s), page height 792.0
+=== pdflatex / cover: 1 page(s), page height 792.0
+    content box   x0=72.000 y0=538.730 x1=72.000 y1=719.950
+    fullness, pre-11edbca algorithm = 0.2288
+    fullness, this branch           = 0.2288
+    SPARSE_FULLNESS = 0.35 -> balance pass fires: pre=True now=True
+    runs the old algorithm placed at the page origin: []
+    text layer: 5/5 required fragments present
+      [ok  ] JaneDoe
+      [ok  ] jane@example.com
+      [ok  ] DearAcme&Sons{Ltd}HiringTeam,
+      [ok  ] Icutcostsby50%usingC#&Rust_v2~magic~for$100.
+      [ok  ] Sincerely,
+name                                 type              encoding         emb sub uni object ID
+------------------------------------ ----------------- ---------------- --- --- --- ---------
+UIPYVQ+LMRoman10-Regular             Type 1            Custom           yes yes yes      8  0
+
+=== tectonic / resume: 1 page(s), page height 792.0
     content box   x0=36.000 y0=488.910 x1=527.073 y1=762.381
-    fullness BEFORE (pypdf visitor_text) = 0.3453
-    fullness AFTER  (this branch)        = 0.3453
-    SPARSE_FULLNESS = 0.35 -> balance pass fires: before=True after=True
-    runs the old code placed at the page origin: []
+    fullness, pre-11edbca algorithm = 0.3453
+    fullness, this branch           = 0.3453
+    SPARSE_FULLNESS = 0.35 -> balance pass fires: pre=True now=True
+    runs the old algorithm placed at the page origin: []
+    text layer: 10/10 required fragments present
+      [ok  ] JaneDoe
+      [ok  ] AI&LLMSystems
+      [ok  ] jane@example.com
+      [ok  ] Acme&Sons{Ltd}
+      [ok  ] Cutcostsby50%usingC#&Rust_v2~magic~
+      [ok  ] Shipped3serviceswith99.9%uptime
+      [ok  ] Builta$100pipelinewith1-pageenforcement
+      [ok  ] Dean’sList
+      [ok  ] Mar2024–Present
+      [ok  ] Python,TypeScript,C#
 name                                 type              encoding         emb sub uni object ID
 ------------------------------------ ----------------- ---------------- --- --- --- ---------
 IHAIZV+TeXGyreHeros-Bold-Identity-H  CID Type 0C       Identity-H       yes yes yes      4  0
@@ -42,4 +74,20 @@ TQTHRL+FontAwesome5Brands-Regular-Identity-H CID Type 0C       Identity-H       
 YEUUOC+TeXGyreHeros-Italic-Identity-H CID Type 0C       Identity-H       yes yes yes     16  0
 AKHCZK+CMSY6                         Type 1C           Builtin          yes yes yes     18  0
 VDVGTR+CMSY10                        Type 1C           Builtin          yes yes yes     20  0
+
+=== tectonic / cover: 1 page(s), page height 792.0
+    content box   x0=72.000 y0=538.730 x1=72.000 y1=719.950
+    fullness, pre-11edbca algorithm = 0.2288
+    fullness, this branch           = 0.2288
+    SPARSE_FULLNESS = 0.35 -> balance pass fires: pre=True now=True
+    runs the old algorithm placed at the page origin: []
+    text layer: 5/5 required fragments present
+      [ok  ] JaneDoe
+      [ok  ] jane@example.com
+      [ok  ] DearAcme&Sons{Ltd}HiringTeam,
+      [ok  ] Icutcostsby50%usingC#&Rust_v2~magic~for$100.
+      [ok  ] Sincerely,
+name                                 type              encoding         emb sub uni object ID
+------------------------------------ ----------------- ---------------- --- --- --- ---------
+IHAIZV+LMRoman10-Regular-Identity-H  CID Type 0C       Identity-H       yes yes yes      4  0
 

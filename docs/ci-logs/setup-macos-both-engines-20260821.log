@@ -1,5 +1,5 @@
-setup.sh on the development host, which has BOTH engines — tectonic 0.16.9 (broken on this template) and pdflatex.
-provenance: repo=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=b33d4fbb9dd48cb72356778a128615207ea691a5 date=2026-08-21T21:06:12Z os=macOS-26.6.1 arch=arm64
+setup.sh on this host, both engines installed (tectonic 0.16.9 + pdflatex).
+provenance: repo=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=a3f85d26ccfbb3f4d690dca0fe89b08a19f73b3a date=2026-08-21T22:32:36Z os=macOS-26.6.1 arch=arm64 non-log-changes=0
 
 Job Agent setup
 
@@ -14,10 +14,10 @@ Job Agent setup
 
 2. Project dependencies
   [ok]   Python dependencies (uv sync)
-  ...    test-compiling the resume template (tectonic's first run downloads its support bundle)
-         tectonic: FAILED — tectonic failed (exit -6) — note: Running TeX ...
+  ...    test-compiling the resume and cover-letter templates (tectonic's first run downloads its support bundle)
+         tectonic: FAILED — resume: tectonic failed (exit -6) — note: Running TeX ...
          pdflatex: ok
-  [ok]   PDF generation (resume template compiles)
+  [ok]   PDF generation (both templates compile, text layer readable)
   [ok]   frontend dependencies (npm ci)
   [ok]   frontend built (frontend/dist)
   [ok]   Playwright Chromium
