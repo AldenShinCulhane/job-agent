@@ -1,0 +1,43 @@
+=== [1/6] base packages
+debconf: delaying package configuration, since apt-utils is not installed
+=== [2/6] Node 22 (NodeSource)
+debconf: delaying package configuration, since apt-utils is not installed
+v22.23.2
+=== [3/6] uv + tectonic
+uv 0.12.5 (aarch64-unknown-linux-gnu)
+Tectonic 0.17.0
+=== [4/6] fresh clone + setup.sh
+provenance: cloned-from=/src ref=v2-linkedin-webapp head=3fbe22ba74a8fb27811489ade1521ea95ba48cd6 date=2026-08-21T16:58:17Z os=Ubuntu 24.04.4 LTS arch=aarch64
+Job Agent setup
+
+1. Core toolchain
+  [ok]   uv 0.12.5
+  [ok]   node v22.23.2 / npm 10.9.8
+  [ok]   tectonic 0.17.0
+  [warn] tesseract not found — needed only for scanned (image-based) resume PDFs. macOS: brew install tesseract | Ubuntu/Debian: sudo apt install tesseract-ocr
+  [warn] ocrmypdf not found — needed only for scanned resume PDFs. macOS: brew install ocrmypdf | Ubuntu/Debian: sudo apt install ocrmypdf
+  [warn] ghostscript not found — required by ocrmypdf. macOS: brew install ghostscript | Ubuntu/Debian: sudo apt install ghostscript
+
+2. Project dependencies
+  [ok]   Python dependencies (uv sync)
+  [ok]   frontend dependencies (npm ci)
+  [ok]   frontend built (frontend/dist)
+  [ok]   Playwright Chromium
+  [ok]   Chromium system dependencies
+
+3. Claude sign-in (uses your Claude subscription — no API key)
+  [warn] not signed in — run: uv run python -m backend.core.claude_cli auth login
+
+Setup finished with 4 warning(s) — optional features affected (details above).
+Start the app with: uv run job-agent   (then open http://127.0.0.1:8700)
+=== [5/6] boot + health
+status:   {"app":"job-agent","engine":{"status":"unprobed","model":null,"retry_in_seconds":null,"last_error":null}}
+settings: {"resume_page_limit":1,"engine":{"status":"unprobed","model":null,"retry_in_seconds":null,"last_error":null},"latex_engines":["tectonic"]}
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset= ...HTML ok
+.data perms: drwx------
+=== [6/6] real Chromium launch
+chromium launched, version: 151.0.7922.34
+=== UBUNTU FRESH-CLONE TEST PASS
