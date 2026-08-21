@@ -1,7 +1,7 @@
 === [0/6] sandbox
-sandbox: /Users/alden/.cache/job-agent-cleanenv.319mVo (left in place — nothing is ever deleted)
+sandbox: /Users/alden/.cache/job-agent-cleanenv.jWXLKB (left in place — nothing is ever deleted)
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
-HOME=/Users/alden/.cache/job-agent-cleanenv.319mVo/home
+HOME=/Users/alden/.cache/job-agent-cleanenv.jWXLKB/home
   absent: uv
   absent: node
   absent: npm
@@ -16,22 +16,25 @@ tectonic 0.17.0 (from tectonic-0.17.0-aarch64-apple-darwin.tar.gz)
 === [1/6] handing off to the fresh-clone test in this environment
 === [1/6] preflight
 ProductName:		macOS ProductVersion:		26.6.1 BuildVersion:		25G76 arch=arm64
-workdir: /Users/alden/.cache/job-agent-cleanenv.319mVo/work/job-agent-freshclone.HNSRjj (left in place — this script never deletes anything)
+workdir: /Users/alden/.cache/job-agent-cleanenv.jWXLKB/work/job-agent-freshclone.rdhl7O (left in place — this script never deletes anything)
 === [2/6] fresh clone + setup.sh
-provenance: cloned-from=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=83ba02eb9fb833aa0c9a33293ac5a021f90f2978 date=2026-08-21T19:29:25Z os=macOS-26.6.1 arch=arm64 home=/Users/alden/.cache/job-agent-cleanenv.319mVo/home
+provenance: cloned-from=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=b33d4fbb9dd48cb72356778a128615207ea691a5 date=2026-08-21T21:06:09Z os=macOS-26.6.1 arch=arm64 home=/Users/alden/.cache/job-agent-cleanenv.jWXLKB/home
 Job Agent setup
 
 1. Core toolchain
   installing uv (https://astral.sh/uv) ...
   [ok]   uv installed to ~/.local/bin
   [ok]   node v22.23.2 / npm 10.9.8
-  [ok]   tectonic 0.17.0
+  [ok]   tectonic found — Tectonic 0.17.0 (test-compiled in step 2)
   [warn] tesseract not found — needed only for scanned (image-based) resume PDFs. macOS: brew install tesseract | Ubuntu/Debian: sudo apt install tesseract-ocr
   [warn] ocrmypdf not found — needed only for scanned resume PDFs. macOS: brew install ocrmypdf | Ubuntu/Debian: sudo apt install ocrmypdf
   [warn] ghostscript not found — required by ocrmypdf. macOS: brew install ghostscript | Ubuntu/Debian: sudo apt install ghostscript
 
 2. Project dependencies
   [ok]   Python dependencies (uv sync)
+  ...    test-compiling the resume template (tectonic's first run downloads its support bundle)
+         tectonic: ok
+  [ok]   PDF generation (resume template compiles)
   [ok]   frontend dependencies (npm ci)
   [ok]   frontend built (frontend/dist)
   [ok]   Playwright Chromium
@@ -58,5 +61,5 @@ chromium launched, version: 151.0.7922.34
 === [6/6] backend test suite in this environment
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-204 passed, 1 warning in 36.09s
+213 passed, 1 warning in 34.24s
 === MACOS FRESH-CLONE TEST PASS

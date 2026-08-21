@@ -1,19 +1,25 @@
-=== [1/5] preflight
+=== [1/6] preflight
 ProductName:		macOS ProductVersion:		26.6.1 BuildVersion:		25G76 arch=arm64
-=== [2/5] fresh clone + setup.sh
-provenance: cloned-from=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=b5e5525f440eeb353214d2ad9d493b088f7c7ce1 date=2026-08-21T18:29:27Z os=macOS-26.6.1 arch=arm64
+workdir: /Users/alden/.cache/job-agent-freshclone.dQ8yXG (left in place — this script never deletes anything)
+=== [2/6] fresh clone + setup.sh
+provenance: cloned-from=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=b33d4fbb9dd48cb72356778a128615207ea691a5 date=2026-08-21T21:08:51Z os=macOS-26.6.1 arch=arm64 home=/Users/alden
 Job Agent setup
 
 1. Core toolchain
   [ok]   uv 0.12.5
   [ok]   node v25.9.0 / npm 11.12.1
-  [ok]   tectonic 0.16.9
+  [ok]   tectonic found — Tectonic 0.16.9 (test-compiled in step 2)
+  [ok]   pdflatex found — pdfTeX 3.141592653-2.6-1.40.29 (TeX Live 2026/Homebrew) (test-compiled in step 2)
   [ok]   tesseract 5.5.3
   [ok]   ocrmypdf 
   [ok]   ghostscript 10.07.1
 
 2. Project dependencies
   [ok]   Python dependencies (uv sync)
+  ...    test-compiling the resume template (tectonic's first run downloads its support bundle)
+         tectonic: FAILED — tectonic failed (exit -6) — note: Running TeX ...
+         pdflatex: ok
+  [ok]   PDF generation (resume template compiles)
   [ok]   frontend dependencies (npm ci)
   [ok]   frontend built (frontend/dist)
   [ok]   Playwright Chromium
@@ -23,8 +29,8 @@ Job Agent setup
 
 Setup finished with 1 warning(s) — optional features affected (details above).
 Start the app with: uv run job-agent   (then open http://127.0.0.1:8700)
-=== [3/5] boot with the documented entrypoint
-=== [4/5] health
+=== [3/6] boot with the documented entrypoint
+=== [4/6] health
 status:   {"app":"job-agent","engine":{"status":"unprobed","model":null,"retry_in_seconds":null,"last_error":null}}
 settings: {"resume_page_limit":1,"engine":{"status":"unprobed","model":null,"retry_in_seconds":null,"last_error":null},"latex_engines":["tectonic","pdflatex"]}
 <!doctype html>
@@ -32,6 +38,10 @@ settings: {"resume_page_limit":1,"engine":{"status":"unprobed","model":null,"ret
   <head>
     <meta charset= ...HTML ok
 .data perms: drwx------@
-=== [5/5] real Chromium launch
+=== [5/6] real Chromium launch
 chromium launched, version: 151.0.7922.34
+=== [6/6] backend test suite in this environment
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+213 passed, 1 warning in 26.44s
 === MACOS FRESH-CLONE TEST PASS

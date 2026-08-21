@@ -1,10 +1,17 @@
-=== [1/4] isolated checkout pinned to 83ba02eb9fb8 (/var/folders/_9/z70lf1dj4ld418jcklv2xl4m0000gn/T/job-agent-uploadcheck.rp_5uwwx)
+[note] the working checkout has uncommitted changes; they are NOT under test — this run tests committed b33d4fbb9dd4:
+M docs/ci-logs/macos-cleanenv-freshclone-20260821-PASS.log
+ M docs/ci-logs/macos-freshclone-20260821.log
+ M docs/ci-logs/ubuntu-freshclone-20260821.log
+?? docs/ci-logs/engines-geometry-fonts-20260821.log
+?? docs/ci-logs/setup-macos-both-engines-20260821.log
+?? docs/ci-logs/setup-macos-tectonic-only-20260821.log
+=== [1/4] isolated checkout pinned to b33d4fbb9dd4 (/var/folders/_9/z70lf1dj4ld418jcklv2xl4m0000gn/T/job-agent-uploadcheck.2nr9fort)
 === [2/4] building the frontend inside the isolated checkout
-=== [3/4] serving frontend/dist statically on http://127.0.0.1:57664 (no backend, no .data, no recovery)
+=== [3/4] serving frontend/dist statically on http://127.0.0.1:59419 (no backend, no .data, no recovery)
 === [4/4] browser check
 [ok] failure shown inline; file input cleared for a same-file retry
 [ok] same-file retry reached the API and the app advanced
-provenance: head=83ba02eb9fb833aa0c9a33293ac5a021f90f2978 ref=v2-linkedin-webapp date=2026-08-21T19:31:08Z served=http://127.0.0.1:57664 os=darwin-arm64
-binding: SHA-bound — bundle built from an isolated checkout pinned to 83ba02eb9fb8 (captured before the build) and served statically; the app backend was never started
-workdir left in place: /var/folders/_9/z70lf1dj4ld418jcklv2xl4m0000gn/T/job-agent-uploadcheck.rp_5uwwx
+provenance: head=b33d4fbb9dd48cb72356778a128615207ea691a5 ref=v2-linkedin-webapp date=2026-08-21T21:10:28Z served=http://127.0.0.1:59419 os=darwin-arm64
+binding: SHA-bound — bundle built from an isolated checkout pinned to b33d4fbb9dd4 (captured before the build) and served statically; the app backend was never started
+workdir left in place: /var/folders/_9/z70lf1dj4ld418jcklv2xl4m0000gn/T/job-agent-uploadcheck.2nr9fort
 === UPLOAD RETRY BROWSER CHECK PASS

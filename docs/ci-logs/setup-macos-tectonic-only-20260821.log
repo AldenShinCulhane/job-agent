@@ -1,0 +1,28 @@
+setup.sh with pdflatex removed from PATH — the reviewer's scenario: a machine whose ONLY LaTeX engine is a tectonic that cannot typeset this template (0.16.9).
+PATH holds symlinks to every Homebrew binary EXCEPT pdflatex/pdftex/xelatex/lualatex/latex, plus ~/.local/bin and the system dirs.
+provenance: repo=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=b33d4fbb9dd48cb72356778a128615207ea691a5 date=2026-08-21T21:06:45Z os=macOS-26.6.1 arch=arm64
+
+Job Agent setup
+
+1. Core toolchain
+  [ok]   uv 0.12.5
+  [ok]   node v25.9.0 / npm 11.12.1
+  [ok]   tectonic found — Tectonic 0.16.9 (test-compiled in step 2)
+  [ok]   tesseract 5.5.3
+  [ok]   ocrmypdf 
+  [ok]   ghostscript 10.07.1
+
+2. Project dependencies
+  [ok]   Python dependencies (uv sync)
+  ...    test-compiling the resume template (tectonic's first run downloads its support bundle)
+         tectonic: FAILED — tectonic failed (exit -6) — note: Running TeX ...
+  [warn] no installed LaTeX engine can typeset the resume template — resume and cover-letter PDFs WILL fail. tectonic must be 0.17+ (0.16.x aborts on this template): macOS: brew install tectonic | Linux: https://tectonic-typesetting.github.io/install.html — or install a TeX Live pdflatex. Re-check with: uv run python -m backend.tailor.smoke_pdf
+  [ok]   frontend dependencies (npm ci)
+  [ok]   frontend built (frontend/dist)
+  [ok]   Playwright Chromium
+
+3. Claude sign-in (uses your Claude subscription — no API key)
+  [ok]   signed in with a claude.ai subscription
+
+Setup finished with 1 warning(s) — including NO WORKING LaTeX ENGINE: the app runs, but every resume and cover-letter PDF will fail (details above).
+Start the app with: uv run job-agent   (then open http://127.0.0.1:8700)

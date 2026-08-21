@@ -1,0 +1,45 @@
+Cross-engine geometry + font evidence for the last-page-fullness fix.
+
+provenance: repo=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=b33d4fbb9dd48cb72356778a128615207ea691a5 date=2026-08-21T21:07:29Z os=macOS-26.6.1 arch=arm64
+document:   backend/tests/test_resume.py::SAMPLE_PROFILE via backend/resume/template.py
+engines:    pdfTeX 3.141592653-2.6-1.40.29 (TeX Live 2026/Homebrew) | Tectonic 0.17.0
+note:       tectonic 0.17.0 here is the binary the clean-environment run
+            fetches from upstream; this host's own tectonic is 0.16.9 and
+            aborts on this template (SIGABRT), which is why the run below
+            invokes the 0.17.0 binary by path.
+
+=== pdflatex: 1 page(s), page height 792.0
+    content box   x0=36.259 y0=489.396 x1=527.125 y1=762.688
+    fullness BEFORE (pypdf visitor_text) = 0.9630
+    fullness AFTER  (this branch)        = 0.3451
+    SPARSE_FULLNESS = 0.35 -> balance pass fires: before=False after=True
+    runs the old code placed at the page origin: ['v2 ˜magic˜']
+name                                 type              encoding         emb sub uni object ID
+------------------------------------ ----------------- ---------------- --- --- --- ---------
+LUYQWG+NimbusSanL-Bold               Type 1            Custom           yes yes yes     28  0
+QSFJVA+FontAwesome5Free-Solid        Type 1            Custom           yes yes yes     29  0
+ZFLSDB+NimbusSanL-Regu               Type 1            Custom           yes yes yes     30  0
+LRJHTD+CMSY9                         Type 1            Builtin          yes yes yes     31  0
+QSFJVA+FontAwesome5Free-Solid        Type 1            Custom           yes yes yes     32  0
+PNYVII+FontAwesome5Brands-Regular    Type 1            Custom           yes yes yes     33  0
+AMMHYO+CMBSY10                       Type 1            Builtin          yes yes yes     34  0
+ZMLGLJ+NimbusSanL-ReguItal           Type 1            Custom           yes yes yes     35  0
+QHOACP+CMSY10                        Type 1            Builtin          yes yes yes     36  0
+ZIDBBK+CMSY6                         Type 1            Builtin          yes yes yes     37  0
+
+=== tectonic: 1 page(s), page height 792.0
+    content box   x0=36.000 y0=488.910 x1=527.073 y1=762.381
+    fullness BEFORE (pypdf visitor_text) = 0.3453
+    fullness AFTER  (this branch)        = 0.3453
+    SPARSE_FULLNESS = 0.35 -> balance pass fires: before=True after=True
+    runs the old code placed at the page origin: []
+name                                 type              encoding         emb sub uni object ID
+------------------------------------ ----------------- ---------------- --- --- --- ---------
+IHAIZV+TeXGyreHeros-Bold-Identity-H  CID Type 0C       Identity-H       yes yes yes      4  0
+BZIVMZ+FontAwesome5Free-Solid-Identity-H CID Type 0C       Identity-H       yes yes no       6  0
+IXFAWU+TeXGyreHeros-Regular-Identity-H CID Type 0C       Identity-H       yes yes yes      8  0
+TQTHRL+FontAwesome5Brands-Regular-Identity-H CID Type 0C       Identity-H       yes yes no      12  0
+YEUUOC+TeXGyreHeros-Italic-Identity-H CID Type 0C       Identity-H       yes yes yes     16  0
+AKHCZK+CMSY6                         Type 1C           Builtin          yes yes yes     18  0
+VDVGTR+CMSY10                        Type 1C           Builtin          yes yes yes     20  0
+
