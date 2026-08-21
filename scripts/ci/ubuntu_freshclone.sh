@@ -30,6 +30,11 @@ fi
 echo "=== [4/6] fresh clone + setup.sh"
 git clone -q /src /work/job-agent
 cd /work/job-agent
+echo "provenance: cloned-from=$(git remote get-url origin)" \
+     "ref=$(git rev-parse --abbrev-ref HEAD)" \
+     "head=$(git rev-parse HEAD)" \
+     "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+     "os=$(. /etc/os-release && echo "$PRETTY_NAME") arch=$(uname -m)"
 ./scripts/setup.sh
 
 echo "=== [5/6] boot + health"

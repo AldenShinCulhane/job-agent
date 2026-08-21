@@ -107,13 +107,14 @@ async def get_settings():
 @router.put("/settings")
 async def put_settings(body: dict):
     limit = body.get("resume_page_limit")
-    # Any strictly positive integer the DB can hold (PLAN.md: the page
-    # limit is the user's N, not a preset) — reject zero, negatives,
-    # booleans, strings, and values past SQLite's integer range.
-    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit < 2**31:
+    # The page limit is the user's N, not a preset (PLAN.md). Accepted
+    # range is 1..2**31-1 — an app-chosen cap (SQLite INTEGER itself is
+    # signed 64-bit); rejects zero, negatives, fractions, booleans, and
+    # strings.
+    if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 2**31 - 1:
         raise HTTPException(
             status_code=422,
-            detail="resume_page_limit must be a positive integer.",
+            detail="resume_page_limit must be a positive integer (1..2147483647).",
         )
     # The limit is read once at gate 3 and pinned into each package's
     # identity, so this change only shapes future selections — packages

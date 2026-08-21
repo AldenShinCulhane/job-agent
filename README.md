@@ -177,5 +177,6 @@ all reasoning.
 ## License
 
 [MIT](LICENSE). Note the redistributor caveat above: shipping a product
-that offers claude.ai sign-in needs Anthropic's approval regardless of
-this code's license.
+that offers claude.ai sign-in needs Anthropic's approval (see the
+[Agent SDK terms](https://code.claude.com/docs/en/agent-sdk/overview))
+regardless of this code's license.
