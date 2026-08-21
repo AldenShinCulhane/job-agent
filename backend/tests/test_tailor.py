@@ -870,6 +870,56 @@ async def test_usage_exhausted_is_durable_and_batch_resumes(
     assert [db.get_package(p)["status"] for p in packages] == ["done"] * 3
 
 
+async def test_usage_retry_timer_resumes_batch_without_manual_kick(
+    test_db, tmp_path, monkeypatch
+):
+    """Timer-driven recovery: after a usage limit parks the batch, the
+    armed retry task ALONE — no manual run_batch call, no user action —
+    respawns the worker once the cooldown elapses and the package
+    completes. (Scoring uses the same mechanism via _arm_pipeline_retry.)"""
+    from backend.api import routes
+    from backend.core import llm
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    pkg, _ = db.create_package("p1", version, "hash-a")
+
+    calls = []
+
+    def behavior(job):
+        calls.append(1)
+        if len(calls) == 1:
+            raise llm.UsageExhausted("usage limit cooldown: retry in 60s")
+        return _cited_tailored()[0]
+
+    _tailor_env(monkeypatch, tmp_path, behavior=behavior)
+    monkeypatch.setattr(routes, "_package_retry_task", None)
+    monkeypatch.setattr(routes, "_package_worker_task", None)
+    monkeypatch.setattr(routes.random, "uniform", lambda a, b: 0.0)
+
+    armed = []
+    real_arm = routes._arm_package_retry
+
+    def capture_arm(delay):
+        armed.append(delay)
+        real_arm(0.0)  # same mechanism, cooldown treated as elapsed
+
+    monkeypatch.setattr(routes, "_arm_package_retry", capture_arm)
+
+    await routes._package_batch_worker()  # hits the limit, arms the timer
+    assert armed and armed[0] >= 60.0  # delay covers the cooldown floor
+    assert db.get_package(pkg)["status"] == "waiting_usage"
+
+    await routes._package_retry_task  # the timer itself drives recovery
+    worker = routes._package_worker_task
+    assert worker is not None  # ...by respawning the batch worker
+    await worker
+    assert db.get_package(pkg)["status"] == "done"
+    assert calls == [1, 1]  # one failed attempt, one timer-driven success
+
+
 async def test_engine_blocked_parks_package_queued_and_stops_batch(
     test_db, tmp_path, monkeypatch
 ):

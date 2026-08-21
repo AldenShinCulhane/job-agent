@@ -147,8 +147,11 @@ shipping something oversized or untrue.
 ## When something stops
 
 Every stop state is autonomous-by-default and visible: a banner explains
-what happened and the way out. Claude usage limit → pauses and resumes
-itself; Claude sign-in expired → banner with the login command
+what happened and the way out. Claude usage limit → queued scoring and
+package work pauses and resumes itself (never lost); one-off actions you
+trigger yourself (uploading a resume, Explain, Re-rank) fail with a clear
+error instead — retry them after the countdown; Claude sign-in expired →
+banner with the login command
 (Settings has a re-check button); LinkedIn checkpoint → search stops
 cleanly, you solve it in the browser window and press Connect — the
 search then resumes on its own; LinkedIn session expired → reconnect

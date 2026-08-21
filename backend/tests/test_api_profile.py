@@ -112,6 +112,91 @@ def test_settings_roundtrip_and_validation(client):
     assert client.get("/api/settings").json()["resume_page_limit"] == 2**31 - 1
 
 
+def test_upload_usage_failure_is_request_scoped_and_retriable(client, monkeypatch):
+    """A usage limit during resume extraction is request-scoped: the
+    upload fails 503 with nothing persisted and NO retry timer armed —
+    the user retries after the countdown (only queued scoring/package
+    work has an automatic retry owner)."""
+    from backend.api import routes
+    from backend.core import llm
+    from backend.resume import ingest
+
+    armed = []
+    monkeypatch.setattr(routes, "_arm_pipeline_retry", lambda d: armed.append(d))
+    monkeypatch.setattr(routes, "_arm_package_retry", lambda d: armed.append(d))
+    monkeypatch.setattr(ingest, "extract_text", lambda path: ("resume text", "text"))
+    calls = []
+
+    async def flaky_extract(text):
+        calls.append(1)
+        if len(calls) == 1:
+            raise llm.UsageExhausted("usage limit cooldown: retry in 300s")
+        return SAMPLE_PROFILE
+
+    monkeypatch.setattr(ingest, "extract_profile", flaky_extract)
+    files = {"file": ("resume.pdf", b"%PDF-fake", "application/pdf")}
+    res = client.post("/api/profile/upload", files=files)
+    assert res.status_code == 503
+    assert "usage limit cooldown" in res.json()["detail"]
+    assert client.get("/api/profile").json()["version"] is None  # nothing persisted
+    assert armed == []  # no automatic retry owner for this path
+
+    # After the cooldown, the user's own retry succeeds cleanly.
+    files = {"file": ("resume.pdf", b"%PDF-fake", "application/pdf")}
+    res = client.post("/api/profile/upload", files=files)
+    assert res.status_code == 200
+    assert res.json()["profile"]["name"] == SAMPLE_PROFILE["name"]
+
+
+def test_explain_and_rerank_usage_failures_are_request_scoped(client, monkeypatch):
+    """On-demand explain and rerank surface a usage limit as 503 without
+    arming any retry timer; the same action succeeds when repeated after
+    the cooldown."""
+    from backend.api import routes
+    from backend.core import llm
+
+    armed = []
+    monkeypatch.setattr(routes, "_arm_pipeline_retry", lambda d: armed.append(d))
+    monkeypatch.setattr(routes, "_arm_package_retry", lambda d: armed.append(d))
+
+    async def usage_boom(*args, **kwargs):
+        raise llm.UsageExhausted("usage limit cooldown: retry in 300s")
+
+    monkeypatch.setattr(routes.llm_layer, "explain_job", usage_boom)
+    res = client.post("/api/jobs/j1/explain")
+    assert res.status_code == 503
+    assert "usage limit cooldown" in res.json()["detail"]
+
+    db.create_search_run({"keywords": "engineer"})
+    monkeypatch.setattr(routes.llm_layer, "rerank_close_matches", usage_boom)
+    res = client.post("/api/search/rerank")
+    assert res.status_code == 503
+    assert armed == []  # request-scoped on both paths
+
+    async def ok_explain(job_id):
+        return {"job_id": job_id, "strengths": [], "gaps": [], "pitch": ""}
+
+    async def ok_rerank(run_id):
+        return {"reranked": 0}
+
+    monkeypatch.setattr(routes.llm_layer, "explain_job", ok_explain)
+    monkeypatch.setattr(routes.llm_layer, "rerank_close_matches", ok_rerank)
+    assert client.post("/api/jobs/j1/explain").status_code == 200
+    assert client.post("/api/search/rerank").status_code == 200
+
+
+def test_invalid_upload_returns_422_and_persists_nothing(client):
+    """PLAN.md M5 recovery case 'invalid upload': the real ingest path
+    rejects an unsupported file with a 422 whose detail the Onboarding
+    page shows inline; no profile row is created and the app needs no
+    recovery — the user just uploads a supported file."""
+    files = {"file": ("resume.xyz", b"not a resume", "application/octet-stream")}
+    res = client.post("/api/profile/upload", files=files)
+    assert res.status_code == 422
+    assert "Unsupported" in res.json()["detail"]
+    assert client.get("/api/profile").json()["version"] is None
+
+
 def test_status_polls_are_pure_and_cover_recovery_states(client, monkeypatch):
     """The two 20-second polls behind the recovery banners — GET
     /api/status and GET /api/linkedin/status — are read-only: no worker

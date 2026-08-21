@@ -47,7 +47,12 @@ export default function RecoveryBanners({
     banners.push({
       key: 'engine-usage',
       tone: 'bg-amber-50 text-amber-800 border-amber-200',
-      text: `Claude usage limit reached — work is paused and resumes automatically${retry ? ` in ${retry}` : ''}. Nothing is lost.`,
+      // Honest scope: queued scoring/package work has a retry timer and
+      // is never lost; one-off actions (upload, Explain, Re-rank) are
+      // request-scoped — they fail now and the user retries them.
+      text: retry
+        ? `Claude usage limit reached — queued scoring and package work is paused, resumes automatically in ${retry}, and is never lost. Actions you trigger yourself (resume upload, Explain, Re-rank) will fail until then — retry them after the countdown.`
+        : 'Claude usage limit was reached — the cooldown has passed. Queued scoring and package work retries on its own; if an action of yours failed (resume upload, Explain, Re-rank), run it again now.',
     })
   }
   if (linkedin?.state === 'captcha_stop') {
