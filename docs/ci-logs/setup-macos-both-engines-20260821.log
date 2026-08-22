@@ -1,5 +1,5 @@
 setup.sh on this host, both engines installed (tectonic 0.16.9 + pdflatex).
-provenance: repo=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=9379441f62d6dc98aba52e5383859c2484e9fa3c date=2026-08-21T23:44:41Z os=macOS-26.6.1 arch=arm64 uncommitted-changes=0
+provenance: repo=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=61670ea14935a51570fa3b19c603ba8aaf742288 date=2026-08-22T00:11:50Z os=macOS-26.6.1 arch=arm64 uncommitted-changes=0
 
 Job Agent setup
 

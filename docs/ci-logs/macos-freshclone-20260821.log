@@ -1,8 +1,8 @@
 === [1/6] preflight
 ProductName:		macOS ProductVersion:		26.6.1 BuildVersion:		25G76 arch=arm64
-workdir: /Users/alden/.cache/job-agent-freshclone.DR0kiw (left in place — this script never deletes anything)
+workdir: /Users/alden/.cache/job-agent-freshclone.5nABVJ (left in place — this script never deletes anything)
 === [2/6] fresh clone + setup.sh
-provenance: cloned-from=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=9379441f62d6dc98aba52e5383859c2484e9fa3c date=2026-08-21T23:46:20Z os=macOS-26.6.1 arch=arm64 home=/Users/alden
+provenance: cloned-from=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=61670ea14935a51570fa3b19c603ba8aaf742288 date=2026-08-22T00:12:09Z os=macOS-26.6.1 arch=arm64 home=/Users/alden
 Job Agent setup
 
 1. Core toolchain
@@ -43,5 +43,5 @@ chromium launched, version: 151.0.7922.34
 === [6/6] backend test suite in this environment
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-221 passed, 1 skipped, 1 warning in 14.51s
+223 passed, 1 skipped, 1 warning in 14.65s
 === MACOS FRESH-CLONE TEST PASS

@@ -1,6 +1,6 @@
 Cross-engine geometry, font and text-layer evidence.
 
-provenance: repo=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=9379441f62d6dc98aba52e5383859c2484e9fa3c date=2026-08-21T23:44:31Z os=Darwin-26.6.1 arch=arm64 worktree=clean
+provenance: repo=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=61670ea14935a51570fa3b19c603ba8aaf742288 date=2026-08-22T00:10:48Z os=Darwin-26.6.1 arch=arm64 worktree=clean
 document:   backend/tests/test_resume.py::SAMPLE_PROFILE through backend/resume/template.py and backend/tailor/cover.py
 engines:    pdflatex (pdflatex), tectonic (/Users/alden/.cache/job-agent-cleanenv.319mVo/tools/tectonic)
 

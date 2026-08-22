@@ -1,7 +1,7 @@
 === [0/6] sandbox
-sandbox: /Users/alden/.cache/job-agent-cleanenv.QusZB8 (left in place — nothing is ever deleted)
+sandbox: /Users/alden/.cache/job-agent-cleanenv.Fjo7uw (left in place — nothing is ever deleted)
 PATH=/usr/bin:/bin:/usr/sbin:/sbin
-HOME=/Users/alden/.cache/job-agent-cleanenv.QusZB8/home
+HOME=/Users/alden/.cache/job-agent-cleanenv.Fjo7uw/home
   absent: uv
   absent: node
   absent: npm
@@ -16,9 +16,9 @@ tectonic 0.17.0 (from tectonic-0.17.0-aarch64-apple-darwin.tar.gz)
 === [1/6] handing off to the fresh-clone test in this environment
 === [1/6] preflight
 ProductName:		macOS ProductVersion:		26.6.1 BuildVersion:		25G76 arch=arm64
-workdir: /Users/alden/.cache/job-agent-cleanenv.QusZB8/work/job-agent-freshclone.Y5Or26 (left in place — this script never deletes anything)
+workdir: /Users/alden/.cache/job-agent-cleanenv.Fjo7uw/work/job-agent-freshclone.RjA4va (left in place — this script never deletes anything)
 === [2/6] fresh clone + setup.sh
-provenance: cloned-from=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=9379441f62d6dc98aba52e5383859c2484e9fa3c date=2026-08-21T23:45:11Z os=macOS-26.6.1 arch=arm64 home=/Users/alden/.cache/job-agent-cleanenv.QusZB8/home
+provenance: cloned-from=/Users/alden/Desktop/job-agent ref=v2-linkedin-webapp head=61670ea14935a51570fa3b19c603ba8aaf742288 date=2026-08-22T00:10:45Z os=macOS-26.6.1 arch=arm64 home=/Users/alden/.cache/job-agent-cleanenv.Fjo7uw/home
 Job Agent setup
 
 1. Core toolchain
@@ -61,5 +61,5 @@ chromium launched, version: 151.0.7922.34
 === [6/6] backend test suite in this environment
 
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
-220 passed, 1 warning in 10.26s
+222 passed, 1 warning in 10.45s
 === MACOS FRESH-CLONE TEST PASS
