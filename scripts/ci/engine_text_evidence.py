@@ -130,10 +130,17 @@ def report(kind: str, tex: str, engine: str, binary: str, expected: tuple,
         mark = "ok  " if frag in packed else "GONE"
         print(f"      [{mark}] {frag}")
 
-    fonts = subprocess.run(["pdffonts", str(result.pdf_path)],
-                           capture_output=True, text=True)
-    print(fonts.stdout.strip() if fonts.returncode == 0
-          else "    (pdffonts not installed)")
+    # pdffonts is genuinely optional here, so a machine without poppler
+    # must print that and carry on — an uncaught FileNotFoundError would
+    # turn "no poppler" into a failed evidence run.
+    try:
+        fonts = subprocess.run(["pdffonts", str(result.pdf_path)],
+                               capture_output=True, text=True)
+    except FileNotFoundError:
+        print("    (pdffonts not installed — poppler absent)")
+    else:
+        print(fonts.stdout.strip() if fonts.returncode == 0
+              else f"    (pdffonts failed: {fonts.stderr.strip()})")
     print()
     return not missing and result.pages == 1
 

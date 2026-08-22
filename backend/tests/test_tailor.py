@@ -1,6 +1,7 @@
 """Tailoring pipeline tests (PLAN.md §4.5/§4.6, M4). All data fake."""
 
 import json
+import sqlite3
 
 import pytest
 
@@ -1027,14 +1028,9 @@ def test_template_upgrade_supersedes_only_unfinished_packages(
     assert kept["error"] is None
 
 
-def test_package_identity_migration_keeps_published_rows(tmp_path, monkeypatch):
-    """Databases written before the template versions joined package
-    identity hold real packages whose PDFs are on disk. The migration
-    rebuilds the table without losing one, pinning each row to the
-    versions its own provenance records — or to 1 where it predates the
-    record."""
-    import sqlite3
-
+def _legacy_packages_db(tmp_path, monkeypatch) -> None:
+    """A database as it stood before the template versions joined package
+    identity: two rows, one carrying provenance and one predating it."""
     monkeypatch.setattr(db, "DATA_DIR", tmp_path)
     monkeypatch.setattr(db, "DB_PATH", tmp_path / "legacy.sqlite3")
     db.init()
@@ -1075,6 +1071,24 @@ def test_package_identity_migration_keeps_published_rows(tmp_path, monkeypatch):
     conn.commit()
     conn.close()
 
+
+def _table_names() -> set[str]:
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        return {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+    finally:
+        conn.close()
+
+
+def test_package_identity_migration_keeps_published_rows(tmp_path, monkeypatch):
+    """Databases written before the template versions joined package
+    identity hold real packages whose PDFs are on disk. The migration
+    rebuilds the table without losing one, pinning each row to the
+    versions its own provenance records — or to 1 where it predates the
+    record."""
+    _legacy_packages_db(tmp_path, monkeypatch)
+
     db.init()  # the upgrade
 
     kept = db.get_package(7)
@@ -1085,6 +1099,7 @@ def test_package_identity_migration_keeps_published_rows(tmp_path, monkeypatch):
     assert predating["page_limit"] == 2 and predating["status"] == "queued"
     assert predating["template_version"] == 1
     assert {row["id"] for row in db.list_packages()} <= {7, 8}
+    assert "packages_pre_tpl_version" not in _table_names()
 
     # And identity is genuinely wider now: same four old inputs, newer
     # templates, new row.
@@ -1092,6 +1107,67 @@ def test_package_identity_migration_keeps_published_rows(tmp_path, monkeypatch):
                                        template_version=2,
                                        cover_template_version=2)
     assert created is True and fresh != 7
+
+
+def test_failed_package_migration_rolls_back_whole(tmp_path, monkeypatch):
+    """A migration that dies partway must leave the OLD table
+    authoritative, not a renamed table beside an empty new one.
+
+    That half-state is unrecoverable by design: `packages` would carry
+    `template_version`, so the next startup would skip the migration
+    forever while every published row sat in `packages_pre_tpl_version`,
+    invisible to the app, its PDFs still on disk. Rolling back whole
+    means the next startup just tries again.
+    """
+    _legacy_packages_db(tmp_path, monkeypatch)
+
+    monkeypatch.setattr(db, "_COPY_PACKAGES_SQL",
+                        "INSERT INTO packages (id) SELECT no_such_column "
+                        "FROM packages_pre_tpl_version")
+    with pytest.raises(sqlite3.OperationalError):
+        db.init()
+
+    # Old table, old shape, both rows visible, nothing left half-renamed.
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(packages)")}
+        rows = conn.execute(
+            "SELECT id, status, output_dir FROM packages ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    assert "template_version" not in cols
+    assert rows == [(7, "done", "/out/p1"), (8, "queued", None)]
+    assert "packages_pre_tpl_version" not in _table_names()
+
+    # And the retry succeeds: a rolled-back migration is not a dead end.
+    monkeypatch.undo()
+    monkeypatch.setattr(db, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(db, "DB_PATH", tmp_path / "legacy.sqlite3")
+    db.init()
+    assert db.get_package(7)["output_dir"] == "/out/p1"
+    assert db.get_package(8)["template_version"] == 1
+    assert "packages_pre_tpl_version" not in _table_names()
+
+
+def test_short_package_migration_copy_is_refused(tmp_path, monkeypatch):
+    """Counting the copy is the other half of the guard: a statement that
+    succeeds while dropping rows would otherwise commit, and the dropped
+    packages would be gone with the old table."""
+    _legacy_packages_db(tmp_path, monkeypatch)
+
+    monkeypatch.setattr(
+        db, "_COPY_PACKAGES_SQL",
+        db._COPY_PACKAGES_SQL + " WHERE id = 7")  # loses row 8
+    with pytest.raises(sqlite3.IntegrityError, match="copied 1 of 2 rows"):
+        db.init()
+
+    conn = sqlite3.connect(db.DB_PATH)
+    try:
+        rows = conn.execute("SELECT id FROM packages ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    assert rows == [(7,), (8,)]
+    assert "packages_pre_tpl_version" not in _table_names()
 
 
 async def test_restart_mid_batch_completes_without_duplicate_generation(

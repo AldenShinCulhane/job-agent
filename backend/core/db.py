@@ -13,6 +13,30 @@ from pathlib import Path
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / ".data"
 DB_PATH = DATA_DIR / "job_agent.sqlite3"
 
+# The packages table stands alone because the migration below must
+# create it inside a transaction, where `executescript()` cannot go.
+_PACKAGES_TABLE = """
+CREATE TABLE IF NOT EXISTS packages (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id                TEXT NOT NULL,
+    profile_version       INTEGER NOT NULL,
+    jd_hash               TEXT NOT NULL,
+    page_limit            INTEGER NOT NULL DEFAULT 1,
+    template_version      INTEGER NOT NULL DEFAULT 1,
+    cover_template_version INTEGER NOT NULL DEFAULT 1,
+    status                TEXT NOT NULL DEFAULT 'queued',
+    stage_json            TEXT,
+    error                 TEXT,
+    retry_count           INTEGER NOT NULL DEFAULT 0,
+    provenance_json       TEXT,
+    output_dir            TEXT,
+    created_at            TEXT NOT NULL,
+    updated_at            TEXT NOT NULL,
+    UNIQUE (job_id, profile_version, jd_hash, page_limit,
+            template_version, cover_template_version)
+);
+"""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS engine_state (
     key        TEXT PRIMARY KEY,
@@ -84,26 +108,7 @@ CREATE TABLE IF NOT EXISTS job_scores (
     explanation_json    TEXT,
     scored_at           TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS packages (
-    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id                TEXT NOT NULL,
-    profile_version       INTEGER NOT NULL,
-    jd_hash               TEXT NOT NULL,
-    page_limit            INTEGER NOT NULL DEFAULT 1,
-    template_version      INTEGER NOT NULL DEFAULT 1,
-    cover_template_version INTEGER NOT NULL DEFAULT 1,
-    status                TEXT NOT NULL DEFAULT 'queued',
-    stage_json            TEXT,
-    error                 TEXT,
-    retry_count           INTEGER NOT NULL DEFAULT 0,
-    provenance_json       TEXT,
-    output_dir            TEXT,
-    created_at            TEXT NOT NULL,
-    updated_at            TEXT NOT NULL,
-    UNIQUE (job_id, profile_version, jd_hash, page_limit,
-            template_version, cover_template_version)
-);
-"""
+""" + _PACKAGES_TABLE
 
 # One-shot schema fixes for databases created by earlier revisions of
 # this branch (executescript's IF NOT EXISTS cannot alter shapes).
@@ -113,6 +118,21 @@ _MIGRATIONS = (
     "DROP TABLE IF EXISTS job_requirements",
     # rerank rank ordinal added after the table first shipped.
     "ALTER TABLE job_scores ADD COLUMN llm_rank INTEGER",
+)
+
+
+# Named so a test can replace it with a statement that fails, and prove
+# the migration rolls back whole rather than half.
+_COPY_PACKAGES_SQL = (
+    "INSERT INTO packages (id, job_id, profile_version, jd_hash, "
+    "page_limit, template_version, cover_template_version, status, "
+    "stage_json, error, retry_count, provenance_json, output_dir, "
+    "created_at, updated_at) "
+    "SELECT id, job_id, profile_version, jd_hash, page_limit, "
+    "COALESCE(json_extract(provenance_json, '$.template_version'), 1), "
+    "COALESCE(json_extract(provenance_json, '$.cover_template_version'), 1), "
+    "status, stage_json, error, retry_count, provenance_json, "
+    "output_dir, created_at, updated_at FROM packages_pre_tpl_version"
 )
 
 
@@ -127,21 +147,34 @@ def _widen_package_identity(conn) -> None:
     way they keep the identity they were built under, and a selection
     made under newer templates becomes a new package instead of silently
     returning the old documents.
+
+    All four steps run inside one transaction, and the copy is counted
+    before the old table goes. Half a migration is worse than none: if
+    the rename and the CREATE landed but the copy did not, the next
+    startup would find `template_version` on an empty `packages`, skip
+    this function forever, and every published row — PDFs still on disk
+    — would be gone from the app with no way back. That is why
+    `executescript()` cannot appear here: it COMMITs whatever is open
+    before it runs, which is precisely the split that leaves that state
+    behind. A crash mid-way now rolls back to the old table, and the
+    next startup simply migrates again.
     """
-    conn.execute("ALTER TABLE packages RENAME TO packages_pre_tpl_version")
-    conn.executescript(_SCHEMA)
-    conn.execute(
-        "INSERT INTO packages (id, job_id, profile_version, jd_hash, "
-        "page_limit, template_version, cover_template_version, status, "
-        "stage_json, error, retry_count, provenance_json, output_dir, "
-        "created_at, updated_at) "
-        "SELECT id, job_id, profile_version, jd_hash, page_limit, "
-        "COALESCE(json_extract(provenance_json, '$.template_version'), 1), "
-        "COALESCE(json_extract(provenance_json, '$.cover_template_version'), 1), "
-        "status, stage_json, error, retry_count, provenance_json, "
-        "output_dir, created_at, updated_at FROM packages_pre_tpl_version"
-    )
-    conn.execute("DROP TABLE packages_pre_tpl_version")
+    conn.commit()  # nothing of ours rides along inside this transaction
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        before = conn.execute("SELECT count(*) FROM packages").fetchone()[0]
+        conn.execute("ALTER TABLE packages RENAME TO packages_pre_tpl_version")
+        conn.execute(_PACKAGES_TABLE)
+        conn.execute(_COPY_PACKAGES_SQL)
+        after = conn.execute("SELECT count(*) FROM packages").fetchone()[0]
+        if after != before:
+            raise sqlite3.IntegrityError(
+                f"package migration copied {after} of {before} rows")
+        conn.execute("DROP TABLE packages_pre_tpl_version")
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
 
 
 def init() -> None:
