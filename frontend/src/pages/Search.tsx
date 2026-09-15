@@ -1,7 +1,11 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { api, packageFileUrl } from '../api'
 import type { Explanation, Job, LinkedInStatus, Package, SearchRun } from '../api'
+import { useEpochEffect } from '../useEventStream'
+import type { Epochs } from '../useEventStream'
+import { useLatestOnly } from '../useLatestOnly'
+import type { ReadOptions } from '../useLatestOnly'
 
 const inputCls =
   'w-full rounded-md border border-slate-300 px-2 py-1 text-sm focus:border-slate-500 focus:outline-none'
@@ -15,6 +19,21 @@ const LINKEDIN_STATES: Record<string, { label: string; tone: string }> = {
   captcha_stop: { label: 'Checkpoint — stopped', tone: 'bg-rose-100 text-rose-800' },
   error: { label: 'Browser error', tone: 'bg-rose-100 text-rose-800' },
 }
+
+/** The four endpoints an event can invalidate on this page. */
+type Slice = 'linkedin' | 'run' | 'jobs' | 'packages' | 'profile'
+
+const NOTHING_OWED: Record<Slice, boolean> = {
+  linkedin: false,
+  run: false,
+  jobs: false,
+  packages: false,
+  profile: false,
+}
+
+// How often a slice that is owed a refresh, but whose last read failed,
+// tries again. Only ever fires while something is actually owed.
+const OWED_RETRY_MS = 5_000
 
 const RUN_LABELS: Record<string, string> = {
   running: 'Searching…',
@@ -67,7 +86,13 @@ const acceptPlaceholderOnTab =
     }
   }
 
-export default function Search() {
+export default function Search({
+  epochs,
+  connected,
+}: {
+  epochs: Epochs
+  connected: boolean
+}) {
   const [linkedin, setLinkedin] = useState<LinkedInStatus | null>(null)
   const [run, setRun] = useState<SearchRun | null>(null)
   const [jobs, setJobs] = useState<Job[]>([])
@@ -96,38 +121,155 @@ export default function Search() {
   const [workplace, setWorkplace] = useState<string[]>([])
   const [experience, setExperience] = useState<string[]>([])
   const [cap, setCap] = useState(100)
+  // Which run the rows ON SCREEN came from. Two copies on purpose: the
+  // ref is read synchronously inside the response handler (a useCallback
+  // closure cannot see current state), the state is what the render needs
+  // — while it disagrees with `run`, the rows belong to a result set that
+  // has already been superseded.
+  const jobsRunIdRef = useRef<number | null>(null)
+  const [jobsRunId, setJobsRunId] = useState<number | null>(null)
 
-  const refresh = useCallback(async () => {
+  // One refetcher per topic the event stream can invalidate. Each is the
+  // single place its slice of state is written, so an event refetches
+  // exactly the endpoint that owns what changed and nothing else.
+  // One ticket sequence per endpoint — an event refetch and a
+  // reconciliation poll overlap constantly, and the older answer must
+  // not be the one that lands last.
+  const readLinkedin = useLatestOnly()
+  const readRun = useLatestOnly()
+  const readJobs = useLatestOnly()
+  const readPackages = useLatestOnly()
+  const readProfile = useLatestOnly()
+
+  // Which slices are known stale and have not been successfully re-read.
+  // An event says "this went stale"; if the refetch it triggers FAILS,
+  // that fact has been consumed and no second event is coming — the list
+  // would sit wrong until an unrelated one arrived. Cleared only by a
+  // read that was actually applied, so a superseded response (which owns
+  // nothing) neither sets nor clears it.
+  const [owed, setOwed] = useState<Record<Slice, boolean>>(NOTHING_OWED)
+  const settle = useCallback((slice: Slice, ok: boolean) => {
+    setOwed((prev) => (prev[slice] === !ok ? prev : { ...prev, [slice]: !ok }))
+  }, [])
+
+  // Each takes the read's `options` so a timer can pass `ifIdle` — see
+  // the poll and the owed retry below.
+  const refreshLinkedin = useCallback(async (options?: ReadOptions) => {
     try {
-      const [status, latest, jobList, packageList] = await Promise.all([
-        api.linkedinStatus(),
-        api.searchLatest(),
-        api.jobs(),
-        api.packages(),
-      ])
-      setLinkedin(status)
-      setRun(latest.id === null ? null : latest)
-      setJobs(jobList.jobs)
-      setScoringPending(jobList.scoring_pending ?? 0)
-      setScoringStall(jobList.scoring_stall ?? null)
-      setPackages(packageList.packages)
+      if (await readLinkedin(() => api.linkedinStatus(), setLinkedin, options)) {
+        settle('linkedin', true)
+      }
     } catch (e) {
       setError(String(e))
+      settle('linkedin', false)
     }
-  }, [])
+  }, [readLinkedin, settle])
+
+  const refreshRun = useCallback(async (options?: ReadOptions) => {
+    try {
+      const applied = await readRun(
+        () => api.searchLatest(),
+        (latest) => setRun(latest.id === null ? null : latest),
+        options,
+      )
+      if (applied) settle('run', true)
+    } catch (e) {
+      setError(String(e))
+      settle('run', false)
+    }
+  }, [readRun, settle])
+
+  const refreshJobs = useCallback(async (options?: ReadOptions) => {
+    try {
+      const applied = await readJobs(
+        () => api.jobs(),
+        (jobList) => {
+          // Another tab can start a search, and the list that arrives is
+          // then a different result set. Selections and explanations are
+          // keyed to job ids from the run they were made in, so they are
+          // dropped the moment the rendered list changes run — checked
+          // against the LIST's run, because the rows are what the user
+          // clicked and the run row is a separate, unsynchronised fetch.
+          if (jobsRunIdRef.current !== null
+              && jobList.run_id !== jobsRunIdRef.current) {
+            setSelected(new Set())
+            setExplanations({})
+            setExpanded(null)
+          }
+          jobsRunIdRef.current = jobList.run_id
+          setJobsRunId(jobList.run_id)
+          setJobs(jobList.jobs)
+          setScoringPending(jobList.scoring_pending ?? 0)
+          setScoringStall(jobList.scoring_stall ?? null)
+        },
+        options,
+      )
+      if (applied) settle('jobs', true)
+    } catch (e) {
+      setError(String(e))
+      settle('jobs', false)
+    }
+  }, [readJobs, settle])
+
+  const refreshPackages = useCallback(async (options?: ReadOptions) => {
+    try {
+      if (await readPackages(() => api.packages(), (list) =>
+        setPackages(list.packages), options,
+      )) {
+        settle('packages', true)
+      }
+    } catch (e) {
+      setError(String(e))
+      settle('packages', false)
+    }
+  }, [readPackages, settle])
+
+  const loadProfileLocation = useCallback(async (options?: ReadOptions) => {
+    try {
+      const applied = await readProfile(
+        () => api.getProfile(),
+        (p) => setProfileLocation(p.profile?.contact.location ?? null),
+        options,
+      )
+      if (applied) settle('profile', true)
+    } catch {
+      // Silent on screen — this only fills a placeholder, and an error
+      // banner for it would be noise. Still owed a retry: dropping the
+      // failure is what makes a read a dead end, impact aside.
+      settle('profile', false)
+    }
+  }, [readProfile, settle])
+
+  const refresh = useCallback(
+    (options?: ReadOptions) =>
+      Promise.all([
+        refreshLinkedin(options),
+        refreshRun(options),
+        refreshJobs(options),
+        refreshPackages(options),
+      ]),
+    [refreshLinkedin, refreshRun, refreshJobs, refreshPackages],
+  )
 
   useEffect(() => {
-    refresh()
-  }, [refresh])
+    void refresh()
+    void loadProfileLocation()
+  }, [refresh, loadProfileLocation])
 
-  // The location suggestion comes from the confirmed profile's contact
-  // block; fetched once — the profile doesn't change on this page.
-  useEffect(() => {
-    api
-      .getProfile()
-      .then((p) => setProfileLocation(p.profile?.contact.location ?? null))
-      .catch(() => {})
-  }, [])
+  useEpochEffect(epochs.linkedin, refreshLinkedin)
+  useEpochEffect(epochs.search, () => {
+    void refreshRun()
+    void refreshJobs() // a run collects jobs as it goes
+  })
+  useEpochEffect(epochs.scoring, refreshJobs)
+  useEpochEffect(epochs.packages, refreshPackages)
+  // A confirm or discard changes which scores /api/jobs can show — score
+  // rows are keyed to a profile version — and the location suggestion
+  // comes from the same profile.
+  useEpochEffect(epochs.profile, () => {
+    void refreshJobs()
+    void loadProfileLocation()
+  })
 
   // Fast poll while a run is active or the session is mid-transition;
   // slow poll while a stop will self-resume (cap reset, auth/captcha
@@ -147,11 +289,56 @@ export default function Search() {
       run?.status === 'stopped_captcha' ||
       packages.some((p) => p.status === 'waiting_usage') || // resumes itself
       (scoringPending > 0 && scoringStall !== null)) // stalled — watch lazily
+  // Reconciliation only, once the stream is up: events already carry
+  // every change, so an active batch is watched at a fraction of the old
+  // rate. A disconnect makes polling the ONLY source again — nothing is
+  // replayed on reconnect — so it runs even when nothing is in flight.
+  const pollMs = fastPoll
+    ? connected
+      ? 15_000
+      : 2_500
+    : slowPoll || !connected
+      ? 30_000
+      : 0
+  // `ifIdle`: a tick that finds the previous read still out stands down.
+  // A timer that superseded instead would, with a round trip longer than
+  // its interval, cancel every response before it could land — and the
+  // 2.5 s disconnected rate is the one most likely to meet a slow server.
   useEffect(() => {
-    if (!fastPoll && !slowPoll) return
-    const timer = setInterval(refresh, fastPoll ? 2500 : 30000)
+    if (pollMs === 0) return
+    const timer = setInterval(() => void refresh({ ifIdle: true }), pollMs)
     return () => clearInterval(timer)
-  }, [fastPoll, slowPoll, refresh])
+  }, [pollMs, refresh])
+
+  // Retry only what is actually owed. Connected and idle, `pollMs` is 0
+  // and no further event is coming for a change already announced, so a
+  // read that failed would otherwise leave that slice wrong until an
+  // unrelated event, a tab switch, or a remount. Unbounded on purpose:
+  // it stops the moment a read lands (success clears the flag and tears
+  // this down), and giving up instead would restore exactly the silent
+  // staleness being fixed — the same reasoning as the disconnected poll.
+  //
+  // Single-flight per slice (`ifIdle`): a tick while the last retry is
+  // still out issues nothing. Otherwise a read slower than the interval
+  // never lands — every tick supersedes the one before, every response
+  // arrives stale, the slice stays owed, and the loop runs forever. An
+  // EVENT for the slice still supersedes, through `useEpochEffect` above:
+  // that caller knows the pending answer is already behind.
+  const owedAny =
+    owed.linkedin || owed.run || owed.jobs || owed.packages || owed.profile
+  useEffect(() => {
+    if (!owedAny) return
+    const paced: ReadOptions = { ifIdle: true }
+    const timer = setInterval(() => {
+      if (owed.linkedin) void refreshLinkedin(paced)
+      if (owed.run) void refreshRun(paced)
+      if (owed.jobs) void refreshJobs(paced)
+      if (owed.packages) void refreshPackages(paced)
+      if (owed.profile) void loadProfileLocation(paced)
+    }, OWED_RETRY_MS)
+    return () => clearInterval(timer)
+  }, [owedAny, owed, refreshLinkedin, refreshRun, refreshJobs, refreshPackages,
+      loadProfileLocation])
 
   const connect = async () => {
     setError(null)
@@ -234,13 +421,35 @@ export default function Search() {
     }
   }
 
+  // The run row and the job list are two unsynchronised fetches, so
+  // between them the newest run can be known while run-1 rows are still
+  // rendered. Anything selected in that window belongs to a dead result
+  // set, and "is it rendered?" cannot tell the difference — the rows are
+  // rendered, they are just stale. Selection is frozen until the list
+  // catches up.
+  const listStale = run !== null && jobsRunId !== null && run.id !== jobsRunId
+
+  // What is BOTH selected and currently on screen. The list can also be
+  // replaced under an existing selection, and a job id that is no longer
+  // rendered must never be submitted, whichever response won the race.
+  const selectedVisible = useMemo(
+    () => jobs.filter((j) => selected.has(j.job_id)).map((j) => j.job_id),
+    [jobs, selected],
+  )
+
   // Gate 3: generating packages IS the job-selection gate — everything
   // after this click runs unattended.
   const generatePackages = async () => {
+    // Belt to the disabled button's braces: a click already dispatched
+    // when the run response landed must not get through either.
+    if (listStale || selectedVisible.length === 0) return
     setBusyGenerate(true)
     setError(null)
     try {
-      await api.packagesGenerate([...selected])
+      // Sent with the run the rows came from — the server rejects ids
+      // that are not in it rather than generating for a job the user
+      // never saw.
+      await api.packagesGenerate(selectedVisible, jobsRunId)
       setSelected(new Set())
       await refresh()
     } catch (e) {
@@ -470,16 +679,16 @@ export default function Search() {
                 </button>
               </>
             )}
-            {selected.size > 0 && (
+            {selectedVisible.length > 0 && (
               <button
                 className="rounded-full bg-slate-900 px-3 py-1 text-xs font-medium text-white hover:bg-slate-700 disabled:opacity-40"
-                disabled={busyGenerate}
+                disabled={busyGenerate || listStale}
                 onClick={generatePackages}
                 title="Tailored resume + cover letter PDFs for each selected job"
               >
                 {busyGenerate
                   ? 'Queueing…'
-                  : `Generate packages (${selected.size})`}
+                  : `Generate packages (${selectedVisible.length})`}
               </button>
             )}
             <label className="flex items-center gap-1">
@@ -537,6 +746,8 @@ export default function Search() {
                         type="checkbox"
                         className="mt-1.5"
                         checked={selected.has(job.job_id)}
+                        disabled={listStale}
+                        title={listStale ? 'New search results are loading…' : undefined}
                         onChange={() => toggleSelected(job.job_id)}
                       />
                       {score !== null && (

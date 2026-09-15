@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from backend.core import db, llm
+from backend.core.events import broker
 from backend.normalize.requirements import cache_key
 from backend.resume import facts, template
 from backend.tailor import compile as latex
@@ -111,13 +112,35 @@ class Superseded(Exception):
 def _transition(package_id: int, status: str | None = None, **kwargs) -> None:
     """Guarded state write: every pipeline write refuses to touch a
     terminal row, so a JD/profile supersede that lands mid-flight wins —
-    the worker's next persist raises instead of resurrecting the row."""
+    the worker's next persist raises instead of resurrecting the row.
+
+    This is the single place a package's visible state changes, so it is
+    the single place that announces one. `_park` routes through here too:
+    publishing there as well would double every parked transition.
+    """
+    # A write that only moves `error` still changes what the packages list
+    # renders — the waiting-for-scoring note is exactly that shape — so it
+    # has to announce. Deciding that needs the pre-write value, and only
+    # for the status-less case; every status move announces regardless.
+    error_only = status is None and "error" in kwargs
+    previous_error = None
+    if error_only:
+        row = db.get_package(package_id)
+        previous_error = row["error"] if row is not None else None
     if not db.update_package(package_id, status=status,
                              guard_not_terminal=True, **kwargs):
         raise Superseded(f"package {package_id} reached a terminal state "
                          "outside this worker")
+    # After the durable write, never before: a subscriber that refetches on
+    # this event must not be able to read the old row. Stage-only writes
+    # stay silent — stage_json is internal, and the packages list shows
+    # nothing that changes without a status or error move.
     if status is not None:
         log.info("package %s -> %s", package_id, status)
+        broker.publish("packages", {"event": "status", "id": package_id,
+                                    "status": status})
+    elif error_only and kwargs["error"] != previous_error:
+        broker.publish("packages", {"event": "error", "id": package_id})
 
 
 def _park(package_id: int, status: str, stage: dict, error: str) -> bool:

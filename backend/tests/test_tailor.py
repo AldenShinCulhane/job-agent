@@ -990,6 +990,103 @@ def test_template_upgrade_makes_the_next_selection_a_new_package(
             == cover_mod.TEMPLATE_VERSION)
 
 
+def test_generate_announces_only_genuinely_created_packages(
+    test_db, monkeypatch
+):
+    """Creation is idempotent, so `package_ids` is every requested job —
+    reused rows included. Announcing that set says new work exists when a
+    repeat selection added none, and every other tab refetches for it."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from backend.api import routes
+    from backend.core.events import broker
+
+    published: list[tuple[str, dict]] = []
+    monkeypatch.setattr(broker, "publish",
+                        lambda event, data: published.append((event, data)))
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_job("p2", jd_hash="hash-b")
+    _seed_derived("p1", version)
+    monkeypatch.setattr(routes, "_maybe_resume_packages", lambda: None)
+    app = FastAPI()
+    app.include_router(routes.router, prefix="/api")
+    client = TestClient(app)
+
+    first = client.post("/api/packages/generate", json={"job_ids": ["p1"]})
+    assert first.status_code == 200 and first.json()["created"] == 1
+    p1 = first.json()["package_ids"][0]
+    assert published == [("packages", {"event": "created", "ids": [p1]})]
+
+    # Same selection again: one existing row back, nothing new to fetch.
+    published.clear()
+    repeat = client.post("/api/packages/generate", json={"job_ids": ["p1"]})
+    assert repeat.json() == {"package_ids": [p1], "created": 0}
+    assert published == []
+
+    # Mixed selection announces the new row only.
+    published.clear()
+    mixed = client.post("/api/packages/generate",
+                        json={"job_ids": ["p1", "p2"]})
+    ids = mixed.json()["package_ids"]
+    assert mixed.json()["created"] == 1 and ids[0] == p1
+    assert published == [("packages", {"event": "created", "ids": [ids[1]]})]
+
+
+def test_generate_rejects_jobs_outside_the_run_the_user_saw(test_db, monkeypatch):
+    """The jobs table is a global cache spanning every run, so an id from
+    a superseded result set resolves there perfectly well. The run the
+    selection was made against is sent with it and checked for membership
+    — otherwise a click that landed while the list was being replaced
+    generates a package for a job the user was never shown."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from backend.api import routes
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_job("p2", jd_hash="hash-b")
+    _seed_derived("p1", version)
+    run_id = db.create_search_run({"keywords": "backend"})
+    db.record_search_page(run_id, [{
+        "job_id": "p1", "title": "Backend Engineer",
+        "company": "Example Widgets Inc.", "location": "Toronto, ON",
+        "posted_text": None, "workplace": None, "easy_apply": False,
+        "url": "https://www.linkedin.com/jobs/view/p1/",
+    }], 0, 25)
+
+    monkeypatch.setattr(routes, "_maybe_resume_packages", lambda: None)
+    app = FastAPI()
+    app.include_router(routes.router, prefix="/api")
+    client = TestClient(app)
+
+    ok = client.post("/api/packages/generate",
+                     json={"job_ids": ["p1"], "run_id": run_id})
+    assert ok.status_code == 200 and ok.json()["created"] == 1
+
+    stale = client.post("/api/packages/generate",
+                        json={"job_ids": ["p2"], "run_id": run_id})
+    assert stale.status_code == 409
+    assert "not in the results" in stale.json()["detail"]
+    assert [row["id"] for row in db.list_packages()] == ok.json()["package_ids"]
+
+    # A mixed selection is refused whole — no partial generation.
+    mixed = client.post("/api/packages/generate",
+                        json={"job_ids": ["p1", "p2"], "run_id": run_id})
+    assert mixed.status_code == 409
+
+    # Omitting run_id means "no run context" and stays permitted.
+    loose = client.post("/api/packages/generate", json={"job_ids": ["p2"]})
+    assert loose.status_code == 200
+
+    bad = client.post("/api/packages/generate",
+                      json={"job_ids": ["p1"], "run_id": "3"})
+    assert bad.status_code == 422
+
+
 def test_template_upgrade_supersedes_only_unfinished_packages(
     test_db, tmp_path, monkeypatch
 ):

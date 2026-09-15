@@ -259,6 +259,67 @@ def latest_profile() -> tuple[int, dict, bool] | None:
     return row[0], json.loads(row[1]), bool(row[2])
 
 
+def live_profile_version() -> int | None:
+    """The newest CONFIRMED version: what scoring and generation resume on,
+    and what a discard falls back to.
+
+    Distinct from `latest_profile()`, which returns the newest row of any
+    kind: an upload or an edit inserts an unconfirmed row that becomes
+    "latest" without becoming live. While such a draft exists the
+    pipeline runs on nothing at all — it is paused, not running on this
+    version.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT version FROM profile_versions WHERE confirmed = 1 "
+            "ORDER BY version DESC LIMIT 1"
+        ).fetchone()
+    return row[0] if row else None
+
+
+def discard_unconfirmed_above_live() -> tuple[int, list[int]] | None:
+    """Drop every unconfirmed version above the live one; None when no
+    live version exists to fall back to.
+
+    Without this an unconfirmed row is a dead end: `latest_profile()`
+    keeps returning it, so `confirmed_profile()` refuses and scoring and
+    generation stay blocked with no way back. Deleting is safe precisely
+    because unconfirmed versions can never be referenced — a package or a
+    score can only be created against a confirmed profile.
+
+    One transaction: reading the live version and deleting above it must
+    not straddle a concurrent confirm, or the delete could take a row
+    that just became live.
+    """
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT version FROM profile_versions WHERE confirmed = 1 "
+            "ORDER BY version DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return None
+        live = row[0]
+        doomed = [r[0] for r in conn.execute(
+            "SELECT version FROM profile_versions "
+            "WHERE version > ? AND confirmed = 0 ORDER BY version", (live,)
+        )]
+        if doomed:
+            conn.execute(
+                "DELETE FROM profile_versions WHERE version > ? AND confirmed = 0",
+                (live,),
+            )
+        conn.commit()
+        return live, doomed
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def get_profile(version: int) -> dict | None:
     import json
 
@@ -269,23 +330,64 @@ def get_profile(version: int) -> dict | None:
     return json.loads(row[0]) if row else None
 
 
-def confirm_profile(version: int) -> None:
+def confirm_profile(version: int) -> list[int] | None:
+    """Confirm `version` and supersede packages built on anything else.
+
+    Returns the superseded package ids, or None when the version is gone
+    or is no longer the newest — the caller lost a race and must not
+    report success.
+
+    One BEGIN IMMEDIATE transaction, and the supersede is gated on the
+    confirm actually landing. The route reads the profile and compiles a
+    preview before calling this, which is seconds wide: a discard can
+    delete the row in that window. The old code ignored the UPDATE's row
+    count, so a confirm of a deleted version still ran the supersede —
+    failing every unfinished package (none of which match the vanished
+    version) and returning 200 for a version that no longer existed.
+
+    "Newest" is also required, not just "exists": confirming a stale
+    version would supersede the packages of a newer confirmed one.
+    """
     now = datetime.now(timezone.utc).isoformat()
-    with _connect() as conn:
-        conn.execute(
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT version FROM profile_versions ORDER BY version DESC LIMIT 1"
+        ).fetchone()
+        if row is None or row[0] != version:
+            conn.rollback()
+            return None
+        cursor = conn.execute(
             "UPDATE profile_versions SET confirmed = 1 WHERE version = ?", (version,)
         )
+        if cursor.rowcount != 1:
+            conn.rollback()
+            return None
         # Unfinished packages pinned to any other profile version are now
         # stale inputs: without this they strand forever (job_scores only
         # keeps the current profile's row, so their waiting_inputs check
         # never passes) or publish against a profile the user replaced.
-        # Done packages are history and stay untouched.
-        conn.execute(
-            "UPDATE packages SET status = 'failed', error = ?, updated_at = ? "
-            "WHERE profile_version != ? AND status NOT IN ('done', 'failed')",
-            ("superseded: profile changed before the package finished; "
-             "re-select the job to build a new package", now, version),
-        )
+        # Done packages are history and stay untouched. Ids are read
+        # first so the caller can announce exactly what changed.
+        superseded = [r[0] for r in conn.execute(
+            "SELECT id FROM packages WHERE profile_version != ? "
+            "AND status NOT IN ('done', 'failed')", (version,)
+        )]
+        if superseded:
+            conn.execute(
+                "UPDATE packages SET status = 'failed', error = ?, updated_at = ? "
+                "WHERE profile_version != ? AND status NOT IN ('done', 'failed')",
+                ("superseded: profile changed before the package finished; "
+                 "re-select the job to build a new package", now, version),
+            )
+        conn.commit()
+        return superseded
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 # --- Artifact provenance (which engine produced a PDF, and its page count;
@@ -302,6 +404,11 @@ def record_artifact(kind: str, ref: str, engine: str, pages: int, path: str) -> 
             "created_at = excluded.created_at",
             (kind, ref, engine, pages, path, now),
         )
+
+
+def delete_artifact(kind: str, ref: str) -> None:
+    with _connect() as conn:
+        conn.execute("DELETE FROM artifacts WHERE kind = ? AND ref = ?", (kind, ref))
 
 
 def get_artifact(kind: str, ref: str) -> dict | None:
@@ -366,6 +473,23 @@ def get_job(job_id: str) -> dict | None:
             (job_id,),
         ).fetchone()
     return _job_row_to_dict(row) if row else None
+
+
+def job_ids_in_run(run_id: int, job_ids: list[str]) -> set[str]:
+    """Which of `job_ids` actually belong to `run_id`. Membership is the
+    only thing a selection can honestly be made against: the jobs table is
+    a global cache spanning every run, so an id from a result set the user
+    is no longer looking at resolves there perfectly well."""
+    if not job_ids:
+        return set()
+    placeholders = ",".join("?" * len(job_ids))
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT job_id FROM search_run_jobs "
+            f"WHERE run_id = ? AND job_id IN ({placeholders})",
+            (run_id, *job_ids),
+        ).fetchall()
+    return {row[0] for row in rows}
 
 
 def list_jobs(run_id: int | None = None,
@@ -461,7 +585,10 @@ def record_search_page(run_id: int, cards: list[dict], next_start: int, cap: int
     return collected
 
 
-def save_job_detail(job_id: str, description: str, description_hash: str) -> None:
+def save_job_detail(job_id: str, description: str,
+                    description_hash: str) -> list[int]:
+    """Returns the package ids this posting edit superseded, so the caller
+    can announce them — this layer never touches the event broker."""
     now = datetime.now(timezone.utc).isoformat()
     with _connect() as conn:
         conn.execute(
@@ -474,6 +601,10 @@ def save_job_detail(job_id: str, description: str, description_hash: str) -> Non
         # text must never publish against it. Done packages keep their
         # pinned snapshot; the guarded pipeline transitions stop any
         # worker already mid-flight on a superseded row.
+        superseded = [r[0] for r in conn.execute(
+            "SELECT id FROM packages WHERE job_id = ? AND jd_hash != ? "
+            "AND status NOT IN ('done', 'failed')", (job_id, description_hash)
+        )]
         conn.execute(
             "UPDATE packages SET status = 'failed', error = ?, updated_at = ? "
             "WHERE job_id = ? AND jd_hash != ? "
@@ -482,6 +613,7 @@ def save_job_detail(job_id: str, description: str, description_hash: str) -> Non
              "re-select the job to build a new package", now, job_id,
              description_hash),
         )
+    return superseded
 
 
 # --- Normalized requirements + scores (PLAN.md §4.4) ------------------------

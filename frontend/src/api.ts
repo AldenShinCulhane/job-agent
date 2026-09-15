@@ -51,6 +51,13 @@ export interface Profile {
 export interface ProfilePayload {
   version: number | null
   confirmed?: boolean
+  /** Newest confirmed version: what the pipeline resumes on, and what a
+   * discard falls back to. Lower than `version` while an unconfirmed draft
+   * sits on top of it — the pipeline is paused meanwhile, not running on
+   * it. Null before the first confirm. */
+  live_version?: number | null
+  discarded?: number[]
+  superseded?: number[]
   profile?: Profile
   ledger?: Record<string, unknown>
   extraction_method?: string
@@ -203,12 +210,14 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(profile),
     }).then(toJson<ProfilePayload>),
+  discardDraft: () =>
+    fetch('/api/profile/discard', { method: 'POST' }).then(toJson<ProfilePayload>),
   confirmProfile: (version: number) =>
     fetch('/api/profile/confirm', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ version }),
-    }).then(toJson<{ ok: boolean; version: number }>),
+    }).then(toJson<ProfilePayload>),
   linkedinStatus: () => fetch('/api/linkedin/status').then(toJson<LinkedInStatus>),
   linkedinConnect: () =>
     fetch('/api/linkedin/connect', { method: 'POST' }).then(toJson<LinkedInStatus>),
@@ -250,13 +259,16 @@ export const api = {
     fetch('/api/packages').then(
       toJson<{ packages: Package[]; page_limit: number }>,
     ),
-  packagesGenerate: (jobIds: string[]) =>
+  /** `runId` is the run the selection was made against — the server
+   * rejects ids that are not in it, so a stale selection fails loudly
+   * instead of generating a package for a job the user never saw. */
+  packagesGenerate: (jobIds: string[], runId: number | null) =>
     fetch('/api/packages/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ job_ids: jobIds }),
+      body: JSON.stringify({ job_ids: jobIds, run_id: runId }),
     }).then(toJson<{ package_ids: number[]; created: number }>),
 }
 
-export const packageFileUrl = (packageId: number, name: string) =>
-  `/api/packages/${packageId}/file/${name}`
+export const packageFileUrl = (packageId: number, name: string, inline = false) =>
+  `/api/packages/${packageId}/file/${name}${inline ? '?inline=1' : ''}`

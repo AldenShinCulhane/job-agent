@@ -25,6 +25,17 @@ def client(tmp_path, monkeypatch):
     return TestClient(app)
 
 
+@pytest.fixture
+def no_compile(tmp_path, monkeypatch):
+    """Confirm without typesetting: these tests assert version bookkeeping,
+    and requiring a LaTeX engine for that would skip them on machines that
+    have none."""
+    stub = tmp_path / "stub-preview.pdf"
+    stub.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    monkeypatch.setattr(routes, "_ensure_preview", lambda version, profile: stub)
+    return stub
+
+
 def test_put_rejects_schema_invalid_profile(client):
     res = client.put("/api/profile", json={"name": "X"})
     assert res.status_code == 422
@@ -246,3 +257,167 @@ def test_status_polls_are_pure_and_cover_recovery_states(client, monkeypatch):
 
     # No poll ever started or resumed a worker.
     assert dict(routes._search_tasks) == tasks_before
+
+
+def test_discard_returns_to_live_and_unblocks_the_pipeline(client, no_compile):
+    """An unconfirmed version is a dead end without this: it becomes the
+    newest row, so `confirmed_profile()` refuses and scoring/generation
+    stay blocked with no way back to the profile that was working."""
+    live = client.put("/api/profile", json=SAMPLE_PROFILE).json()["version"]
+    client.post("/api/profile/confirm", json={"version": live})
+
+    draft = client.put("/api/profile", json=SAMPLE_PROFILE).json()["version"]
+    assert draft > live
+    body = client.get("/api/profile").json()
+    assert (body["version"], body["confirmed"], body["live_version"]) == (draft, False, live)
+
+    res = client.post("/api/profile/discard")
+    assert res.status_code == 200
+    assert res.json()["version"] == live
+    assert res.json()["confirmed"] is True
+    assert res.json()["discarded"] == [draft]
+
+    after = client.get("/api/profile").json()
+    assert (after["version"], after["confirmed"], after["live_version"]) == (live, True, live)
+    assert db.get_profile(draft) is None
+
+
+def test_discard_resumes_what_the_draft_stopped(client, no_compile, monkeypatch):
+    """A draft pauses scoring by making every pass stale, and that stop is
+    given no retry timer on purpose — the profile settling is the trigger.
+    Discard settles it exactly as confirm does, so it owes the same kick;
+    without it the pending jobs, and the packages parked on their scores,
+    sit still until something unrelated happens to restart them."""
+    kicked: list[str] = []
+    monkeypatch.setattr(routes, "_maybe_resume_scoring",
+                        lambda: kicked.append("scoring") or False)
+    monkeypatch.setattr(routes, "_maybe_resume_packages",
+                        lambda: kicked.append("packages") or False)
+
+    live = client.put("/api/profile", json=SAMPLE_PROFILE).json()["version"]
+    client.post("/api/profile/confirm", json={"version": live})
+    assert kicked == ["scoring", "packages"]  # confirm already did
+
+    kicked.clear()
+    client.put("/api/profile", json=SAMPLE_PROFILE)
+    assert kicked == []  # a draft starts nothing
+
+    assert client.post("/api/profile/discard").status_code == 200
+    assert kicked == ["scoring", "packages"]
+
+
+def test_discard_refuses_when_nothing_is_live(client, no_compile):
+    """Nothing to fall back to — deleting the only version would leave the
+    app with no profile at all, so the draft stands and the user is told."""
+    version = client.put("/api/profile", json=SAMPLE_PROFILE).json()["version"]
+    res = client.post("/api/profile/discard")
+    assert res.status_code == 409
+    assert "No confirmed profile" in res.json()["detail"]
+    assert client.get("/api/profile").json()["version"] == version
+
+
+def test_discard_spares_confirmed_versions_and_older_drafts(client, no_compile):
+    """Only unconfirmed rows ABOVE the live one are drafts. An older
+    unconfirmed version is history that some later confirm stepped over,
+    and deleting it would rewrite the record for nothing."""
+    old_draft = client.put("/api/profile", json=SAMPLE_PROFILE).json()["version"]
+    first = client.put("/api/profile", json=SAMPLE_PROFILE).json()["version"]
+    client.post("/api/profile/confirm", json={"version": first})
+    live = client.put("/api/profile", json=SAMPLE_PROFILE).json()["version"]
+    client.post("/api/profile/confirm", json={"version": live})
+    new_draft = client.put("/api/profile", json=SAMPLE_PROFILE).json()["version"]
+
+    assert client.post("/api/profile/discard").json()["discarded"] == [new_draft]
+    assert db.get_profile(old_draft) is not None
+    assert db.get_profile(first) is not None
+    assert db.get_profile(live) is not None
+    assert db.get_profile(new_draft) is None
+
+
+@pytest.mark.skipif(
+    shutil.which("tectonic") is None and shutil.which("pdflatex") is None,
+    reason="no LaTeX engine installed",
+)
+def test_discard_clears_the_preview_it_leaves_behind(client):
+    """The artifact row is the preview cache key: leaving it while the PDF
+    is gone makes `_ensure_preview` hand back a path to nothing."""
+    live = client.put("/api/profile", json=SAMPLE_PROFILE).json()["version"]
+    client.post("/api/profile/confirm", json={"version": live})
+    draft = client.put("/api/profile", json=SAMPLE_PROFILE).json()["version"]
+    assert client.get(f"/api/profile/preview.pdf?version={draft}").status_code == 200
+    assert db.get_artifact("preview", str(draft)) is not None
+
+    client.post("/api/profile/discard")
+    assert db.get_artifact("preview", str(draft)) is None
+    assert not (routes.PREVIEW_DIR / f"v{draft}").exists()
+    assert db.get_artifact("preview", str(live)) is not None
+
+
+def test_package_file_is_a_download_by_default_and_inline_on_request(client, tmp_path):
+    """An iframe preview needs `inline`; a browser handed `attachment`
+    downloads the file instead of rendering it. The existing links are
+    downloads, so the default must not move."""
+    out = tmp_path / "package"
+    out.mkdir()
+    (out / "resume.pdf").write_bytes(b"%PDF-1.4\n%%EOF\n")
+    package_id, _ = db.create_package("job-1", 1, "hash-1", 1,
+                                      template_version=1, cover_template_version=1)
+    db.update_package(package_id, status="done", output_dir=str(out))
+
+    res = client.get(f"/api/packages/{package_id}/file/resume.pdf")
+    assert res.headers["content-type"] == "application/pdf"
+    assert res.headers["content-disposition"].startswith("attachment")
+
+    res = client.get(f"/api/packages/{package_id}/file/resume.pdf?inline=1")
+    assert res.headers["content-type"] == "application/pdf"
+    assert res.headers["content-disposition"].startswith("inline")
+    # A cached 'attachment' response pins itself to the URL and keeps
+    # downloading after the header is fixed — it bit the profile preview.
+    assert res.headers["cache-control"] == "no-store"
+
+    assert client.get(f"/api/packages/{package_id}/file/passwd?inline=1").status_code == 404
+
+
+def test_confirm_loses_to_a_discard_that_lands_mid_compile(client, tmp_path, monkeypatch):
+    """The confirm route reads the profile and compiles a preview before it
+    writes — a window seconds wide that a discard can land inside.
+
+    The old code ignored the UPDATE's row count: the confirm of a deleted
+    version wrote nothing, then superseded every package whose version was
+    not the vanished one — which is all of them — and returned 200.
+    """
+    live = client.put("/api/profile", json=SAMPLE_PROFILE).json()["version"]
+    stub = tmp_path / "stub-preview.pdf"
+    stub.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    monkeypatch.setattr(routes, "_ensure_preview", lambda version, profile: stub)
+    client.post("/api/profile/confirm", json={"version": live})
+
+    package_id, _ = db.create_package("job-1", live, "hash-1", 1,
+                                      template_version=1, cover_template_version=1)
+    draft = client.put("/api/profile", json=SAMPLE_PROFILE).json()["version"]
+
+    def discard_mid_compile(version, profile):
+        db.discard_unconfirmed_above_live()
+        return stub
+
+    monkeypatch.setattr(routes, "_ensure_preview", discard_mid_compile)
+    res = client.post("/api/profile/confirm", json={"version": draft})
+
+    assert res.status_code == 409
+    assert "no longer the newest" in res.json()["detail"]
+    assert db.get_package(package_id)["status"] == "queued"
+    assert client.get("/api/profile").json()["version"] == live
+
+
+def test_confirm_returns_the_payload_the_client_needs(client, no_compile):
+    """Patching `confirmed` alone left the header showing the old live
+    version after a confirm; the new live version only exists server-side."""
+    live = client.put("/api/profile", json=SAMPLE_PROFILE).json()["version"]
+    client.post("/api/profile/confirm", json={"version": live})
+    draft = client.put("/api/profile", json=SAMPLE_PROFILE).json()["version"]
+
+    body = client.post("/api/profile/confirm", json={"version": draft}).json()
+    assert body["version"] == draft
+    assert body["confirmed"] is True
+    assert body["live_version"] == draft
+    assert body["profile"]

@@ -32,6 +32,7 @@ from claude_agent_sdk import (
 
 from backend.core import claude_cli, db
 from backend.core.claude_env import harden_process_env
+from backend.core.events import broker
 
 MODEL_PREFERRED = "claude-fable-5"
 MODEL_FALLBACK = "claude-opus-5"
@@ -202,20 +203,72 @@ _BACKOFF_START_MIN = 5
 _BACKOFF_CAP_MIN = 60
 
 
-def _enter_usage_exhausted() -> None:
+def _engine_signature() -> tuple[str | None, ...]:
+    """Every durable field `engine_status()` renders, in one comparable
+    value.
+
+    Status alone is too coarse to dedupe on: a second auth failure with a
+    different message, a repeat usage limit that pushes `retry_at` further
+    out, or a model that got unpinned all change what the header badge and
+    the recovery banner show while the status string sits still.
+    """
+    return (
+        db.get_state("engine_status", "unprobed"),
+        db.get_state("pinned_model"),
+        db.get_state("retry_at"),
+        db.get_state("last_error"),
+    )
+
+
+def _announce_engine(previous: tuple[str | None, ...]) -> None:
+    """Invalidate the UI surfaces that read engine state — the header badge
+    and the recovery banners — but only on a real change.
+
+    The success path runs `_clear_wait_state` on every single LLM call, so
+    an unconditional publish would put one identical event per scored job
+    on the wire. The payload is a hint, not truth: the client refetches
+    /api/status rather than believing this.
+    """
+    current = _engine_signature()
+    if current != previous:
+        broker.publish("engine", {"status": current[0]})
+
+
+def _persist_failure(status: str, error: str) -> None:
+    """Record a durable engine failure, then announce it — in that order,
+    so a subscriber that refetches on the event never reads pre-write state."""
+    previous = _engine_signature()
+    db.set_state("engine_status", status)
+    db.set_state("last_error", error)
+    _announce_engine(previous)
+
+
+def _enter_usage_exhausted(error: str | None = None) -> None:
+    previous = _engine_signature()
     minutes = int(db.get_state("usage_backoff_minutes", str(_BACKOFF_START_MIN)))
     retry_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
     db.set_state("engine_status", "waiting_usage_exhausted")
     db.set_state("retry_at", retry_at.isoformat())
     db.set_state("usage_backoff_minutes", str(min(minutes * 2, _BACKOFF_CAP_MIN)))
+    if error is not None:
+        db.set_state("last_error", error)
+    _announce_engine(previous)
 
 
-def _clear_wait_state() -> None:
-    """Success recovery: a stale last_error must not survive an ok status."""
+def _clear_wait_state(previous: tuple[str | None, ...] | None = None) -> None:
+    """Success recovery: a stale last_error must not survive an ok status.
+
+    `previous` is passed in when the caller already wrote engine state (the
+    probe pins the model first); capturing it here would then be reading
+    post-write state and the pin would never be announced.
+    """
+    if previous is None:
+        previous = _engine_signature()
     db.set_state("engine_status", "ok")
     db.delete_state("retry_at")
     db.delete_state("usage_backoff_minutes")
     db.delete_state("last_error")
+    _announce_engine(previous)
 
 
 def seconds_until_retry() -> float:
@@ -261,8 +314,7 @@ async def probe() -> str:
     # before spending a request.
     problem = await asyncio.to_thread(claude_cli.subscription_problem)
     if problem is not None:
-        db.set_state("engine_status", "auth_required")
-        db.set_state("last_error", problem)
+        _persist_failure("auth_required", problem)
         raise AuthRequired(problem)
 
     for model in (MODEL_PREFERRED, MODEL_FALLBACK):
@@ -271,23 +323,27 @@ async def probe() -> str:
             await _run_with_retry("Say ok.", options)
         except ModelNotEntitled as exc:
             if model == MODEL_FALLBACK:
+                # Same announce path as every other durable engine write.
+                # The status does not move here (the caller decides what
+                # an unentitled fallback means), but the banner renders
+                # last_error, so a silent write leaves a stale message up.
+                previous = _engine_signature()
                 db.set_state("last_error", str(exc))
+                _announce_engine(previous)
                 raise
             continue
         except AuthRequired as exc:
-            db.set_state("engine_status", "auth_required")
-            db.set_state("last_error", str(exc))
+            _persist_failure("auth_required", str(exc))
             raise
         except UsageExhausted as exc:
-            _enter_usage_exhausted()
-            db.set_state("last_error", str(exc))
+            _enter_usage_exhausted(str(exc))
             raise
         except ConfigError as exc:
-            db.set_state("engine_status", "config_error")
-            db.set_state("last_error", str(exc))
+            _persist_failure("config_error", str(exc))
             raise
+        previous = _engine_signature()
         db.set_state("pinned_model", model)
-        _clear_wait_state()
+        _clear_wait_state(previous)
         return model
 
     raise ConfigError("probe fell through without pinning a model")  # unreachable
@@ -295,9 +351,11 @@ async def probe() -> str:
 
 def reset_probe() -> None:
     """Settings-page hook: forget the pinned model and re-probe next call."""
+    previous = _engine_signature()
     db.delete_state("pinned_model")
     db.delete_state("last_error")
     db.set_state("engine_status", "unprobed")
+    _announce_engine(previous)
 
 
 async def structured(
@@ -329,15 +387,13 @@ async def structured(
             _enter_usage_exhausted()
             raise
         except AuthRequired as exc:
-            db.set_state("engine_status", "auth_required")
-            db.set_state("last_error", str(exc))
+            _persist_failure("auth_required", str(exc))
             raise
         except ConfigError as exc:
             # Persisted for /api/status even when the model was already
             # pinned — a lockdown breach or broken CLI must not leave the
             # engine reporting ok.
-            db.set_state("engine_status", "config_error")
-            db.set_state("last_error", str(exc))
+            _persist_failure("config_error", str(exc))
             raise
 
     _clear_wait_state()

@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import random
+import shutil
 import tempfile
 import time
 import uuid
@@ -125,7 +126,14 @@ async def put_settings(body: dict):
 
 @router.get("/events")
 async def events():
-    return StreamingResponse(broker.stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        broker.stream(),
+        media_type="text/event-stream",
+        # no-cache so a reconnect is never served a stored stream;
+        # X-Accel-Buffering is nginx's opt-out, harmless where unread.
+        headers={"Cache-Control": "no-cache",
+                 "X-Accel-Buffering": "no"},
+    )
 
 
 # --- Profile (gate 1: upload -> preview -> unlimited edits -> confirm) ------
@@ -134,6 +142,12 @@ def _profile_payload(version: int, profile: dict, confirmed: bool, **extra) -> d
     return {
         "version": version,
         "confirmed": confirmed,
+        # Newest confirmed version: what the pipeline resumes on and what
+        # a discard falls back to. Equals `version` once this row is
+        # confirmed; lower while a draft sits on top of it (the pipeline
+        # is then paused, not running on it); None before the first
+        # confirm.
+        "live_version": db.live_profile_version(),
         "profile": profile,
         "ledger": facts.build_ledger(profile),
         **extra,
@@ -195,6 +209,33 @@ def _ensure_preview(version: int, profile: dict) -> Path:
     return result.pdf_path
 
 
+@router.post("/profile/discard")
+async def discard_profile_draft():
+    """Drop unconfirmed versions and return to the live profile."""
+    result = db.discard_unconfirmed_above_live()
+    if result is None:
+        raise HTTPException(
+            status_code=409,
+            detail="No confirmed profile to fall back to — confirm this one "
+                   "or upload a different resume.",
+        )
+    live, discarded = result
+    for version in discarded:
+        shutil.rmtree(PREVIEW_DIR / f"v{version}", ignore_errors=True)
+        db.delete_artifact("preview", str(version))
+    profile = db.get_profile(live)
+    assert profile is not None, "the live version was read inside the transaction"
+    broker.publish("profile", {"version": live, "event": "discarded"})
+    # A draft pauses scoring by making every in-flight pass stale, and that
+    # stop is deliberately given no retry timer — the profile settling is
+    # the trigger. Confirm is one way it settles; discard is the other, so
+    # it owes the same kick, or the pending jobs (and the packages parked
+    # on their scores) sit still until some unrelated event restarts them.
+    _maybe_resume_scoring()
+    _maybe_resume_packages()
+    return _profile_payload(live, profile, True, discarded=discarded)
+
+
 @router.get("/profile/preview.pdf")
 async def profile_preview(version: int):
     profile = db.get_profile(version)
@@ -235,8 +276,17 @@ async def confirm_profile(body: dict):
             status_code=422,
             detail=f"Profile does not compile, fix it before confirming: {exc}",
         )
-    db.confirm_profile(version)
+    superseded = db.confirm_profile(version)
+    if superseded is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Profile version {version} is no longer the newest — it was "
+                   "discarded or replaced while this confirmation was compiling. "
+                   "Reload the profile and confirm what is there now.",
+        )
     broker.publish("profile", {"version": version, "event": "confirmed"})
+    if superseded:
+        broker.publish("packages", {"event": "superseded", "ids": superseded})
     # A worker scoring against the previous profile version is now
     # wasted spend — cancel it, then re-score the current run
     # (deterministic-only when requirements are already cached; no LLM).
@@ -249,7 +299,7 @@ async def confirm_profile(body: dict):
     # version resume from their persisted stages).
     _cancel_package_worker()
     _maybe_resume_packages()
-    return {"ok": True, "version": version}
+    return _profile_payload(version, profile, True, superseded=superseded)
 
 
 # --- LinkedIn session + search (gate 2 lives inside connect) ----------------
@@ -299,6 +349,7 @@ def _set_scoring_stall(reason: str, detail: str | None,
     payload = {"reason": reason, "detail": detail, "run_id": run_id,
                "profile_version": profile_version, **_stall_schedule(reason)}
     db.set_state(_SCORING_STALL_KEY, json.dumps(payload))
+    broker.publish("scoring", {"event": "stalled", "reason": reason})
     return payload["token"]
 
 
@@ -327,7 +378,10 @@ def _update_stall_schedule(token: str, *, next_attempt_at: float,
 
 
 def _clear_scoring_stall() -> None:
+    if db.get_state(_SCORING_STALL_KEY) is None:
+        return
     db.delete_state(_SCORING_STALL_KEY)
+    broker.publish("scoring", {"event": "stall_cleared"})
 
 
 def _clear_package_stall() -> None:
@@ -425,8 +479,8 @@ async def _pipeline_worker(run_id: int, profile_version: int) -> None:
         # Scoring just finished deriving requirements/scores — packages
         # created before that were waiting on exactly these inputs.
         _maybe_resume_packages()
-    # session/stale_profile stops are owned by connect recovery and the
-    # profile-confirm trigger respectively — no timer here.
+    # session/stale_profile stops are owned by connect recovery and by the
+    # profile settling (confirm OR discard) respectively — no timer here.
 
 
 def _on_engine_recovered() -> None:
@@ -705,6 +759,15 @@ def _maybe_resume_packages() -> bool:
     return _spawn_package_worker()
 
 
+def _announce_search(run_id: int, event: str) -> None:
+    """Run status changed somewhere other than the collector's own
+    progress reporting: creation, an explicit resume, an automatic
+    reclaim, or a driver failure before collection ever started. Each is
+    invisible to `run_search`, so each has to invalidate here or a tab
+    that did not click sits on a stale run indefinitely."""
+    broker.publish("search", {"run_id": run_id, "event": event})
+
+
 def _spawn_search(run_id: int) -> bool:
     """At most one concurrent worker per run: a second Start/Resume for a
     run that is already being driven is a no-op (a finished worker's slot
@@ -747,9 +810,11 @@ async def _connect_then_search(run_id: int) -> None:
             await sources.source.connect()
         except sources.CaptchaStop as exc:
             db.update_search_run(run_id, status="stopped_captcha", message=str(exc))
+            _announce_search(run_id, "stopped_captcha")
             return
         except sources.AuthRequired as exc:
             db.update_search_run(run_id, status="stopped_auth", message=str(exc))
+            _announce_search(run_id, "stopped_auth")
             return
         result = await sources.source.resume(run_id)
         if result and result.get("status") == "stopped_cap":
@@ -763,6 +828,7 @@ async def _connect_then_search(run_id: int) -> None:
         db.update_search_run(
             run_id, status="stopped_error", message=f"{type(exc).__name__}: {exc}"
         )
+        _announce_search(run_id, "stopped_error")
 
 
 async def _connect_only() -> None:
@@ -796,6 +862,7 @@ def _reclaim_latest(statuses: tuple[str, ...]) -> list[int]:
         return []
     if run["status"] != "running":
         db.update_search_run(run["id"], status="running", message=None)
+        _announce_search(run["id"], "resumed")
     if _spawn_search(run["id"]):
         log.info("reclaimed search run %s (was %s)", run["id"], run["status"])
         return [run["id"]]
@@ -946,6 +1013,9 @@ async def search_start(body: dict):
     _supersede_stale_running(except_id=None)
     _clear_scoring_stall()
     run_id = db.create_search_run(config)
+    # Announce before spawning: collection can sit for minutes behind a
+    # sign-in, or never start at all, and the latest run has already moved.
+    _announce_search(run_id, "started")
     _spawn_search(run_id)
     return {"run_id": run_id, "status": "running"}
 
@@ -962,6 +1032,7 @@ async def search_resume(body: dict | None = None):
     if run["status"] == "done":
         return run
     db.update_search_run(run["id"], status="running", message=None)
+    _announce_search(run["id"], "resumed")
     _spawn_search(run["id"])
     return {**run, "status": "running", "message": None}
 
@@ -1056,6 +1127,27 @@ async def packages_generate(body: dict):
     job_ids = body.get("job_ids") or []
     if not isinstance(job_ids, list) or not job_ids:
         raise HTTPException(status_code=422, detail="Select at least one job.")
+    # Optional, and the UI always sends it: the run the selection was made
+    # against. The jobs table is a global cache spanning every run, so
+    # without this an id from a result set the user is no longer looking
+    # at — a search started in another tab, a click that landed while the
+    # list was being replaced — resolves fine and generates the wrong
+    # package. Omitted means "no run context", which stays permitted.
+    run_id = body.get("run_id")
+    if run_id is not None and (not isinstance(run_id, int)
+                               or isinstance(run_id, bool)):
+        raise HTTPException(status_code=422, detail="run_id must be an integer.")
+    if run_id is not None:
+        wanted = [str(j) for j in job_ids]
+        members = db.job_ids_in_run(run_id, wanted)
+        outsiders = [j for j in wanted if j not in members]
+        if outsiders:
+            raise HTTPException(
+                status_code=409,
+                detail=f"{len(outsiders)} selected job(s) are not in the "
+                       "results you were looking at — the search results "
+                       "changed. Re-select from the current list.",
+            )
     try:
         version, _ = scoring_pipeline.confirmed_profile()
     except scoring_pipeline.NoConfirmedProfile as exc:
@@ -1081,14 +1173,21 @@ async def packages_generate(body: dict):
     # or the improvement could never reach a job already generated.
     limit = tailor_pipeline.resume_page_limit()
     resume_tpl, cover_tpl = tailor_pipeline.template_versions()
-    created = 0
     package_ids = []
+    created_ids = []
     for job in jobs:
         package_id, was_created = db.create_package(
             job["job_id"], version, job["description_hash"], limit,
             template_version=resume_tpl, cover_template_version=cover_tpl)
         package_ids.append(package_id)
-        created += int(was_created)
+        if was_created:
+            created_ids.append(package_id)
+    created = len(created_ids)
+    # Creation is idempotent: re-selecting a job returns the existing row.
+    # Only the rows that are genuinely new go on the wire — a selection
+    # that created nothing added nothing for another tab to fetch.
+    if created_ids:
+        broker.publish("packages", {"event": "created", "ids": created_ids})
     _maybe_resume_packages()
     return {"package_ids": package_ids, "created": created}
 
@@ -1100,10 +1199,13 @@ async def packages_list():
 
 
 _PACKAGE_FILES = ("resume.pdf", "cover_letter.pdf", "job.md")
+# Only these render in the preview pane; job.md has no inline consumer,
+# so it never gets an inline disposition.
+_INLINE_FILES = ("resume.pdf", "cover_letter.pdf")
 
 
 @router.get("/packages/{package_id}/file/{name}")
-async def package_file(package_id: int, name: str):
+async def package_file(package_id: int, name: str, inline: bool = False):
     if name not in _PACKAGE_FILES:
         raise HTTPException(status_code=404, detail="Unknown package file.")
     package = db.get_package(package_id)
@@ -1112,7 +1214,18 @@ async def package_file(package_id: int, name: str):
     path = Path(package["output_dir"]) / name
     if not path.is_file():
         raise HTTPException(status_code=404, detail="Artifact missing on disk.")
-    return FileResponse(path, filename=name)
+    if not inline or name not in _INLINE_FILES:
+        return FileResponse(path, filename=name)
+    # Inline for the in-page preview pane. no-store because a cached
+    # 'attachment' response pins itself to the URL and keeps downloading
+    # long after the header is fixed — that bit us on the profile preview.
+    return FileResponse(
+        path,
+        media_type="application/pdf",
+        filename=name,
+        content_disposition_type="inline",
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.post("/search/rerank")
@@ -1123,7 +1236,15 @@ async def search_rerank():
     if run is None:
         raise HTTPException(status_code=404, detail="No search run to rerank.")
     try:
-        return await llm_layer.rerank_close_matches(run["id"])
+        result = await llm_layer.rerank_close_matches(run["id"])
+        # A successful rerank rewrites llm_rank across a whole cluster —
+        # the order every other tab is looking at. Announced here rather
+        # than in llm_layer so the scoring code stays transport-free.
+        if result.get("reranked"):
+            broker.publish("scoring", {"event": "reranked",
+                                       "run_id": run["id"],
+                                       "reranked": result["reranked"]})
+        return result
     except scoring_pipeline.NoConfirmedProfile as exc:
         raise HTTPException(status_code=409, detail=str(exc))
     except ValueError as exc:

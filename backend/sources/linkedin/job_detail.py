@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from bs4 import Comment
 
 from backend.core import db
+from backend.core.events import broker
 from backend.sources.linkedin import selectors
 
 log = logging.getLogger(__name__)
@@ -90,5 +91,7 @@ async def fetch_detail(supervisor, job_id: str, force: bool = False) -> dict:
         # Hash moved -> normalized requirements/score/explanation are all
         # stale; drop them so the pipeline recomputes (PLAN.md §4.4).
         db.invalidate_derived(job_id)
-    db.save_job_detail(job_id, description, new_hash)
+    superseded = db.save_job_detail(job_id, description, new_hash)
+    if superseded:
+        broker.publish("packages", {"event": "superseded", "ids": superseded})
     return {**db.get_job(job_id), "refetched": True, "changed": changed}

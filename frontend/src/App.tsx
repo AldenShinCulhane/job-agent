@@ -1,7 +1,10 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { api } from './api'
 import type { EngineStatus, LinkedInStatus } from './api'
 import { engineBadge } from './engineStatus'
+import { useEpochEffect, useEventStream } from './useEventStream'
+import { useLatestOnly } from './useLatestOnly'
+import type { ReadOptions } from './useLatestOnly'
 import RecoveryBanners from './RecoveryBanners'
 import Onboarding from './pages/Onboarding'
 import Search from './pages/Search'
@@ -21,26 +24,59 @@ export default function App() {
   const [engine, setEngine] = useState<EngineStatus | null>(null)
   const [linkedin, setLinkedin] = useState<LinkedInStatus | null>(null)
   const [tab, setTab] = useState<TabId>('profile')
+  // One stream for the whole app. It says which surface went stale; the
+  // endpoints below stay the only source of what is actually true.
+  const { epochs, connected } = useEventStream()
+
+  // One ticket sequence per endpoint: an event and a reconciliation poll
+  // can be in flight together, and the older answer must not land last.
+  const readStatus = useLatestOnly()
+  const readLinkedin = useLatestOnly()
+
+  const loadEngine = useCallback(
+    (options?: ReadOptions) =>
+      readStatus(
+        () => api.status(),
+        (s) => setEngine(s.engine),
+        options,
+      ).catch(() => setEngine(null)),
+    [readStatus],
+  )
+  const loadLinkedin = useCallback(
+    (options?: ReadOptions) =>
+      readLinkedin(() => api.linkedinStatus(), setLinkedin, options).catch(
+        () => setLinkedin(null),
+      ),
+    [readLinkedin],
+  )
 
   useEffect(() => {
-    let alive = true
-    const poll = () => {
-      api
-        .status()
-        .then((s) => alive && setEngine(s.engine))
-        .catch(() => alive && setEngine(null))
-      api
-        .linkedinStatus()
-        .then((s) => alive && setLinkedin(s))
-        .catch(() => alive && setLinkedin(null))
-    }
-    poll()
-    const timer = setInterval(poll, STATUS_POLL_MS)
-    return () => {
-      alive = false
-      clearInterval(timer)
-    }
-  }, [])
+    void loadEngine()
+    void loadLinkedin()
+  }, [loadEngine, loadLinkedin])
+
+  useEpochEffect(epochs.engine, loadEngine)
+  useEpochEffect(epochs.linkedin, loadLinkedin)
+
+  // Reconciliation, not the primary path. Three things the stream cannot
+  // cover: a disconnect (nothing is replayed on reconnect, and the gap is
+  // invisible until then); the usage-limit countdown, which moves with the
+  // clock and writes no further state to announce; and a read that simply
+  // failed, leaving state null — an unknown status is precisely when
+  // reconciliation is owed, and no event is coming to prompt it.
+  // `ifIdle`: a tick never cancels a read still in flight — a timer
+  // shorter than the round trip would otherwise supersede every answer
+  // before it landed. Events and the mount fetch supersede as before.
+  const counting = engine?.status === 'waiting_usage_exhausted'
+  const unknown = engine === null || linkedin === null
+  useEffect(() => {
+    if (connected && !counting && !unknown) return
+    const timer = setInterval(() => {
+      void loadEngine({ ifIdle: true })
+      void loadLinkedin({ ifIdle: true })
+    }, STATUS_POLL_MS)
+    return () => clearInterval(timer)
+  }, [connected, counting, unknown, loadEngine, loadLinkedin])
 
   const badge = engine ? engineBadge(engine.status) : null
 
@@ -87,7 +123,13 @@ export default function App() {
         </div>
       </nav>
       <main className="mx-auto max-w-7xl p-8">
-        {tab === 'profile' ? <Onboarding /> : tab === 'search' ? <Search /> : <Settings />}
+        {tab === 'profile' ? (
+          <Onboarding profileEpoch={epochs.profile} />
+        ) : tab === 'search' ? (
+          <Search epochs={epochs} connected={connected} />
+        ) : (
+          <Settings engine={engine} refreshEngine={loadEngine} />
+        )}
       </main>
     </div>
   )
