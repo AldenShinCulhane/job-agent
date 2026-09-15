@@ -5,19 +5,17 @@ import type { Explanation, Job, LinkedInStatus, Package, SearchRun } from '../ap
 import { useEpochEffect } from '../useEventStream'
 import type { Epochs } from '../useEventStream'
 import { useLatestOnly } from '../useLatestOnly'
+import { btnPrimary, btnSecondary, chip, inputCls, labelCls } from '../styles'
+import type { Tone } from '../styles'
 import type { ReadOptions } from '../useLatestOnly'
 
-const inputCls =
-  'w-full rounded-md border border-slate-300 px-2 py-1 text-sm focus:border-slate-500 focus:outline-none'
-const labelCls = 'block text-xs font-medium uppercase tracking-wide text-slate-500'
-
-const LINKEDIN_STATES: Record<string, { label: string; tone: string }> = {
-  idle: { label: 'Not connected', tone: 'bg-slate-100 text-slate-600' },
-  connecting: { label: 'Connecting…', tone: 'bg-sky-100 text-sky-800' },
-  ready: { label: 'LinkedIn connected', tone: 'bg-emerald-100 text-emerald-800' },
-  logged_out: { label: 'Sign-in needed', tone: 'bg-amber-100 text-amber-800' },
-  captcha_stop: { label: 'Checkpoint — stopped', tone: 'bg-rose-100 text-rose-800' },
-  error: { label: 'Browser error', tone: 'bg-rose-100 text-rose-800' },
+const LINKEDIN_STATES: Record<string, { label: string; tone: Tone }> = {
+  idle: { label: 'Not connected', tone: 'neutral' },
+  connecting: { label: 'Connecting…', tone: 'info' },
+  ready: { label: 'LinkedIn connected', tone: 'ok' },
+  logged_out: { label: 'Sign-in needed', tone: 'warn' },
+  captcha_stop: { label: 'Checkpoint — stopped', tone: 'danger' },
+  error: { label: 'Browser error', tone: 'danger' },
 }
 
 /** The four endpoints an event can invalidate on this page. */
@@ -45,19 +43,16 @@ const RUN_LABELS: Record<string, string> = {
   superseded: 'Replaced by a newer search',
 }
 
-const PACKAGE_STATES: Record<string, { label: string; tone: string }> = {
-  queued: { label: 'Queued', tone: 'bg-slate-100 text-slate-600' },
-  generating: { label: 'Generating…', tone: 'bg-sky-100 text-sky-800' },
-  validating: { label: 'Validating…', tone: 'bg-sky-100 text-sky-800' },
-  fitting: { label: 'Fitting pages…', tone: 'bg-sky-100 text-sky-800' },
-  asserting: { label: 'Final checks…', tone: 'bg-sky-100 text-sky-800' },
-  publishing: { label: 'Publishing…', tone: 'bg-sky-100 text-sky-800' },
-  done: { label: 'Ready', tone: 'bg-emerald-100 text-emerald-800' },
-  failed: { label: 'Failed', tone: 'bg-rose-100 text-rose-800' },
-  waiting_usage: {
-    label: 'Waiting — usage limit',
-    tone: 'bg-amber-100 text-amber-800',
-  },
+const PACKAGE_STATES: Record<string, { label: string; tone: Tone }> = {
+  queued: { label: 'Queued', tone: 'neutral' },
+  generating: { label: 'Generating…', tone: 'info' },
+  validating: { label: 'Validating…', tone: 'info' },
+  fitting: { label: 'Fitting pages…', tone: 'info' },
+  asserting: { label: 'Final checks…', tone: 'info' },
+  publishing: { label: 'Publishing…', tone: 'info' },
+  done: { label: 'Ready', tone: 'ok' },
+  failed: { label: 'Failed', tone: 'danger' },
+  waiting_usage: { label: 'Waiting — usage limit', tone: 'warn' },
 }
 
 const PACKAGE_ACTIVE = new Set([
@@ -499,23 +494,23 @@ export default function Search({
   const scoredCount = jobs.filter((j) => j.deterministic_score !== null).length
 
   const badge = linkedin
-    ? (LINKEDIN_STATES[linkedin.state] ?? { label: linkedin.state, tone: 'bg-slate-100 text-slate-600' })
+    ? (LINKEDIN_STATES[linkedin.state] ?? { label: linkedin.state, tone: 'bg-surface-2 text-ink-2' })
     : null
 
   return (
     <div className="space-y-6">
-      <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+      <section className="rounded-xl border border-line bg-surface p-6 shadow-card">
         <div className="flex items-center justify-between">
           <h2 className="text-lg font-semibold">LinkedIn</h2>
           <div className="flex items-center gap-3">
             {badge && (
-              <span className={`rounded-full px-3 py-1 text-sm font-medium ${badge.tone}`}>
+              <span className={`rounded-full px-3 py-1 text-sm font-medium ${chip[badge.tone]}`}>
                 {badge.label}
               </span>
             )}
             {linkedin?.state !== 'ready' && (
               <button
-                className="rounded-md bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-40"
+                className={`${btnPrimary} rounded-md px-3 py-1.5 text-sm font-medium`}
                 disabled={linkedin?.state === 'connecting'}
                 onClick={connect}
               >
@@ -524,8 +519,8 @@ export default function Search({
             )}
           </div>
         </div>
-        {linkedin?.detail && <p className="mt-2 text-sm text-amber-700">{linkedin.detail}</p>}
-        <p className="mt-2 text-xs text-slate-400">
+        {linkedin?.detail && <p className="mt-2 text-sm text-warn-fg">{linkedin.detail}</p>}
+        <p className="mt-2 text-xs text-ink-3">
           A real browser window opens for sign-in; your session stays on this machine.
           Sign in with your LinkedIn email and password — Google blocks its sign-in
           inside automated browsers, so "Continue with Google" won't work here.
@@ -534,7 +529,7 @@ export default function Search({
         </p>
       </section>
 
-      <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+      <section className="rounded-xl border border-line bg-surface p-6 shadow-card">
         <h2 className="mb-4 text-lg font-semibold">Job search</h2>
         <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
           <label className="col-span-2 block">
@@ -616,7 +611,7 @@ export default function Search({
         </div>
         <div className="mt-4 flex items-center gap-3">
           <button
-            className="rounded-md bg-slate-900 px-4 py-2 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-40"
+            className={`${btnPrimary} rounded-md px-4 py-2 text-sm font-medium`}
             disabled={!keywords.trim() || run?.status === 'running'}
             onClick={start}
           >
@@ -624,24 +619,24 @@ export default function Search({
           </button>
           {run?.status === 'stopped_error' && (
             <button
-              className="rounded-md border border-slate-300 px-4 py-2 text-sm hover:bg-slate-50"
+              className={`${btnSecondary} rounded-md px-4 py-2 text-sm`}
               onClick={resume}
             >
               Resume
             </button>
           )}
           {run?.status && (
-            <span className="text-sm text-slate-500">
+            <span className="text-sm text-ink-3">
               {RUN_LABELS[run.status] ?? run.status}
               {typeof run.collected === 'number' && ` · ${run.collected} collected`}
             </span>
           )}
         </div>
-        {run?.message && <p className="mt-2 text-sm text-amber-700">{run.message}</p>}
-        {error && <p className="mt-2 text-sm text-rose-600">{error}</p>}
+        {run?.message && <p className="mt-2 text-sm text-warn-fg">{run.message}</p>}
+        {error && <p className="mt-2 text-sm text-danger-fg">{error}</p>}
       </section>
 
-      <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+      <section className="rounded-xl border border-line bg-surface p-6 shadow-card">
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-lg font-semibold">
             Jobs ({visibleJobs.length}
@@ -649,14 +644,14 @@ export default function Search({
           </h2>
           <div className="flex flex-wrap items-center gap-3 text-sm">
             {scoringPending > 0 && !scoringStall && (
-              <span className="rounded-full bg-sky-100 px-3 py-1 text-xs font-medium text-sky-800">
+              <span className={`rounded-full px-3 py-1 text-xs font-medium ${chip.info}`}>
                 Scoring… {jobs.length - scoringPending}/{jobs.length}
               </span>
             )}
             {scoringPending > 0 && scoringStall && (
               <>
                 <span
-                  className="rounded-full bg-amber-100 px-3 py-1 text-xs font-medium text-amber-800"
+                  className={`rounded-full px-3 py-1 text-xs font-medium ${chip.warn}`}
                   title={scoringStall.detail ?? undefined}
                 >
                   {scoringStall.reason === 'engine_blocked'
@@ -664,7 +659,7 @@ export default function Search({
                     : 'Scoring paused — automatic retries exhausted'}
                 </span>
                 <button
-                  className="rounded-md border border-amber-300 px-2 py-1 text-xs text-amber-800 hover:bg-amber-50"
+                  className="rounded-md border border-line-strong px-2 py-1 text-xs text-warn-fg hover:bg-warn-bg"
                   onClick={async () => {
                     setError(null)
                     try {
@@ -681,7 +676,7 @@ export default function Search({
             )}
             {selectedVisible.length > 0 && (
               <button
-                className="rounded-full bg-slate-900 px-3 py-1 text-xs font-medium text-white hover:bg-slate-700 disabled:opacity-40"
+                className={`${btnPrimary} rounded-full px-3 py-1 text-xs font-medium`}
                 disabled={busyGenerate || listStale}
                 onClick={generatePackages}
                 title="Tailored resume + cover letter PDFs for each selected job"
@@ -694,7 +689,7 @@ export default function Search({
             <label className="flex items-center gap-1">
               Sort
               <select
-                className="rounded-md border border-slate-300 px-1 py-0.5 text-sm"
+                className="rounded-md border border-line-strong bg-surface px-1 py-0.5 text-sm text-ink"
                 value={sortBy}
                 onChange={(e) => setSortBy(e.target.value as 'score' | 'date')}
               >
@@ -720,7 +715,7 @@ export default function Search({
             </label>
             {scoredCount >= 2 && scoringPending === 0 && (
               <button
-                className="rounded-md border border-slate-300 px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-40"
+                className={`${btnSecondary} rounded-md px-2 py-1 text-xs`}
                 disabled={busyRerank}
                 onClick={rerank}
                 title="LLM-order the jobs scored within a few points of the top"
@@ -731,9 +726,9 @@ export default function Search({
           </div>
         </div>
         {jobs.length === 0 ? (
-          <p className="text-sm text-slate-400">No jobs collected yet.</p>
+          <p className="text-sm text-ink-3">No jobs collected yet.</p>
         ) : (
-          <ul className="divide-y divide-slate-100">
+          <ul className="divide-y divide-line">
             {visibleJobs.map((job) => {
               const score = displayScore(job)
               const breakdown = job.score_breakdown
@@ -753,11 +748,7 @@ export default function Search({
                       {score !== null && (
                         <span
                           className={`mt-0.5 w-12 shrink-0 rounded-md px-1.5 py-0.5 text-center text-sm font-semibold ${
-                            score >= 75
-                              ? 'bg-emerald-100 text-emerald-800'
-                              : score >= 50
-                                ? 'bg-amber-100 text-amber-800'
-                                : 'bg-slate-100 text-slate-600'
+                            chip[score >= 75 ? 'ok' : score >= 50 ? 'warn' : 'neutral']
                           }`}
                           title={
                             job.llm_rerank !== null
@@ -773,11 +764,11 @@ export default function Search({
                           href={job.url}
                           target="_blank"
                           rel="noreferrer"
-                          className="font-medium text-slate-900 hover:underline"
+                          className="font-medium text-ink hover:underline"
                         >
                           {job.title}
                         </a>
-                        <p className="text-sm text-slate-500">
+                        <p className="text-sm text-ink-3">
                           {job.company}
                           {job.location ? ` · ${job.location}` : ''}
                           {job.posted_text ? ` · ${job.posted_text}` : ''}
@@ -787,19 +778,19 @@ export default function Search({
                     <div className="flex shrink-0 items-center gap-2">
                       {breakdown?.exceeds_experience && (
                         <span
-                          className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800"
+                          className={`rounded-full px-2 py-0.5 text-xs font-medium ${chip.warn}`}
                           title="Demands more experience than the profile shows"
                         >
                           Over-exp
                         </span>
                       )}
                       {job.easy_apply && (
-                        <span className="rounded-full bg-sky-100 px-2 py-0.5 text-xs font-medium text-sky-800">
+                        <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${chip.info}`}>
                           Easy Apply
                         </span>
                       )}
                       <button
-                        className="rounded-md border border-slate-300 px-2 py-1 text-xs hover:bg-slate-50 disabled:opacity-40"
+                        className={`${btnSecondary} rounded-md px-2 py-1 text-xs`}
                         disabled={busyDetail === job.job_id}
                         onClick={() =>
                           job.description && expanded !== job.job_id
@@ -820,24 +811,24 @@ export default function Search({
                   {expanded === job.job_id && (
                     <div className="mt-2 space-y-2">
                       {breakdown && (
-                        <div className="rounded-lg bg-slate-50 p-3 text-sm text-slate-700">
-                          <p className="text-xs uppercase tracking-wide text-slate-400">
+                        <div className="rounded-lg bg-surface-2 p-3 text-sm text-ink-2">
+                          <p className="text-xs uppercase tracking-wide text-ink-3">
                             Skills {breakdown.skills} · Experience{' '}
                             {breakdown.experience} · Education {breakdown.education}
                           </p>
                           {breakdown.match_reasons.map((r) => (
-                            <p key={r} className="mt-1 text-emerald-700">
+                            <p key={r} className="mt-1 text-ok-fg">
                               ✓ {r}
                             </p>
                           ))}
                           {breakdown.gap_reasons.map((r) => (
-                            <p key={r} className="mt-1 text-amber-700">
+                            <p key={r} className="mt-1 text-warn-fg">
                               ✗ {r}
                             </p>
                           ))}
                           {job.deterministic_score !== null && (
                             <button
-                              className="mt-2 rounded-md border border-slate-300 px-2 py-1 text-xs hover:bg-white disabled:opacity-40"
+                              className="mt-2 rounded-md border border-line-strong px-2 py-1 text-xs hover:bg-surface disabled:opacity-40"
                               disabled={busyExplain === job.job_id}
                               onClick={() => explain(job.job_id)}
                             >
@@ -849,17 +840,17 @@ export default function Search({
                             </button>
                           )}
                           {explanation && (
-                            <div className="mt-2 border-t border-slate-200 pt-2">
-                              <p className="font-medium text-slate-800">
+                            <div className="mt-2 border-t border-line pt-2">
+                              <p className="font-medium text-ink">
                                 {explanation.pitch}
                               </p>
                               {explanation.strengths.map((s) => (
-                                <p key={s} className="mt-1 text-emerald-700">
+                                <p key={s} className="mt-1 text-ok-fg">
                                   + {s}
                                 </p>
                               ))}
                               {explanation.gaps.map((g) => (
-                                <p key={g} className="mt-1 text-amber-700">
+                                <p key={g} className="mt-1 text-warn-fg">
                                   – {g}
                                 </p>
                               ))}
@@ -868,7 +859,7 @@ export default function Search({
                         </div>
                       )}
                       {job.description && (
-                        <p className="whitespace-pre-wrap rounded-lg bg-slate-50 p-3 text-sm text-slate-700">
+                        <p className="whitespace-pre-wrap rounded-lg bg-surface-2 p-3 text-sm text-ink-2">
                           {job.description}
                         </p>
                       )}
@@ -882,13 +873,13 @@ export default function Search({
       </section>
 
       {packages.length > 0 && (
-        <section className="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+        <section className="rounded-xl border border-line bg-surface p-6 shadow-card">
           <h2 className="mb-4 text-lg font-semibold">Packages</h2>
-          <ul className="divide-y divide-slate-100">
+          <ul className="divide-y divide-line">
             {packages.map((pkg) => {
               const state = PACKAGE_STATES[pkg.status] ?? {
                 label: pkg.status,
-                tone: 'bg-slate-100 text-slate-600',
+                tone: 'bg-surface-2 text-ink-2',
               }
               return (
                 <li
@@ -896,26 +887,26 @@ export default function Search({
                   className="flex flex-wrap items-center justify-between gap-3 py-3"
                 >
                   <div className="min-w-0">
-                    <p className="truncate font-medium text-slate-800">
+                    <p className="truncate font-medium text-ink">
                       {pkg.title}{' '}
-                      <span className="font-normal text-slate-500">
+                      <span className="font-normal text-ink-3">
                         — {pkg.company}
                       </span>
                     </p>
                     {pkg.error && pkg.status !== 'done' && (
-                      <p className="mt-0.5 text-xs text-rose-600">{pkg.error}</p>
+                      <p className="mt-0.5 text-xs text-danger-fg">{pkg.error}</p>
                     )}
                   </div>
                   <div className="flex shrink-0 items-center gap-3 text-sm">
                     <span
-                      className={`rounded-full px-3 py-1 text-xs font-medium ${state.tone}`}
+                      className={`rounded-full px-3 py-1 text-xs font-medium ${chip[state.tone]}`}
                     >
                       {state.label}
                     </span>
                     {pkg.status === 'done' && (
                       <>
                         <a
-                          className="text-slate-600 underline hover:text-slate-900"
+                          className="text-ink-2 underline hover:text-ink"
                           href={packageFileUrl(pkg.id, 'resume.pdf')}
                           target="_blank"
                           rel="noreferrer"
@@ -923,7 +914,7 @@ export default function Search({
                           Resume
                         </a>
                         <a
-                          className="text-slate-600 underline hover:text-slate-900"
+                          className="text-ink-2 underline hover:text-ink"
                           href={packageFileUrl(pkg.id, 'cover_letter.pdf')}
                           target="_blank"
                           rel="noreferrer"
@@ -931,7 +922,7 @@ export default function Search({
                           Cover letter
                         </a>
                         <a
-                          className="text-slate-600 underline hover:text-slate-900"
+                          className="text-ink-2 underline hover:text-ink"
                           href={packageFileUrl(pkg.id, 'job.md')}
                           target="_blank"
                           rel="noreferrer"
@@ -941,7 +932,7 @@ export default function Search({
                       </>
                     )}
                     <a
-                      className="text-slate-400 underline hover:text-slate-600"
+                      className="text-ink-3 underline hover:text-ink-2"
                       href={pkg.url}
                       target="_blank"
                       rel="noreferrer"

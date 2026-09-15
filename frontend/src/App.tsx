@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react'
 import { api } from './api'
 import type { EngineStatus, LinkedInStatus } from './api'
 import { engineBadge } from './engineStatus'
+import { chip } from './styles'
 import { useEpochEffect, useEventStream } from './useEventStream'
 import { useLatestOnly } from './useLatestOnly'
 import type { ReadOptions } from './useLatestOnly'
@@ -81,17 +82,17 @@ export default function App() {
   const badge = engine ? engineBadge(engine.status) : null
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      <header className="flex items-center justify-between border-b border-slate-200 bg-white px-8 py-4">
+    <div className="min-h-screen bg-bg text-ink">
+      <header className="flex items-center justify-between border-b border-line bg-surface px-8 py-4">
         <div>
           <h1 className="text-xl font-semibold">Job Agent</h1>
-          <p className="text-sm text-slate-500">
+          <p className="text-sm text-ink-3">
             LinkedIn job search with tailored resume + cover letter packages
           </p>
         </div>
         {badge && (
           <span
-            className={`rounded-full px-3 py-1 text-sm font-medium ${badge.tone}`}
+            className={`rounded-full px-3 py-1 text-sm font-medium ${chip[badge.tone]}`}
             title={engine?.last_error ?? undefined}
           >
             {badge.label}
@@ -105,15 +106,15 @@ export default function App() {
         onOpenSettings={() => setTab('settings')}
         onOpenSearch={() => setTab('search')}
       />
-      <nav className="border-b border-slate-200 bg-white px-8">
+      <nav className="border-b border-line bg-surface px-8">
         <div className="mx-auto flex max-w-7xl gap-6">
           {TABS.map((t) => (
             <button
               key={t.id}
               className={`border-b-2 py-3 text-sm font-medium ${
                 tab === t.id
-                  ? 'border-slate-900 text-slate-900'
-                  : 'border-transparent text-slate-500 hover:text-slate-800'
+                  ? 'border-accent text-ink'
+                  : 'border-transparent text-ink-3 hover:text-ink'
               }`}
               onClick={() => setTab(t.id)}
             >

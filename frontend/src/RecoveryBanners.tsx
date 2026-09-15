@@ -1,5 +1,7 @@
 import type { EngineStatus, LinkedInStatus } from './api'
 import { retryText } from './engineStatus'
+import { banner } from './styles'
+import type { Tone } from './styles'
 
 interface Props {
   engine: EngineStatus | null
@@ -10,7 +12,7 @@ interface Props {
 
 interface Banner {
   key: string
-  tone: string
+  tone: Tone
   text: string
   action?: { label: string; run: () => void }
 }
@@ -29,7 +31,7 @@ export default function RecoveryBanners({
   if (engine?.status === 'auth_required') {
     banners.push({
       key: 'engine-auth',
-      tone: 'bg-rose-50 text-rose-800 border-rose-200',
+      tone: 'danger',
       text: 'Claude sign-in required — scoring and package generation are paused until you log in.',
       action: { label: 'How to fix', run: onOpenSettings },
     })
@@ -37,7 +39,7 @@ export default function RecoveryBanners({
   if (engine?.status === 'config_error') {
     banners.push({
       key: 'engine-config',
-      tone: 'bg-rose-50 text-rose-800 border-rose-200',
+      tone: 'danger',
       text: `Claude engine configuration error${engine.last_error ? `: ${engine.last_error}` : ''}.`,
       action: { label: 'Details', run: onOpenSettings },
     })
@@ -46,7 +48,7 @@ export default function RecoveryBanners({
     const retry = retryText(engine.retry_in_seconds)
     banners.push({
       key: 'engine-usage',
-      tone: 'bg-amber-50 text-amber-800 border-amber-200',
+      tone: 'warn',
       // Honest scope: queued scoring/package work has a retry timer and
       // is never lost; one-off actions (upload, Explain, Re-rank) are
       // request-scoped — they fail now and the user retries them.
@@ -58,7 +60,7 @@ export default function RecoveryBanners({
   if (linkedin?.state === 'captcha_stop') {
     banners.push({
       key: 'li-captcha',
-      tone: 'bg-rose-50 text-rose-800 border-rose-200',
+      tone: 'danger',
       text: 'LinkedIn checkpoint hit — solve it in the browser window, then press Connect; the search resumes on its own. The app never bypasses checkpoints.',
       action: { label: 'Go to Search', run: onOpenSearch },
     })
@@ -66,7 +68,7 @@ export default function RecoveryBanners({
   if (linkedin?.state === 'logged_out') {
     banners.push({
       key: 'li-auth',
-      tone: 'bg-amber-50 text-amber-800 border-amber-200',
+      tone: 'warn',
       text: 'LinkedIn session expired — reconnect to keep searching. Scored jobs and packages are unaffected.',
       action: { label: 'Go to Search', run: onOpenSearch },
     })
@@ -78,7 +80,7 @@ export default function RecoveryBanners({
       {banners.map((b) => (
         <div
           key={b.key}
-          className={`flex items-center justify-between border-b px-8 py-2 text-sm ${b.tone}`}
+          className={`flex items-center justify-between border-b px-8 py-2 text-sm ${banner[b.tone]}`}
         >
           <span>{b.text}</span>
           {b.action && (

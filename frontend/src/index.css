@@ -1,1 +1,117 @@
 @import "tailwindcss";
+
+/* Design tokens: the one place a colour is chosen.
+ *
+ * Every value is light-dark(<light>, <dark>). Which side applies is decided
+ * by `color-scheme` on :root, so there is exactly one table and no second
+ * copy to keep in sync. With `light dark` the browser follows the system
+ * preference; the two attribute rules below are the user's override.
+ *
+ * Hex only. scripts/contrast.mjs parses this block and refuses to pass a
+ * token it cannot read, so a typo here fails the check instead of shipping
+ * a colour nobody measured.
+ */
+:root {
+  color-scheme: light dark;
+
+  /* surfaces */
+  --bg: light-dark(#f5f6f8, #0f1216);
+  --surface: light-dark(#ffffff, #171b21);
+  --surface-2: light-dark(#eef0f3, #1f242c);
+
+  /* lines: `line` separates, `line-strong` is a control boundary (3:1) */
+  --line: light-dark(#e2e5ea, #2a3039);
+  --line-strong: light-dark(#7d8490, #6b7380);
+
+  /* text: three levels, all readable (ink-3 is secondary text, not decoration) */
+  --ink: light-dark(#16191f, #e7e9ed);
+  --ink-2: light-dark(#3f4650, #b8bec8);
+  --ink-3: light-dark(#5d6570, #9aa1ab);
+
+  /* the filled button: ink on paper, inverted in dark. Not the accent. */
+  --primary: light-dark(#16191f, #e7e9ed);
+  --primary-ink: light-dark(#ffffff, #0f1216);
+  --primary-hover: light-dark(#2c313a, #ffffff);
+
+  /* the one accent: focus ring, native checkbox/radio, active tab. Never a fill. */
+  --accent: light-dark(#2457d6, #8ab0ff);
+
+  /* semantic status: fg on its own tint, and fg alone on a neutral surface */
+  --ok-fg: light-dark(#14663a, #7fdca4);
+  --ok-bg: light-dark(#d9f3e3, #103322);
+  --warn-fg: light-dark(#7a4a07, #f0c060);
+  --warn-bg: light-dark(#fbeccc, #3a2a0a);
+  --danger-fg: light-dark(#9b1c3a, #ff8fa6);
+  --danger-bg: light-dark(#fde2e7, #43141f);
+  --info-fg: light-dark(#0c5a86, #7cc4f5);
+  --info-bg: light-dark(#dbeefb, #0f2f45);
+
+  /* light-dark() picks a colour, not a whole declaration, so the shadow is
+   * one declaration whose colour disappears in dark (borders separate there) */
+  --shadow-color: light-dark(rgb(0 0 0 / 0.06), transparent);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+/* Drop Tailwind's palette. A raw `bg-slate-50` then generates nothing, so
+ * the restraint rule is enforced by the build rather than by review. */
+@theme {
+  --color-*: initial;
+}
+
+/* Utilities read the tokens by reference (`inline`), so `text-ink` resolves
+ * on the element that uses it and follows the scheme in force there. */
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-ink: var(--ink);
+  --color-ink-2: var(--ink-2);
+  --color-ink-3: var(--ink-3);
+  --color-primary: var(--primary);
+  --color-primary-ink: var(--primary-ink);
+  --color-primary-hover: var(--primary-hover);
+  --color-accent: var(--accent);
+  --color-ok-fg: var(--ok-fg);
+  --color-ok-bg: var(--ok-bg);
+  --color-warn-fg: var(--warn-fg);
+  --color-warn-bg: var(--warn-bg);
+  --color-danger-fg: var(--danger-fg);
+  --color-danger-bg: var(--danger-bg);
+  --color-info-fg: var(--info-fg);
+  --color-info-bg: var(--info-bg);
+}
+
+@utility shadow-card {
+  box-shadow: 0 1px 2px 0 var(--shadow-color);
+}
+
+@layer base {
+  /* The root paints, so the empty shell before React mounts already has
+   * the scheme's background instead of a white frame. */
+  html {
+    background-color: var(--bg);
+    color: var(--ink);
+    accent-color: var(--accent);
+  }
+
+  /* Preflight makes placeholders 50%-alpha currentcolor, which nobody
+   * measured. This is a real token and is in the contrast check. */
+  ::placeholder {
+    color: var(--ink-3);
+  }
+
+  /* One keyboard focus style for every control. Offset so the ring sits on
+   * the surrounding surface, which is the pair the contrast check measures. */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+}

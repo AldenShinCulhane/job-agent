@@ -1,19 +1,21 @@
-export const ENGINE_STATUS_LABELS: Record<string, { label: string; tone: string }> = {
-  ok: { label: 'Claude ready', tone: 'bg-emerald-100 text-emerald-800' },
-  unprobed: { label: 'Claude not yet probed', tone: 'bg-slate-100 text-slate-600' },
+import type { Tone } from './styles'
+
+export const ENGINE_STATUS_LABELS: Record<string, { label: string; tone: Tone }> = {
+  ok: { label: 'Claude ready', tone: 'ok' },
+  unprobed: { label: 'Claude not yet probed', tone: 'neutral' },
   waiting_usage_exhausted: {
     label: 'Waiting — usage limit reached',
-    tone: 'bg-amber-100 text-amber-800',
+    tone: 'warn',
   },
   auth_required: {
     label: 'Sign in to Claude required',
-    tone: 'bg-rose-100 text-rose-800',
+    tone: 'danger',
   },
-  config_error: { label: 'Engine configuration error', tone: 'bg-rose-100 text-rose-800' },
+  config_error: { label: 'Engine configuration error', tone: 'danger' },
 }
 
-export function engineBadge(status: string): { label: string; tone: string } {
-  return ENGINE_STATUS_LABELS[status] ?? { label: status, tone: 'bg-slate-100 text-slate-600' }
+export function engineBadge(status: string): { label: string; tone: Tone } {
+  return ENGINE_STATUS_LABELS[status] ?? { label: status, tone: 'neutral' }
 }
 
 export function retryText(seconds: number | null): string | null {
