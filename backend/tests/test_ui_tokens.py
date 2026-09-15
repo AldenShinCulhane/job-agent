@@ -7,6 +7,7 @@ because a token pair can pass on paper while an element ends up over a
 different surface than the table assumed.
 """
 
+import json
 import os
 from pathlib import Path
 
@@ -134,4 +135,42 @@ def test_disabled_controls_render_dimmed(browser, dist_url):
     assert save.is_disabled()  # limit unchanged from the fixture value
     assert page.evaluate("(el) => getComputedStyle(el).opacity",
                          save.element_handle()) == "0.4"
+    context.close()
+
+
+def test_unknown_statuses_get_the_neutral_chip(browser, dist_url):
+    """Every status map falls back for a status it has no entry for: the
+    raw name, in the neutral tone, still readable. Engine, LinkedIn and
+    package each have their own map; the fixtures give each one a status
+    the UI has never heard of."""
+    context = browser.new_context(color_scheme="light",
+                                  viewport={"width": 1280, "height": 900})
+    page = context.new_page()
+    console_errors: list[str] = []
+    page.on("console", lambda m: console_errors.append(m.text)
+            if m.type == "error" else None)
+    page.on("pageerror", lambda e: console_errors.append(str(e)))
+    route_fixtures(page)
+    page.route("**/api/status", lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body=json.dumps({"app": "job-agent", "engine": {
+            "status": "rebooting", "model": None,
+            "retry_in_seconds": None, "last_error": None}})))
+    page.route("**/api/linkedin/status", lambda route: route.fulfill(
+        status=200, content_type="application/json",
+        body=json.dumps({"state": "rate_limited", "detail": None})))
+
+    page.goto(dist_url)
+    page.wait_for_selector("text=rebooting")  # header chip, engine map
+    page.get_by_role("button", name="Search", exact=True).click()
+    page.wait_for_selector("text=rate_limited")  # LinkedIn map
+    page.wait_for_selector("text=archived")  # package map
+
+    chips = {m["text"]: m for m in page.evaluate(MEASURE_JS, ".text-ink-2")
+             if m["text"] in {"rebooting", "rate_limited", "archived"}}
+    assert set(chips) == {"rebooting", "rate_limited", "archived"}, chips
+    for m in chips.values():
+        assert "bg-surface-2" in m["cls"].split(), m
+        assert m["ratio"] is not None and m["ratio"] >= AA_TEXT, m
+    assert not console_errors, console_errors
     context.close()

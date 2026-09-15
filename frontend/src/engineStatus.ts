@@ -1,6 +1,7 @@
-import type { Tone } from './styles'
+import { badgeFor } from './styles'
+import type { Badge } from './styles'
 
-export const ENGINE_STATUS_LABELS: Record<string, { label: string; tone: Tone }> = {
+export const ENGINE_STATUS_LABELS: Record<string, Badge> = {
   ok: { label: 'Claude ready', tone: 'ok' },
   unprobed: { label: 'Claude not yet probed', tone: 'neutral' },
   waiting_usage_exhausted: {
@@ -14,8 +15,8 @@ export const ENGINE_STATUS_LABELS: Record<string, { label: string; tone: Tone }>
   config_error: { label: 'Engine configuration error', tone: 'danger' },
 }
 
-export function engineBadge(status: string): { label: string; tone: Tone } {
-  return ENGINE_STATUS_LABELS[status] ?? { label: status, tone: 'neutral' }
+export function engineBadge(status: string): Badge {
+  return badgeFor(ENGINE_STATUS_LABELS, status)
 }
 
 export function retryText(seconds: number | null): string | null {

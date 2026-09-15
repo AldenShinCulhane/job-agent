@@ -3,6 +3,7 @@ import { api } from './api'
 import type { EngineStatus, LinkedInStatus } from './api'
 import { engineBadge } from './engineStatus'
 import { chip } from './styles'
+import { usePreference } from './theme'
 import { useEpochEffect, useEventStream } from './useEventStream'
 import { useLatestOnly } from './useLatestOnly'
 import type { ReadOptions } from './useLatestOnly'
@@ -25,6 +26,11 @@ export default function App() {
   const [engine, setEngine] = useState<EngineStatus | null>(null)
   const [linkedin, setLinkedin] = useState<LinkedInStatus | null>(null)
   const [tab, setTab] = useState<TabId>('profile')
+  // The theme preference lives here, not in Settings, because it has to
+  // outlive Settings: the listener that follows other tabs must be up
+  // while any tab is showing, and with storage blocked this state is the
+  // only record of the choice — it would be lost with the page.
+  const [appearance, setAppearance] = usePreference()
   // One stream for the whole app. It says which surface went stale; the
   // endpoints below stay the only source of what is actually true.
   const { epochs, connected } = useEventStream()
@@ -129,7 +135,12 @@ export default function App() {
         ) : tab === 'search' ? (
           <Search epochs={epochs} connected={connected} />
         ) : (
-          <Settings engine={engine} refreshEngine={loadEngine} />
+          <Settings
+            engine={engine}
+            refreshEngine={loadEngine}
+            appearance={appearance}
+            setAppearance={setAppearance}
+          />
         )}
       </main>
     </div>

@@ -49,6 +49,11 @@ function storePreference(preference: ThemePreference): void {
 
 /** The preference as React state, kept in step with other tabs.
  *
+ * Mounted once, in App, for the life of the document. It must not belong
+ * to a page: the listener below has to be up whichever tab is showing,
+ * and when storage is blocked this state is the only record of the
+ * choice, so unmounting with a page would reset it to System.
+ *
  * Setting it switches THIS document at once and writes storage. The
  * `storage` event never fires in the document that wrote — only in the
  * others — so the listener exists purely for changes made elsewhere:

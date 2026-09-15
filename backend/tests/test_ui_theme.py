@@ -170,6 +170,37 @@ def test_other_tabs_follow_a_choice_and_a_clear(browser, dist_url):
     context.close()
 
 
+def test_a_tab_that_never_opened_settings_still_follows(browser, dist_url):
+    """The listener belongs to the document, not to the Settings page: a
+    tab left on Profile, then Search, follows another tab's choice and
+    its return to System without ever showing the control."""
+    context, sender, errors = _open(browser, dist_url, "light")
+    receiver = context.new_page()
+    route_fixtures(receiver)
+    receiver.goto(dist_url)
+    receiver.wait_for_selector("text=Claude sign-in required")
+    receiver.wait_for_selector("text=Your profile")  # on Profile, and stays
+    _open_appearance(sender)
+
+    _choose(sender, "Dark")
+    receiver.wait_for_function(
+        "document.documentElement.dataset.theme === 'dark'")
+    assert _is_dark(receiver)
+
+    receiver.get_by_role("button", name="Search", exact=True).click()
+    receiver.wait_for_selector("text=Daily cap reached")
+    _choose(sender, "System")
+    receiver.wait_for_function(
+        "document.documentElement.dataset.theme === undefined")
+    assert not _is_dark(receiver)
+
+    # The control, opened only now, agrees with what the document shows.
+    _open_appearance(receiver)
+    assert receiver.get_by_label("System", exact=True).is_checked()
+    assert not errors, errors
+    context.close()
+
+
 def test_blocked_storage_keeps_the_tab_usable(browser, dist_url):
     context, page, errors = _open(browser, dist_url, "light",
                                   block_storage=True)
@@ -181,6 +212,15 @@ def test_blocked_storage_keeps_the_tab_usable(browser, dist_url):
     assert _is_dark(page)
     assert _override(page) == "dark"
     assert _stored(page) == "blocked"
+
+    # The choice outlives the Settings page: it is held in memory by the
+    # document, not re-read from the storage that refused it.
+    page.get_by_role("button", name="Profile", exact=True).click()
+    page.wait_for_selector("text=Your profile")
+    assert _is_dark(page)
+    _open_appearance(page)
+    assert page.get_by_label("Dark", exact=True).is_checked()
+    assert _is_dark(page)
     assert not errors, errors
     context.close()
 

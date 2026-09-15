@@ -74,7 +74,8 @@ ENGINE = {"status": "auth_required", "model": None, "retry_in_seconds": None,
 # Chosen so that every tone in styles.ts renders on the first paint of some
 # tab: danger (engine banner, failed package), warn (LinkedIn banner, run
 # message, waiting package, missing LaTeX), info (generating package), ok
-# (done package, score 80), neutral (queued package, score 30).
+# (done package, score 80), neutral (queued package, score 30, and a
+# package whose status the UI does not know).
 API_FIXTURES: dict[str, dict] = {
     "/api/status": {"app": "job-agent", "engine": ENGINE},
     "/api/linkedin/status": {"state": "logged_out", "detail": "session expired"},
@@ -88,6 +89,9 @@ API_FIXTURES: dict[str, dict] = {
         _package(1, "done"), _package(2, "generating"),
         _package(3, "failed", "compile failed"), _package(4, "queued"),
         _package(5, "waiting_usage"),
+        # A status the UI has no label for: it must still render, in the
+        # neutral tone, under its raw name.
+        _package(6, "archived"),
     ]},
     "/api/profile": {
         "version": 5, "confirmed": False, "live_version": 4,

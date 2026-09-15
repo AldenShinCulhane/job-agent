@@ -3,7 +3,6 @@ import { api } from '../api'
 import type { EngineStatus, Settings as SettingsPayload } from '../api'
 import { engineBadge, retryText } from '../engineStatus'
 import { btnPrimary, btnSecondary, chip } from '../styles'
-import { usePreference } from '../theme'
 import type { ThemePreference } from '../theme'
 import { useLatestOnly } from '../useLatestOnly'
 
@@ -26,9 +25,15 @@ const APPEARANCE: { value: ThemePreference; label: string }[] = [
 export default function Settings({
   engine,
   refreshEngine,
+  appearance,
+  setAppearance,
 }: {
   engine: EngineStatus | null
   refreshEngine: () => Promise<unknown>
+  // Owned by App: browser-local, never on the server, and alive for the
+  // whole document rather than for this page.
+  appearance: ThemePreference
+  setAppearance: (next: ThemePreference) => void
 }) {
   const [documents, setDocuments] = useState<Documents | null>(null)
   const [limit, setLimit] = useState(1)
@@ -41,10 +46,6 @@ export default function Settings({
   // one of those must not push the stored value back over what the user
   // has since typed — the save's own reload is exactly that read.
   const limitSeq = useRef(0)
-  // Browser-local, never on the server: it belongs to this machine's
-  // screen, not to the profile.
-  const [appearance, setAppearance] = usePreference()
-
   const readDocuments = useLatestOnly()
 
   const loadDocuments = useCallback(() => {

@@ -9,6 +9,22 @@
 
 export type Tone = 'neutral' | 'ok' | 'info' | 'warn' | 'danger'
 
+/** What a status renders as: its wording and which tone map entry. */
+export interface Badge {
+  label: string
+  tone: Tone
+}
+
+/** The badge for a status, known or not. A status the map has no entry
+ * for still gets one: its raw name, in the neutral tone. Every map goes
+ * through this so the fallback is written once and type-checked once —
+ * a fallback literal written at a call site after `??` is not checked
+ * at all, because the index type says the lookup is never undefined and
+ * TypeScript then drops the right operand's type. */
+export function badgeFor(map: Record<string, Badge>, status: string): Badge {
+  return map[status] ?? { label: status, tone: 'neutral' }
+}
+
 /** A pill or badge: tinted background with its matching text. */
 export const chip: Record<Tone, string> = {
   neutral: 'bg-surface-2 text-ink-2',

@@ -5,11 +5,11 @@ import type { Explanation, Job, LinkedInStatus, Package, SearchRun } from '../ap
 import { useEpochEffect } from '../useEventStream'
 import type { Epochs } from '../useEventStream'
 import { useLatestOnly } from '../useLatestOnly'
-import { btnPrimary, btnSecondary, chip, inputCls, labelCls } from '../styles'
-import type { Tone } from '../styles'
+import { badgeFor, btnPrimary, btnSecondary, chip, inputCls, labelCls } from '../styles'
+import type { Badge } from '../styles'
 import type { ReadOptions } from '../useLatestOnly'
 
-const LINKEDIN_STATES: Record<string, { label: string; tone: Tone }> = {
+const LINKEDIN_STATES: Record<string, Badge> = {
   idle: { label: 'Not connected', tone: 'neutral' },
   connecting: { label: 'Connecting…', tone: 'info' },
   ready: { label: 'LinkedIn connected', tone: 'ok' },
@@ -43,7 +43,7 @@ const RUN_LABELS: Record<string, string> = {
   superseded: 'Replaced by a newer search',
 }
 
-const PACKAGE_STATES: Record<string, { label: string; tone: Tone }> = {
+const PACKAGE_STATES: Record<string, Badge> = {
   queued: { label: 'Queued', tone: 'neutral' },
   generating: { label: 'Generating…', tone: 'info' },
   validating: { label: 'Validating…', tone: 'info' },
@@ -493,9 +493,7 @@ export default function Search({
 
   const scoredCount = jobs.filter((j) => j.deterministic_score !== null).length
 
-  const badge = linkedin
-    ? (LINKEDIN_STATES[linkedin.state] ?? { label: linkedin.state, tone: 'bg-surface-2 text-ink-2' })
-    : null
+  const badge = linkedin ? badgeFor(LINKEDIN_STATES, linkedin.state) : null
 
   return (
     <div className="space-y-6">
@@ -877,10 +875,7 @@ export default function Search({
           <h2 className="mb-4 text-lg font-semibold">Packages</h2>
           <ul className="divide-y divide-line">
             {packages.map((pkg) => {
-              const state = PACKAGE_STATES[pkg.status] ?? {
-                label: pkg.status,
-                tone: 'bg-surface-2 text-ink-2',
-              }
+              const state = badgeFor(PACKAGE_STATES, pkg.status)
               return (
                 <li
                   key={pkg.id}
