@@ -2,6 +2,25 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <meta name="color-scheme" content="light dark" />
+    <script>
+      // Theme bootstrap: the same two lines applyPreference() in
+      // src/theme.ts runs, done here before the stylesheet and the app
+      // exist so the first paint is already the stored preference. The
+      // attribute is what index.css switches on; the inline color-scheme
+      // is what paints the empty shell until that stylesheet arrives.
+      // Storage can be blocked — then the page follows the system, which
+      // is exactly what "no preference" means.
+      ;(function () {
+        try {
+          var theme = localStorage.getItem('theme')
+          if (theme === 'light' || theme === 'dark') {
+            document.documentElement.dataset.theme = theme
+            document.documentElement.style.colorScheme = theme
+          }
+        } catch (e) {}
+      })()
+    </script>
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Job Agent</title>

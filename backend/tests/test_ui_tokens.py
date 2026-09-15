@@ -12,9 +12,9 @@ from pathlib import Path
 
 import pytest
 
-from backend.tests.ui_harness import (  # noqa: F401  (fixtures)
-    MEASURE_JS, PLACEHOLDER_JS, browser, dist_url, luminance_of_css_rgb,
-    resolved_token, route_fixtures,
+from backend.tests.ui_harness import (
+    MEASURE_JS, PLACEHOLDER_JS, luminance_of_css_rgb, resolved_token,
+    route_fixtures,
 )
 
 AA_TEXT = 4.5
