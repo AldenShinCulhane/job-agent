@@ -7,7 +7,9 @@ against the built bundle over synthetic fixtures.
 
 import json
 
-from backend.tests.ui_harness import API_FIXTURES, route_fixtures
+from backend.tests.ui_harness import API_FIXTURES, _job, route_fixtures
+
+THIRTY_JOBS = [_job(f"j{i}", 80 - i) for i in range(30)]
 
 
 def _open(browser, dist_url, *, width=1280, height=900):
@@ -30,7 +32,7 @@ def _row(page, title: str):
 
 
 def _checkbox(page, title: str):
-    return _row(page, title).get_by_role("checkbox")
+    return page.get_by_role("checkbox", name=f"Select {title}", exact=True)
 
 
 def _generate(page):
@@ -106,4 +108,86 @@ def test_a_failed_generation_keeps_the_selection_and_shows_why(browser, dist_url
     assert _checkbox(page, "Backend Engineer a").is_checked()
     assert _generate(page).inner_text() == "Generate packages (1)"
     assert not _generate(page).is_disabled()
+    context.close()
+
+
+def _open_long(browser, dist_url, *, width=1280, height=900):
+    context, page = _open(browser, dist_url, width=width, height=height)
+    page.route("**/api/jobs", lambda route, *_: route.fulfill(
+        status=200, content_type="application/json",
+        body=json.dumps(dict(API_FIXTURES["/api/jobs"], jobs=THIRTY_JOBS))))
+    _goto_search(page, dist_url, ready="text=Backend Engineer j29")
+    return context, page
+
+
+def _bar(page):
+    return page.get_by_text("selected", exact=False).locator("..")
+
+
+def _box(locator):
+    return locator.bounding_box()
+
+
+def test_the_gate_stays_in_view_while_the_list_runs_past_it(browser, dist_url):
+    context, page = _open_long(browser, dist_url)
+    _checkbox(page, "Backend Engineer j0").check()
+    _checkbox(page, "Backend Engineer j3").check()
+    assert page.get_by_text("2 selected").is_visible()
+
+    bar = _bar(page)
+    for y in (0, 600, 1200):
+        page.evaluate(f"window.scrollTo(0, {y})")
+        b = _box(bar)
+        assert 0 <= b["y"] and b["y"] + b["height"] <= 900, (y, b)
+        assert _generate(page).is_visible()
+
+    # At the end of the list the bar sits in its own place, under the
+    # last row rather than over it.
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    last = _box(_row(page, "Backend Engineer j29"))
+    b = _box(bar)
+    assert last["y"] + last["height"] <= b["y"] + 1, (last, b)
+    assert b["y"] + b["height"] <= 900, b
+    context.close()
+
+
+def test_focus_never_lands_under_the_gate(browser, dist_url):
+    context, page = _open_long(browser, dist_url)
+    _checkbox(page, "Backend Engineer j0").check()
+    bar_top = _box(_bar(page))["y"]
+
+    # A row well below the fold, focused from the keyboard's point of
+    # view: the browser scrolls it into view, and the bar must not be
+    # what it scrolls it under.
+    _checkbox(page, "Backend Engineer j24").focus()
+    for _ in range(8):
+        focused = page.evaluate(
+            "() => { const r = document.activeElement.getBoundingClientRect();"
+            " return [document.activeElement.textContent || document.activeElement.ariaLabel, r.top, r.bottom] }")
+        bar_top = _box(_bar(page))["y"]
+        assert 0 <= focused[1] and focused[2] <= bar_top + 0.5, (focused, bar_top)
+        page.keyboard.press("Tab")
+    context.close()
+
+
+def test_clear_selection_empties_the_gate(browser, dist_url):
+    context, page = _open_long(browser, dist_url)
+    _checkbox(page, "Backend Engineer j1").check()
+    _checkbox(page, "Backend Engineer j2").check()
+    page.get_by_role("button", name="Clear selection").click()
+    assert _generate(page).count() == 0
+    assert page.get_by_text("selected", exact=False).count() == 0
+    assert not _checkbox(page, "Backend Engineer j1").is_checked()
+    assert not _checkbox(page, "Backend Engineer j2").is_checked()
+    assert page.evaluate("document.documentElement.style.scrollPaddingBottom") == ""
+    context.close()
+
+
+def test_the_gate_fits_a_phone(browser, dist_url):
+    context, page = _open_long(browser, dist_url, width=375, height=667)
+    _checkbox(page, "Backend Engineer j0").check()
+    b = _box(_bar(page))
+    assert b["x"] >= 0 and b["x"] + b["width"] <= 375, b
+    assert b["y"] + b["height"] <= 667, b
+    assert page.evaluate("document.documentElement.scrollWidth") == 375
     context.close()

@@ -140,6 +140,11 @@ export default function Search({
   // so no response arriving later can fold an editor that is in use.
   // With no run there is nothing to summarise and the fields simply show.
   const [editing, setEditing] = useState(false)
+  // The selection bar, while it exists. Sticky to the viewport bottom,
+  // it covers whatever the page scrolls under it — including a row the
+  // keyboard just focused. scroll-padding on the root is how the browser
+  // is told that the bottom of the viewport ends where the bar starts.
+  const barRef = useRef<HTMLDivElement | null>(null)
   // Which run the rows ON SCREEN came from. Two copies on purpose: the
   // ref is read synchronously inside the response handler (a useCallback
   // closure cannot see current state), the state is what the render needs
@@ -518,6 +523,23 @@ export default function Search({
     () => visibleJobs.filter((j) => selected.has(j.job_id)).map((j) => j.job_id),
     [visibleJobs, selected],
   )
+
+  const hasSelection = selectedVisible.length > 0
+  useEffect(() => {
+    const bar = barRef.current
+    if (!hasSelection || !bar) return
+    const root = document.documentElement
+    const apply = () => {
+      root.style.scrollPaddingBottom = `${bar.getBoundingClientRect().height}px`
+    }
+    apply()
+    const observer = new ResizeObserver(apply)
+    observer.observe(bar)
+    return () => {
+      observer.disconnect()
+      root.style.removeProperty('scroll-padding-bottom')
+    }
+  }, [hasSelection])
 
   const scoredCount = jobs.filter((j) => j.deterministic_score !== null).length
 
@@ -905,18 +927,6 @@ export default function Search({
             )}
           </div>
           <div className="flex flex-wrap items-center gap-3 text-sm">
-            {selectedVisible.length > 0 && (
-              <button
-                className={`${btnPrimary} rounded-full px-3 py-1 text-xs font-medium`}
-                disabled={busyGenerate || listStale}
-                onClick={generatePackages}
-                title="Tailored resume + cover letter PDFs for each selected job"
-              >
-                {busyGenerate
-                  ? 'Queueing…'
-                  : `Generate packages (${selectedVisible.length})`}
-              </button>
-            )}
             <label className="flex items-center gap-1">
               Sort
               <select
@@ -1107,6 +1117,36 @@ export default function Search({
               )
             })}
           </ul>
+        )}
+        {selectedVisible.length > 0 && (
+          // Gate 3, kept in reach: sticky to the bottom of the viewport
+          // while the list runs past it, back in its own place once the
+          // end of the list is on screen — so it never hides the last
+          // rows the way a fixed bar would. Bleeds to the card's edges.
+          <div
+            ref={barRef}
+            className="sticky bottom-0 -mx-4 -mb-4 mt-3 flex flex-wrap items-center gap-3 rounded-b-xl border-t border-line bg-surface px-4 pt-3 pb-[max(0.75rem,env(safe-area-inset-bottom))] sm:-mx-6 sm:-mb-6 sm:px-6"
+          >
+            <span className="text-sm text-ink-2" aria-live="polite">
+              {selectedVisible.length} selected
+            </span>
+            <button
+              className={`${btnPrimary} rounded-md px-4 py-2 text-sm font-medium`}
+              disabled={busyGenerate || listStale}
+              onClick={generatePackages}
+              title="Tailored resume + cover letter PDFs for each selected job"
+            >
+              {busyGenerate
+                ? 'Queueing…'
+                : `Generate packages (${selectedVisible.length})`}
+            </button>
+            <button
+              className={`${btnSecondary} rounded-md px-4 py-2 text-sm`}
+              onClick={() => setSelected(new Set())}
+            >
+              Clear selection
+            </button>
+          </div>
         )}
       </section>
     </div>

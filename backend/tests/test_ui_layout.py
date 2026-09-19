@@ -94,6 +94,8 @@ def test_nothing_is_wider_than_the_page(browser, dist_url, width, height):
             page.wait_for_selector("[placeholder]")
             page.get_by_role("button", name="Details").first.click()
             page.wait_for_selector("text=Build APIs.")
+            page.get_by_role("checkbox", name="Select Backend Engineer a").check()
+            page.wait_for_selector("text=1 selected")
         scroll_w, client_w, escaped = page.evaluate(OVERFLOW_JS)
         assert scroll_w == client_w, (tab, width, scroll_w, client_w)
         assert escaped == [], (tab, width, escaped)
