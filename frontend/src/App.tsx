@@ -89,7 +89,7 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-bg text-ink">
-      <header className="flex items-center justify-between border-b border-line bg-surface px-8 py-4">
+      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-line bg-surface px-4 py-4 sm:px-8">
         <div>
           <h1 className="text-xl font-semibold">Job Agent</h1>
           <p className="text-sm text-ink-3">
@@ -112,7 +112,7 @@ export default function App() {
         onOpenSettings={() => setTab('settings')}
         onOpenSearch={() => setTab('search')}
       />
-      <nav className="border-b border-line bg-surface px-8">
+      <nav className="border-b border-line bg-surface px-4 sm:px-8">
         <div className="mx-auto flex max-w-7xl gap-6">
           {TABS.map((t) => (
             <button
@@ -129,7 +129,7 @@ export default function App() {
           ))}
         </div>
       </nav>
-      <main className="mx-auto max-w-7xl p-8">
+      <main className="mx-auto max-w-7xl p-4 sm:p-8">
         {tab === 'profile' ? (
           <Onboarding profileEpoch={epochs.profile} />
         ) : tab === 'search' ? (

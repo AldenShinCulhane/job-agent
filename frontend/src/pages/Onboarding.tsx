@@ -368,7 +368,7 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
   return (
     <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
       <section className="space-y-6 rounded-xl border border-line bg-surface p-6 shadow-card">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-lg font-semibold">
             Your profile
             <span className="ml-2 text-sm font-normal text-ink-3">
@@ -379,7 +379,7 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
                   : `Draft v${payload.version} · not live${live !== null ? ` (v${live} is)` : ''}`}
             </span>
           </h2>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <button
               className={`${btnSecondary} rounded-md px-3 py-1.5 text-sm`}
               disabled={busy !== null}

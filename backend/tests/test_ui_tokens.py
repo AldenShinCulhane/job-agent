@@ -68,6 +68,12 @@ def test_rendered_text_meets_aa_on_every_surface(browser, dist_url, scheme):
         page.get_by_role("button", name=tab, exact=True).click()
         for selector in ready:
             page.wait_for_selector(selector)
+        # The search fields fold behind the last run's summary; open them
+        # so their placeholders and borders are measured too.
+        edit = page.get_by_role("button", name="Edit search")
+        if edit.count():
+            edit.click()
+            page.wait_for_selector("[placeholder]")
         for m in page.evaluate(MEASURE_JS, TEXT_SELECTOR):
             if m["ratio"] is None:
                 failures.append({"why": "unmeasurable", **m})
@@ -164,6 +170,8 @@ def test_unknown_statuses_get_the_neutral_chip(browser, dist_url):
     page.wait_for_selector("text=rebooting")  # header chip, engine map
     page.get_by_role("button", name="Search", exact=True).click()
     page.wait_for_selector("text=rate_limited")  # LinkedIn map
+    # The unknown package is older than the recent few, so it is folded.
+    page.get_by_text("Earlier packages (1)").click()
     page.wait_for_selector("text=archived")  # package map
 
     chips = {m["text"]: m for m in page.evaluate(MEASURE_JS, ".text-ink-2")

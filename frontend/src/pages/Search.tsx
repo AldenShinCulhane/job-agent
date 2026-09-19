@@ -61,6 +61,24 @@ const PACKAGE_ACTIVE = new Set([
 
 const WORKPLACE_OPTIONS = ['remote', 'hybrid', 'onsite'] as const
 
+const DATE_LABELS: Record<string, string> = {
+  day: 'Past day',
+  week: 'Past week',
+  month: 'Past month',
+}
+
+// How many of the newest packages stay on screen outside the fold. The
+// list is every package ever generated, so it is bounded here; anything
+// still in flight is shown regardless of age.
+const RECENT_PACKAGES = 5
+
+const CONSENT =
+  'A real browser window opens for sign-in; your session stays on this machine. ' +
+  'Sign in with your LinkedIn email and password — Google blocks its sign-in ' +
+  'inside automated browsers, so "Continue with Google" won\'t work here. ' +
+  'Automated collection is paced but still against LinkedIn\'s terms — account ' +
+  'restriction is a risk you accept (see README).'
+
 const EXPERIENCE_OPTIONS = [
   { id: 'internship', label: 'Internship' },
   { id: 'entry', label: 'Entry level' },
@@ -116,6 +134,12 @@ export default function Search({
   const [workplace, setWorkplace] = useState<string[]>([])
   const [experience, setExperience] = useState<string[]>([])
   const [cap, setCap] = useState(100)
+  // Whether the search fields are on screen while a run exists to
+  // summarise instead. Only the user's own actions change it — typing
+  // and Edit open the fields, Cancel and a successful Start close them —
+  // so no response arriving later can fold an editor that is in use.
+  // With no run there is nothing to summarise and the fields simply show.
+  const [editing, setEditing] = useState(false)
   // Which run the rows ON SCREEN came from. Two copies on purpose: the
   // ref is read synchronously inside the response handler (a useCallback
   // closure cannot see current state), the state is what the render needs
@@ -360,6 +384,7 @@ export default function Search({
         experience,
         cap,
       })
+      setEditing(false)
       await refresh()
     } catch (e) {
       setError(String(e))
@@ -498,12 +523,121 @@ export default function Search({
 
   const badge = linkedin ? badgeFor(LINKEDIN_STATES, linkedin.state) : null
 
+  const fieldsOpen = run === null || editing
+
+  // The fields start from the run they would replace, so an edit is a
+  // change to the last search rather than a blank form. Local state from
+  // here on: nothing writes these again until the next Edit.
+  const beginEdit = () => {
+    const c = run?.config
+    if (c) {
+      setKeywords(c.keywords)
+      setLocation(c.location ?? '')
+      setDatePosted(c.date_posted ?? '')
+      setWorkplace(c.workplace ?? [])
+      setExperience(c.experience ?? [])
+      setCap(c.cap ?? 100)
+    }
+    setEditing(true)
+  }
+  // Typing is the user opening the editor, even when it was merely
+  // showing because no run existed yet: a run started elsewhere must
+  // not fold the fields under them.
+  const touch = () => setEditing(true)
+
+  // What the persisted run searched for — the summary describes the run,
+  // not whatever the fields currently hold.
+  const summary: string[] = run?.config
+    ? [
+        run.config.keywords,
+        run.config.location ?? null,
+        run.config.date_posted
+          ? (DATE_LABELS[run.config.date_posted] ?? run.config.date_posted)
+          : null,
+        run.config.workplace?.length ? run.config.workplace.join(' / ') : null,
+        run.config.experience?.length
+          ? run.config.experience
+              .map((id) => EXPERIENCE_OPTIONS.find((o) => o.id === id)?.label ?? id)
+              .join(', ')
+          : null,
+        run.config.cap ? `up to ${run.config.cap}` : null,
+      ].filter((x): x is string => x !== null)
+    : []
+
+  // Newest first from the server. Everything still moving stays visible
+  // however far down it is; the rest beyond the first few folds away.
+  const inFlight = (p: Package) =>
+    PACKAGE_ACTIVE.has(p.status) || p.status === 'waiting_usage'
+  const recentPackages = packages.filter((p, i) => i < RECENT_PACKAGES || inFlight(p))
+  const earlierPackages = packages.filter((p, i) => i >= RECENT_PACKAGES && !inFlight(p))
+
+  const packageRow = (pkg: Package) => {
+    const state = badgeFor(PACKAGE_STATES, pkg.status)
+    return (
+      <li key={pkg.id} className="py-3">
+        <p className="font-medium text-ink">
+          {pkg.title}{' '}
+          <span className="font-normal text-ink-3">— {pkg.company}</span>
+        </p>
+        {pkg.error && pkg.status !== 'done' && (
+          <p className="mt-0.5 text-xs text-danger-fg">{pkg.error}</p>
+        )}
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+          <span className={`rounded-full px-3 py-1 text-xs font-medium ${chip[state.tone]}`}>
+            {state.label}
+          </span>
+          {pkg.status === 'done' && (
+            <>
+              <a
+                className="text-ink-2 underline hover:text-ink"
+                href={packageFileUrl(pkg.id, 'resume.pdf')}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Resume
+              </a>
+              <a
+                className="text-ink-2 underline hover:text-ink"
+                href={packageFileUrl(pkg.id, 'cover_letter.pdf')}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Cover letter
+              </a>
+              <a
+                className="text-ink-2 underline hover:text-ink"
+                href={packageFileUrl(pkg.id, 'job.md')}
+                target="_blank"
+                rel="noreferrer"
+              >
+                Posting
+              </a>
+            </>
+          )}
+          <a
+            className="text-ink-3 underline hover:text-ink-2"
+            href={pkg.url}
+            target="_blank"
+            rel="noreferrer"
+          >
+            LinkedIn
+          </a>
+        </div>
+      </li>
+    )
+  }
+
+  const card = 'rounded-xl border border-line bg-surface p-4 shadow-card sm:p-6'
+
   return (
-    <div className="space-y-6">
-      <section className="rounded-xl border border-line bg-surface p-6 shadow-card">
-        <div className="flex items-center justify-between">
+    // One column, in reading order: connection, search, what is being
+    // generated, then the long list. From xl the packages become a rail
+    // beside the list — same DOM order, so the reading order holds.
+    <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_20rem] xl:items-start">
+      <section className={`${card} xl:col-start-1 xl:row-start-1`}>
+        <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-lg font-semibold">LinkedIn</h2>
-          <div className="flex items-center gap-3">
+          <div className="flex flex-wrap items-center gap-3">
             {badge && (
               <span className={`rounded-full px-3 py-1 text-sm font-medium ${chip[badge.tone]}`}>
                 {badge.label}
@@ -521,129 +655,223 @@ export default function Search({
           </div>
         </div>
         {linkedin?.detail && <p className="mt-2 text-sm text-warn-fg">{linkedin.detail}</p>}
-        <p className="mt-2 text-xs text-ink-3">
-          A real browser window opens for sign-in; your session stays on this machine.
-          Sign in with your LinkedIn email and password — Google blocks its sign-in
-          inside automated browsers, so "Continue with Google" won't work here.
-          Automated collection is paced but still against LinkedIn's terms — account
-          restriction is a risk you accept (see README).
-        </p>
+        {linkedin?.state === 'ready' ? (
+          // Connected: the disclosure has been acted on, so it folds. Any
+          // problem with the connection stays on the line above.
+          <details className="mt-2 text-xs text-ink-3">
+            <summary className="cursor-pointer">Browser access and account risk</summary>
+            <p className="mt-1">{CONSENT}</p>
+          </details>
+        ) : (
+          <p className="mt-2 text-xs text-ink-3">{CONSENT}</p>
+        )}
       </section>
 
-      <section className="rounded-xl border border-line bg-surface p-6 shadow-card">
-        <h2 className="mb-4 text-lg font-semibold">Job search</h2>
-        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-          <label className="col-span-2 block">
-            <span className={labelCls}>Keywords</span>
-            <input
-              className={inputCls}
-              value={keywords}
-              onChange={(e) => setKeywords(e.target.value)}
-              onKeyDown={acceptPlaceholderOnTab(setKeywords)}
-              placeholder="software engineer"
-            />
-          </label>
-          <label className="block">
-            <span className={labelCls}>Location</span>
-            <input
-              className={inputCls}
-              value={location}
-              onChange={(e) => setLocation(e.target.value)}
-              onKeyDown={acceptPlaceholderOnTab(setLocation)}
-              placeholder={profileLocation ?? 'Toronto, ON'}
-            />
-          </label>
-          <label className="block">
-            <span className={labelCls}>Posted within</span>
-            <select className={inputCls} value={datePosted} onChange={(e) => setDatePosted(e.target.value)}>
-              <option value="">Any time</option>
-              <option value="day">Past day</option>
-              <option value="week">Past week</option>
-              <option value="month">Past month</option>
-            </select>
-          </label>
-          <div>
-            <span className={labelCls}>Workplace</span>
-            <div className="mt-1 flex gap-3">
-              {WORKPLACE_OPTIONS.map((w) => (
-                <label key={w} className="flex items-center gap-1 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={workplace.includes(w)}
-                    onChange={(e) =>
-                      setWorkplace((prev) => (e.target.checked ? [...prev, w] : prev.filter((x) => x !== w)))
-                    }
-                  />
-                  {w}
-                </label>
-              ))}
-            </div>
-          </div>
-          <label className="block">
-            <span className={labelCls}>Max results</span>
-            <input
-              type="number"
-              min={1}
-              max={500}
-              className={inputCls}
-              value={cap}
-              onChange={(e) => setCap(Number(e.target.value) || 100)}
-            />
-          </label>
-          <div className="col-span-2 md:col-span-3">
-            <span className={labelCls}>Experience level</span>
-            <div className="mt-1 flex flex-wrap gap-3">
-              {EXPERIENCE_OPTIONS.map((opt) => (
-                <label key={opt.id} className="flex items-center gap-1 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={experience.includes(opt.id)}
-                    onChange={(e) =>
-                      setExperience((prev) =>
-                        e.target.checked ? [...prev, opt.id] : prev.filter((x) => x !== opt.id),
-                      )
-                    }
-                  />
-                  {opt.label}
-                </label>
-              ))}
-            </div>
-          </div>
-        </div>
-        <div className="mt-4 flex items-center gap-3">
-          <button
-            className={`${btnPrimary} rounded-md px-4 py-2 text-sm font-medium`}
-            disabled={!keywords.trim() || run?.status === 'running'}
-            onClick={start}
-          >
-            Start search
-          </button>
-          {run?.status === 'stopped_error' && (
+      <section className={`${card} xl:col-start-1 xl:row-start-2`}>
+        <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+          <h2 className="text-lg font-semibold">Job search</h2>
+          {run !== null && !fieldsOpen && (
             <button
-              className={`${btnSecondary} rounded-md px-4 py-2 text-sm`}
-              onClick={resume}
+              className={`${btnSecondary} rounded-md px-3 py-1.5 text-sm`}
+              aria-expanded={false}
+              onClick={beginEdit}
             >
-              Resume
+              Edit search
             </button>
           )}
-          {run?.status && (
+        </div>
+        {fieldsOpen ? (
+          <>
+            <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+              <label className="col-span-2 block">
+                <span className={labelCls}>Keywords</span>
+                <input
+                  className={inputCls}
+                  value={keywords}
+                  onChange={(e) => {
+                    touch()
+                    setKeywords(e.target.value)
+                  }}
+                  onKeyDown={acceptPlaceholderOnTab(setKeywords)}
+                  placeholder="software engineer"
+                />
+              </label>
+              <label className="block">
+                <span className={labelCls}>Location</span>
+                <input
+                  className={inputCls}
+                  value={location}
+                  onChange={(e) => {
+                    touch()
+                    setLocation(e.target.value)
+                  }}
+                  onKeyDown={acceptPlaceholderOnTab(setLocation)}
+                  placeholder={profileLocation ?? 'Toronto, ON'}
+                />
+              </label>
+              <label className="block">
+                <span className={labelCls}>Posted within</span>
+                <select
+                  className={inputCls}
+                  value={datePosted}
+                  onChange={(e) => {
+                    touch()
+                    setDatePosted(e.target.value)
+                  }}
+                >
+                  <option value="">Any time</option>
+                  <option value="day">Past day</option>
+                  <option value="week">Past week</option>
+                  <option value="month">Past month</option>
+                </select>
+              </label>
+              <div>
+                <span className={labelCls}>Workplace</span>
+                <div className="mt-1 flex flex-wrap gap-3">
+                  {WORKPLACE_OPTIONS.map((w) => (
+                    <label key={w} className="flex items-center gap-1 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={workplace.includes(w)}
+                        onChange={(e) => {
+                          touch()
+                          setWorkplace((prev) =>
+                            e.target.checked ? [...prev, w] : prev.filter((x) => x !== w),
+                          )
+                        }}
+                      />
+                      {w}
+                    </label>
+                  ))}
+                </div>
+              </div>
+              <label className="block">
+                <span className={labelCls}>Max results</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={500}
+                  className={inputCls}
+                  value={cap}
+                  onChange={(e) => {
+                    touch()
+                    setCap(Number(e.target.value) || 100)
+                  }}
+                />
+              </label>
+              <div className="col-span-2 md:col-span-3">
+                <span className={labelCls}>Experience level</span>
+                <div className="mt-1 flex flex-wrap gap-3">
+                  {EXPERIENCE_OPTIONS.map((opt) => (
+                    <label key={opt.id} className="flex items-center gap-1 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={experience.includes(opt.id)}
+                        onChange={(e) => {
+                          touch()
+                          setExperience((prev) =>
+                            e.target.checked
+                              ? [...prev, opt.id]
+                              : prev.filter((x) => x !== opt.id),
+                          )
+                        }}
+                      />
+                      {opt.label}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div className="mt-4 flex flex-wrap items-center gap-3">
+              <button
+                className={`${btnPrimary} rounded-md px-4 py-2 text-sm font-medium`}
+                disabled={!keywords.trim() || run?.status === 'running'}
+                onClick={start}
+              >
+                Start search
+              </button>
+              {run !== null && (
+                <button
+                  className={`${btnSecondary} rounded-md px-4 py-2 text-sm`}
+                  onClick={() => setEditing(false)}
+                >
+                  Cancel
+                </button>
+              )}
+            </div>
+          </>
+        ) : (
+          <ul className="flex flex-wrap gap-2" aria-label="Last search">
+            {summary.map((item) => (
+              <li
+                key={item}
+                className={`rounded-full px-3 py-1 text-sm ${chip.neutral}`}
+              >
+                {item}
+              </li>
+            ))}
+          </ul>
+        )}
+        {/* The run's own state, and anything that failed on this page,
+            stay in view whether the fields are open or folded. */}
+        {run?.status && (
+          <div className="mt-3 flex flex-wrap items-center gap-3">
+            {run.status === 'stopped_error' && (
+              <button
+                className={`${btnSecondary} rounded-md px-4 py-2 text-sm`}
+                onClick={resume}
+              >
+                Resume
+              </button>
+            )}
             <span className="text-sm text-ink-3">
               {RUN_LABELS[run.status] ?? run.status}
               {typeof run.collected === 'number' && ` · ${run.collected} collected`}
             </span>
-          )}
-        </div>
+          </div>
+        )}
         {run?.message && <p className="mt-2 text-sm text-warn-fg">{run.message}</p>}
         {error && <p className="mt-2 text-sm text-danger-fg">{error}</p>}
       </section>
 
-      <section className="rounded-xl border border-line bg-surface p-6 shadow-card">
+      <section
+        className={`${card} xl:sticky xl:top-4 xl:col-start-2 xl:row-span-3 xl:row-start-1 xl:self-start`}
+      >
+        <h2 className="mb-2 text-lg font-semibold">Packages</h2>
+        {packages.length === 0 ? (
+          <p className="text-sm text-ink-3">
+            None yet. Tick jobs in the list and generate packages for them.
+          </p>
+        ) : (
+          // From xl the rail is as tall as the viewport allows and scrolls
+          // on its own; the tab stop is what makes that reachable without
+          // a pointer.
+          <div
+            className="xl:max-h-[calc(100vh-7rem)] xl:overflow-y-auto"
+            tabIndex={0}
+            role="region"
+            aria-label="Package list"
+          >
+            <ul className="divide-y divide-line">{recentPackages.map(packageRow)}</ul>
+            {earlierPackages.length > 0 && (
+              <details className="mt-2 border-t border-line pt-2">
+                <summary className="cursor-pointer text-sm text-ink-2">
+                  Earlier packages ({earlierPackages.length})
+                </summary>
+                <ul className="divide-y divide-line">{earlierPackages.map(packageRow)}</ul>
+              </details>
+            )}
+          </div>
+        )}
+      </section>
+
+      <section className={`${card} xl:col-start-1 xl:row-start-3`}>
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-lg font-semibold">
-            Jobs ({visibleJobs.length}
-            {visibleJobs.length !== jobs.length ? ` of ${jobs.length}` : ''})
-          </h2>
-          <div className="flex flex-wrap items-center gap-3 text-sm">
+          <div className="flex flex-wrap items-center gap-3">
+            <h2 className="text-lg font-semibold">
+              Jobs ({visibleJobs.length}
+              {visibleJobs.length !== jobs.length ? ` of ${jobs.length}` : ''})
+            </h2>
             {scoringPending > 0 && !scoringStall && (
               <span className={`rounded-full px-3 py-1 text-xs font-medium ${chip.info}`}>
                 Scoring… {jobs.length - scoringPending}/{jobs.length}
@@ -675,6 +903,8 @@ export default function Search({
                 </button>
               </>
             )}
+          </div>
+          <div className="flex flex-wrap items-center gap-3 text-sm">
             {selectedVisible.length > 0 && (
               <button
                 className={`${btnPrimary} rounded-full px-3 py-1 text-xs font-medium`}
@@ -734,83 +964,90 @@ export default function Search({
               const score = displayScore(job)
               const breakdown = job.score_breakdown
               const explanation = explanations[job.job_id]
+              const meta = [job.company, job.location, job.posted_text]
+                .filter(Boolean)
+                .join(' · ')
               return (
-                <li key={job.job_id} className="py-3">
-                  <div className="flex items-start justify-between gap-4">
-                    <div className="flex items-start gap-3">
-                      <input
-                        type="checkbox"
-                        className="mt-1.5"
-                        checked={selected.has(job.job_id)}
-                        disabled={listStale}
-                        title={listStale ? 'New search results are loading…' : undefined}
-                        onChange={() => toggleSelected(job.job_id)}
-                      />
-                      {score !== null && (
-                        <span
-                          className={`mt-0.5 w-12 shrink-0 rounded-md px-1.5 py-0.5 text-center text-sm font-semibold ${
-                            chip[score >= 75 ? 'ok' : score >= 50 ? 'warn' : 'neutral']
-                          }`}
-                          title={
-                            job.llm_rerank !== null
-                              ? `LLM rerank ${job.llm_rerank} (deterministic ${job.deterministic_score})`
-                              : `Deterministic score ${job.deterministic_score}`
-                          }
-                        >
-                          {Math.round(score)}
-                        </span>
-                      )}
-                      <div>
-                        <a
-                          href={job.url}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="font-medium text-ink hover:underline"
-                        >
-                          {job.title}
-                        </a>
-                        <p className="text-sm text-ink-3">
-                          {job.company}
-                          {job.location ? ` · ${job.location}` : ''}
-                          {job.posted_text ? ` · ${job.posted_text}` : ''}
-                        </p>
-                      </div>
-                    </div>
-                    <div className="flex shrink-0 items-center gap-2">
-                      {breakdown?.exceeds_experience && (
-                        <span
-                          className={`rounded-full px-2 py-0.5 text-xs font-medium ${chip.warn}`}
-                          title="Demands more experience than the profile shows"
-                        >
-                          Over-exp
-                        </span>
-                      )}
-                      {job.easy_apply && (
-                        <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${chip.info}`}>
-                          Easy Apply
-                        </span>
-                      )}
-                      <button
-                        className={`${btnSecondary} rounded-md px-2 py-1 text-xs`}
-                        disabled={busyDetail === job.job_id}
-                        onClick={() =>
-                          job.description && expanded !== job.job_id
-                            ? setExpanded(job.job_id)
-                            : expanded === job.job_id
-                              ? setExpanded(null)
-                              : fetchDetail(job.job_id)
-                        }
+                // Four columns from md: tick, score, title, actions — so
+                // the eye runs down aligned scores and titles. Below md
+                // the actions drop under the title instead of squeezing it.
+                <li
+                  key={job.job_id}
+                  className="grid grid-cols-[auto_auto_minmax(0,1fr)] items-start gap-x-3 gap-y-1 py-1.5 md:grid-cols-[auto_auto_minmax(0,1fr)_auto]"
+                >
+                  <input
+                    type="checkbox"
+                    className="mt-1"
+                    checked={selected.has(job.job_id)}
+                    disabled={listStale}
+                    title={listStale ? 'New search results are loading…' : undefined}
+                    aria-label={`Select ${job.title}`}
+                    onChange={() => toggleSelected(job.job_id)}
+                  />
+                  {score !== null ? (
+                    <span
+                      className={`w-12 rounded-md px-1.5 py-0.5 text-center text-sm font-semibold ${
+                        chip[score >= 75 ? 'ok' : score >= 50 ? 'warn' : 'neutral']
+                      }`}
+                      title={
+                        job.llm_rerank !== null
+                          ? `LLM rerank ${job.llm_rerank} (deterministic ${job.deterministic_score})`
+                          : `Deterministic score ${job.deterministic_score}`
+                      }
+                    >
+                      {Math.round(score)}
+                    </span>
+                  ) : (
+                    <span className="w-12" aria-hidden="true" />
+                  )}
+                  <div className="min-w-0">
+                    <a
+                      href={job.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="font-medium leading-tight text-ink hover:underline"
+                    >
+                      {job.title}
+                    </a>
+                    <p className="truncate text-sm text-ink-3" title={meta}>
+                      {meta}
+                    </p>
+                  </div>
+                  <div className="col-start-3 flex flex-wrap items-center gap-2 md:col-start-4 md:row-start-1">
+                    {breakdown?.exceeds_experience && (
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-xs font-medium ${chip.warn}`}
+                        title="Demands more experience than the profile shows"
                       >
-                        {busyDetail === job.job_id
-                          ? 'Fetching…'
+                        Over-exp
+                      </span>
+                    )}
+                    {job.easy_apply && (
+                      <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${chip.info}`}>
+                        Easy Apply
+                      </span>
+                    )}
+                    <button
+                      className={`${btnSecondary} rounded-md px-2 py-1 text-xs`}
+                      disabled={busyDetail === job.job_id}
+                      aria-expanded={expanded === job.job_id}
+                      onClick={() =>
+                        job.description && expanded !== job.job_id
+                          ? setExpanded(job.job_id)
                           : expanded === job.job_id
-                            ? 'Hide'
-                            : 'Details'}
-                      </button>
-                    </div>
+                            ? setExpanded(null)
+                            : fetchDetail(job.job_id)
+                      }
+                    >
+                      {busyDetail === job.job_id
+                        ? 'Fetching…'
+                        : expanded === job.job_id
+                          ? 'Hide'
+                          : 'Details'}
+                    </button>
                   </div>
                   {expanded === job.job_id && (
-                    <div className="mt-2 space-y-2">
+                    <div className="col-span-full mt-1 space-y-2">
                       {breakdown && (
                         <div className="rounded-lg bg-surface-2 p-3 text-sm text-ink-2">
                           <p className="text-xs uppercase tracking-wide text-ink-3">
@@ -872,78 +1109,6 @@ export default function Search({
           </ul>
         )}
       </section>
-
-      {packages.length > 0 && (
-        <section className="rounded-xl border border-line bg-surface p-6 shadow-card">
-          <h2 className="mb-4 text-lg font-semibold">Packages</h2>
-          <ul className="divide-y divide-line">
-            {packages.map((pkg) => {
-              const state = badgeFor(PACKAGE_STATES, pkg.status)
-              return (
-                <li
-                  key={pkg.id}
-                  className="flex flex-wrap items-center justify-between gap-3 py-3"
-                >
-                  <div className="min-w-0">
-                    <p className="truncate font-medium text-ink">
-                      {pkg.title}{' '}
-                      <span className="font-normal text-ink-3">
-                        — {pkg.company}
-                      </span>
-                    </p>
-                    {pkg.error && pkg.status !== 'done' && (
-                      <p className="mt-0.5 text-xs text-danger-fg">{pkg.error}</p>
-                    )}
-                  </div>
-                  <div className="flex shrink-0 items-center gap-3 text-sm">
-                    <span
-                      className={`rounded-full px-3 py-1 text-xs font-medium ${chip[state.tone]}`}
-                    >
-                      {state.label}
-                    </span>
-                    {pkg.status === 'done' && (
-                      <>
-                        <a
-                          className="text-ink-2 underline hover:text-ink"
-                          href={packageFileUrl(pkg.id, 'resume.pdf')}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          Resume
-                        </a>
-                        <a
-                          className="text-ink-2 underline hover:text-ink"
-                          href={packageFileUrl(pkg.id, 'cover_letter.pdf')}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          Cover letter
-                        </a>
-                        <a
-                          className="text-ink-2 underline hover:text-ink"
-                          href={packageFileUrl(pkg.id, 'job.md')}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          Posting
-                        </a>
-                      </>
-                    )}
-                    <a
-                      className="text-ink-3 underline hover:text-ink-2"
-                      href={pkg.url}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      LinkedIn
-                    </a>
-                  </div>
-                </li>
-              )
-            })}
-          </ul>
-        </section>
-      )}
     </div>
   )
 }

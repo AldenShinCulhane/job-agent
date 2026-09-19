@@ -80,7 +80,7 @@ export default function RecoveryBanners({
       {banners.map((b) => (
         <div
           key={b.key}
-          className={`flex items-center justify-between border-b px-8 py-2 text-sm ${banner[b.tone]}`}
+          className={`flex items-center justify-between border-b px-4 py-2 text-sm sm:px-8 ${banner[b.tone]}`}
         >
           <span>{b.text}</span>
           {b.action && (

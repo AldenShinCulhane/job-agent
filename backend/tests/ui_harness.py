@@ -30,10 +30,11 @@ DIST = REPO / "frontend" / "dist"
 
 
 def _job(job_id: str, score: float | None, rerank: float | None = None,
-         easy: bool = False) -> dict:
+         easy: bool = False, title: str | None = None,
+         description: str | None = None) -> dict:
     return {
         "job_id": job_id,
-        "title": f"Backend Engineer {job_id}",
+        "title": title or f"Backend Engineer {job_id}",
         "company": "Example Co",
         "location": "Toronto, ON",
         "posted_text": "2 days ago",
@@ -42,7 +43,7 @@ def _job(job_id: str, score: float | None, rerank: float | None = None,
         "url": f"https://example.invalid/jobs/{job_id}",
         "first_seen_at": "2026-09-15T12:00:00Z",
         "last_seen_at": "2026-09-15T12:00:00Z",
-        "description": None,
+        "description": description,
         "description_hash": None,
         "detail_fetched_at": None,
         "deterministic_score": score,
@@ -83,7 +84,9 @@ API_FIXTURES: dict[str, dict] = {
                            "message": "Daily cap reached",
                            "config": {"keywords": "backend"}},
     "/api/jobs": {"run_id": 7, "scoring_pending": 0, "scoring_stall": None,
-                  "jobs": [_job("a", 80, easy=True), _job("b", 60),
+                  "jobs": [_job("a", 80, easy=True,
+                                description="Build APIs.\nRequirements: Python."),
+                           _job("b", 60),
                            _job("c", 30), _job("d", None)]},
     "/api/packages": {"page_limit": 1, "packages": [
         _package(1, "done"), _package(2, "generating"),
