@@ -140,6 +140,12 @@ export default function Search({
   // so no response arriving later can fold an editor that is in use.
   // With no run there is nothing to summarise and the fields simply show.
   const [editing, setEditing] = useState(false)
+  // Bumped by every edit. Start captures it and folds the fields on
+  // completion only if nothing was typed while the request was out;
+  // otherwise the newer text is exactly what must stay on screen.
+  const editSeq = useRef(0)
+  // What the gate itself said when it last failed, shown beside it.
+  const [generateError, setGenerateError] = useState<string | null>(null)
   // The selection bar, while it exists. Sticky to the viewport bottom,
   // it covers whatever the page scrolls under it — including a row the
   // keyboard just focused. scroll-padding on the root is how the browser
@@ -375,6 +381,7 @@ export default function Search({
 
   const start = async () => {
     setError(null)
+    const seq = editSeq.current
     // A new search is a new result set — selections and explanations
     // from the previous run don't carry over.
     setSelected(new Set())
@@ -389,7 +396,7 @@ export default function Search({
         experience,
         cap,
       })
-      setEditing(false)
+      if (editSeq.current === seq) setEditing(false)
       await refresh()
     } catch (e) {
       setError(String(e))
@@ -461,7 +468,7 @@ export default function Search({
     // when the run response landed must not get through either.
     if (listStale || selectedVisible.length === 0) return
     setBusyGenerate(true)
-    setError(null)
+    setGenerateError(null)
     try {
       // Sent with the run the rows came from — the server rejects ids
       // that are not in it rather than generating for a job the user
@@ -470,7 +477,9 @@ export default function Search({
       setSelected(new Set())
       await refresh()
     } catch (e) {
-      setError(String(e))
+      // Beside the button that failed, not in the search card a screen
+      // above it.
+      setGenerateError(String(e))
     } finally {
       setBusyGenerate(false)
     }
@@ -565,7 +574,14 @@ export default function Search({
   // Typing is the user opening the editor, even when it was merely
   // showing because no run existed yet: a run started elsewhere must
   // not fold the fields under them.
-  const touch = () => setEditing(true)
+  const touch = () => {
+    editSeq.current += 1
+    setEditing(true)
+  }
+  const edited = (setter: (value: string) => void) => (value: string) => {
+    touch()
+    setter(value)
+  }
 
   // What the persisted run searched for — the summary describes the run,
   // not whatever the fields currently hold.
@@ -586,12 +602,23 @@ export default function Search({
       ].filter((x): x is string => x !== null)
     : []
 
-  // Newest first from the server. Everything still moving stays visible
-  // however far down it is; the rest beyond the first few folds away.
-  const inFlight = (p: Package) =>
-    PACKAGE_ACTIVE.has(p.status) || p.status === 'waiting_usage'
-  const recentPackages = packages.filter((p, i) => i < RECENT_PACKAGES || inFlight(p))
-  const earlierPackages = packages.filter((p, i) => i >= RECENT_PACKAGES && !inFlight(p))
+  // Newest first from the server. The preview is a fixed few whatever
+  // their state — a bulk generation would otherwise put every queued
+  // package on screen above the list — and the counts line says what the
+  // fold is hiding.
+  const recentPackages = packages.slice(0, RECENT_PACKAGES)
+  const earlierPackages = packages.slice(RECENT_PACKAGES)
+  const counts = (
+    [
+      [packages.filter((p) => PACKAGE_ACTIVE.has(p.status)).length, 'in progress'],
+      [packages.filter((p) => p.status === 'waiting_usage').length, 'waiting'],
+      [packages.filter((p) => p.status === 'failed').length, 'failed'],
+      [packages.filter((p) => p.status === 'done').length, 'ready'],
+    ] as [number, string][]
+  )
+    .filter(([n]) => n > 0)
+    .map(([n, label]) => `${n} ${label}`)
+    .join(' · ')
 
   const packageRow = (pkg: Package) => {
     const state = badgeFor(PACKAGE_STATES, pkg.status)
@@ -714,7 +741,7 @@ export default function Search({
                     touch()
                     setKeywords(e.target.value)
                   }}
-                  onKeyDown={acceptPlaceholderOnTab(setKeywords)}
+                  onKeyDown={acceptPlaceholderOnTab(edited(setKeywords))}
                   placeholder="software engineer"
                 />
               </label>
@@ -727,7 +754,7 @@ export default function Search({
                     touch()
                     setLocation(e.target.value)
                   }}
-                  onKeyDown={acceptPlaceholderOnTab(setLocation)}
+                  onKeyDown={acceptPlaceholderOnTab(edited(setLocation))}
                   placeholder={profileLocation ?? 'Toronto, ON'}
                 />
               </label>
@@ -874,6 +901,7 @@ export default function Search({
             role="region"
             aria-label="Package list"
           >
+            {counts && <p className="text-xs text-ink-3">{counts}</p>}
             <ul className="divide-y divide-line">{recentPackages.map(packageRow)}</ul>
             {earlierPackages.length > 0 && (
               <details className="mt-2 border-t border-line pt-2">
@@ -1142,10 +1170,18 @@ export default function Search({
             </button>
             <button
               className={`${btnSecondary} rounded-md px-4 py-2 text-sm`}
-              onClick={() => setSelected(new Set())}
+              onClick={() => {
+                setSelected(new Set())
+                setGenerateError(null)
+              }}
             >
               Clear selection
             </button>
+            {generateError && (
+              <span role="alert" className="text-sm text-danger-fg">
+                {generateError}
+              </span>
+            )}
           </div>
         )}
       </section>

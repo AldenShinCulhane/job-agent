@@ -191,3 +191,22 @@ def test_the_gate_fits_a_phone(browser, dist_url):
     assert b["y"] + b["height"] <= 667, b
     assert page.evaluate("document.documentElement.scrollWidth") == 375
     context.close()
+
+
+def test_a_failed_generate_explains_itself_beside_the_gate(browser, dist_url):
+    context, page = _open_long(browser, dist_url)
+    bodies: list = []
+    _route_generate(page, bodies, status=503, detail="engine unavailable")
+    _checkbox(page, "Backend Engineer j25").check()
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    _generate(page).click()
+    alert = page.get_by_role("alert")
+    alert.wait_for()
+    assert alert.inner_text() == "Error: engine unavailable"
+    box = alert.bounding_box()
+    assert 0 <= box["y"] and box["y"] + box["height"] <= 900, box
+    assert _checkbox(page, "Backend Engineer j25").is_checked()
+    assert not _generate(page).is_disabled()
+    # The search card, a screen above, did not get it instead.
+    assert page.get_by_text("engine unavailable").count() == 1
+    context.close()

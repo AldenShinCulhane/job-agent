@@ -201,14 +201,35 @@ def test_package_history_is_folded_whatever_the_list_length(browser, dist_url):
     page.wait_for_selector("text=Role 1")  # the packages read is its own fetch
     region = page.get_by_role("region", name="Package list")
     rows = region.get_by_role("listitem")
-    # The newest five, plus the older one still in flight.
-    assert [r for r in rows.all_inner_texts() if r.startswith("Role")] and \
-        rows.count() == 6, rows.all_inner_texts()
-    assert page.get_by_text("Role 9").is_visible()
+    # The newest five; what the fold hides is counted, not shown.
+    assert rows.count() == 5, rows.all_inner_texts()
+    assert page.get_by_text("2 in progress · 28 ready").is_visible()
+    assert not page.get_by_text("Role 9").is_visible()
     assert not page.get_by_text("Role 30").is_visible()
-    page.get_by_text("Earlier packages (24)").click()
+    page.get_by_text("Earlier packages (25)").click()
+    assert page.get_by_text("Role 9").is_visible()
     assert page.get_by_text("Role 30").is_visible()
     assert rows.count() == 30
+    context.close()
+
+
+@pytest.mark.parametrize("width", [375, 768])
+def test_bulk_generation_stays_bounded_below_xl(browser, dist_url, width):
+    """Thirty packages just queued: the preview above the list is still
+    five rows, and the state of the other twenty-five is a line, not a
+    wall."""
+    queued = [_package(i, "queued") for i in range(1, 31)]
+    context, page, errors = _open(browser, dist_url, width=width, jobs=[],
+                                  packages=queued)
+    _search_tab(page, ready="text=No jobs collected yet.")
+    page.wait_for_selector("text=Role 1")
+    region = page.get_by_role("region", name="Package list")
+    assert region.get_by_role("listitem").count() == 5
+    assert page.get_by_text("30 in progress").is_visible()
+    assert page.get_by_text("Earlier packages (25)").is_visible()
+    section = page.get_by_role("heading", name="Packages").locator("..")
+    assert section.bounding_box()["height"] < 700, section.bounding_box()
+    assert not errors, errors
     context.close()
 
 
@@ -217,7 +238,7 @@ def test_the_rail_scrolls_on_its_own_and_from_the_keyboard(browser, dist_url):
                                   packages=THIRTY_PACKAGES)
     _search_tab(page, ready="text=No jobs collected yet.")
     region = page.get_by_role("region", name="Package list")
-    page.get_by_text("Earlier packages (24)").click()
+    page.get_by_text("Earlier packages (25)").click()
     assert region.evaluate("el => el.scrollHeight > el.clientHeight")
     assert region.get_attribute("tabindex") == "0"
     region.focus()
@@ -268,5 +289,56 @@ def test_row_density_at_the_narrowed_column_width(browser, dist_url):
     assert m["titleEllipsis"] == 0, m
     assert m["wrappedTitles"] == 6, m  # every fifth of thirty is long
     assert m["metaTruncated"] == 0, m
+    assert not errors, errors
+    context.close()
+
+
+def test_newer_edits_survive_the_start_response(browser, dist_url):
+    """Typing while Start is still out: the fields stay open with the
+    newer text, not folded behind the config that was submitted."""
+    context, page, errors = _open(browser, dist_url)
+    held: list = []
+    page.route("**/api/search/start", lambda route, *_: held.append(route))
+    _search_tab(page)
+    page.get_by_role("button", name="Edit search").click()
+    field = page.get_by_placeholder("software engineer")
+    field.fill("backend one")
+    page.get_by_role("button", name="Start search").click()
+    page.wait_for_function("() => true")
+    assert held, "the start request was not held"
+    field.fill("backend two")
+
+    held[0].fulfill(status=200, content_type="application/json",
+                    body=json.dumps({"run_id": 8, "status": "running"}))
+    with page.expect_response(lambda r: r.url.endswith("/api/search/latest")):
+        pass
+    assert field.input_value() == "backend two"
+    assert page.get_by_role("button", name="Cancel").is_visible()
+    assert page.get_by_role("list", name="Last search").count() == 0
+    assert not errors, errors
+    context.close()
+
+
+def test_accepting_a_placeholder_counts_as_an_edit(browser, dist_url):
+    """Tab on the empty keywords field takes the suggestion. That is an
+    edit like any other: a run arriving from elsewhere must not fold it."""
+    state = {"latest": {"id": None}}
+    context, page, errors = _open(browser, dist_url, jobs=[])
+    page.route("**/api/search/latest", lambda route, *_: route.fulfill(
+        status=200, content_type="application/json",
+        body=json.dumps(state["latest"])))
+    _search_tab(page, ready="text=No jobs collected yet.")
+    field = page.get_by_placeholder("software engineer")
+    field.click()
+    page.keyboard.press("Tab")
+    assert field.input_value() == "software engineer"
+
+    state["latest"] = API_FIXTURES["/api/search/latest"]  # started elsewhere
+    with page.expect_response(lambda r: r.url.endswith("/api/search/latest"),
+                              timeout=20_000):
+        pass
+    page.wait_for_selector("text=Cancel")  # a run exists, and the editor is open
+    assert field.input_value() == "software engineer"
+    assert page.get_by_role("list", name="Last search").count() == 0
     assert not errors, errors
     context.close()
