@@ -424,14 +424,6 @@ export default function Search({
   // catches up.
   const listStale = run !== null && jobsRunId !== null && run.id !== jobsRunId
 
-  // What is BOTH selected and currently on screen. The list can also be
-  // replaced under an existing selection, and a job id that is no longer
-  // rendered must never be submitted, whichever response won the race.
-  const selectedVisible = useMemo(
-    () => jobs.filter((j) => selected.has(j.job_id)).map((j) => j.job_id),
-    [jobs, selected],
-  )
-
   // Gate 3: generating packages IS the job-selection gate — everything
   // after this click runs unattended.
   const generatePackages = async () => {
@@ -490,6 +482,17 @@ export default function Search({
     return list
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobs, hideExceeds, easyOnly, sortBy])
+
+  // What is BOTH selected and currently on screen — the filtered list,
+  // not the full one. The list can be replaced under an existing
+  // selection, and a job id that is no longer rendered must never be
+  // submitted, whichever response won the race; a filter hides a row the
+  // same way, and a hidden row is not something the user can see they
+  // are about to generate for.
+  const selectedVisible = useMemo(
+    () => visibleJobs.filter((j) => selected.has(j.job_id)).map((j) => j.job_id),
+    [visibleJobs, selected],
+  )
 
   const scoredCount = jobs.filter((j) => j.deterministic_score !== null).length
 
