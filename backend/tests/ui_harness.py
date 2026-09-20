@@ -19,6 +19,7 @@ from dataclasses import dataclass
 
 import functools
 import http.server
+import copy
 import json
 import struct
 import threading
@@ -172,13 +173,20 @@ def route_fixtures(page, fixtures: dict | None = None, *,
     after the page is up and see the change land through an event or a
     poll.
 
+    The table is the page's own deep copy of what was given: tests change
+    answers in place to drive transitions, and nothing they change may
+    reach the module tables, another page, or the dict they passed in.
+
     The event stream gets a complete, empty stream unless `live_events`,
     which lets it through to the static server's real stream: EventSource
     reconnects quietly, whereas an aborted or non-200 response is logged
     by Chromium as a console error and would trip the no-console-errors
     assertion. The preview iframe gets a text stub for the same reason.
+    Both are page routes, and a page's routes run before any context
+    route, newest first: a test that wants the pane's request for itself
+    registers its own page route after this call.
     """
-    table = dict(API_FIXTURES) if fixtures is None else fixtures
+    table = copy.deepcopy(API_FIXTURES if fixtures is None else fixtures)
 
     def fulfill(route, answer):
         if isinstance(answer, Response):
@@ -371,7 +379,9 @@ def events(dist_url):
 
 # --------------------------------------------------------------------- axe
 
-AXE_RUN = """() => axe.run(document, { exclude: [['iframe']] }).then(r => ({
+# The first argument is axe's context — what to test — and `exclude`
+# belongs there; in the options argument it is ignored.
+AXE_RUN = """() => axe.run({ exclude: [['iframe']] }).then(r => ({
   violations: r.violations.map(v => ({
     id: v.id, impact: v.impact,
     nodes: v.nodes.slice(0, 5).map(n => n.target.join(' ')),
@@ -380,9 +390,14 @@ AXE_RUN = """() => axe.run(document, { exclude: [['iframe']] }).then(r => ({
 }))"""
 
 
+# What axe could not decide, per checked state, for the session's terminal
+# summary (conftest prints it): a passing test's own output is captured.
+AXE_INCOMPLETE: list[tuple[str, list[dict]]] = []
+
+
 def axe_check(page) -> dict:
-    """axe-core's default rules over the page, browser-rendered PDF content
-    excluded (the preview iframe is the browser's viewer, not ours).
+    """axe-core's default rules over the page, iframe content excluded
+    (the preview pane is the browser's PDF viewer, not ours).
     Returns violations and the incomplete (needs-review) list."""
     if not AXE_PATH.exists():
         unavailable(f"axe-core bundle missing at {AXE_PATH}: `cd frontend && npm install`")

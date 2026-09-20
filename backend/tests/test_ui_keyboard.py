@@ -9,7 +9,7 @@ to be put somewhere sensible rather than dropped to the top of the page.
 import json
 
 from backend.tests.test_ui_theme import _is_dark
-from backend.tests.ui_harness import profile_payload, route_fixtures
+from backend.tests.ui_harness import API_FIXTURES, profile_payload, route_fixtures
 
 FOCUS_JS = """() => {
   const el = document.activeElement
@@ -54,8 +54,7 @@ def _open(browser, dist_url, fixtures=None):
     context = browser.new_context(color_scheme="light",
                                   viewport={"width": 1280, "height": 900})
     page = context.new_page()
-    table = route_fixtures(page)
-    table.update(fixtures or {})
+    table = route_fixtures(page, {**API_FIXTURES, **(fixtures or {})})
     page.goto(dist_url)
     page.wait_for_selector("text=Claude sign-in required")
     return context, page, table
@@ -160,7 +159,11 @@ def test_upload_save_and_confirm_by_keyboard_only(browser, dist_url):
     table[("PUT", "/api/profile")] = saved
     table["/api/profile"] = saved
     _assert_stop(_tab_to(page, "Name"))
-    page.keyboard.press("End")
+    # Tab selected the whole name; the arrow collapses that to the end so
+    # the typing appends. Not End: on macOS that key never reaches a text
+    # field's caret, it smooth-scrolls the page to its bottom, and that
+    # animation was still running when the save landed focus up here.
+    page.keyboard.press("ArrowRight")
     page.keyboard.type(" B")
     page.wait_for_selector("text=Unsaved edits")
     _assert_stop(_tab_to(page, "Save & re-render"))
@@ -216,6 +219,38 @@ def test_appearance_by_keyboard_only(browser, dist_url):
     context.close()
 
 
+def test_the_first_search_lands_on_edit_search(browser, dist_url):
+    """Before any run there is no "Edit search" to land on when Start folds
+    the fields: it exists only once the accepted run has been read back.
+    Focus must still end up on it, not on the page body."""
+    no_run = {
+        "/api/search/latest": {"id": None},
+        "/api/jobs": {"run_id": None, "scoring_pending": 0, "scoring_stall": None,
+                      "jobs": []},
+    }
+    context, page, table = _open(browser, dist_url, no_run)
+
+    def start(route, *_):
+        # The run exists from the moment Start is accepted; the page learns
+        # of it from its own read afterwards.
+        table["/api/search/latest"] = {
+            "id": 8, "status": "running", "collected": 0, "message": None,
+            "config": json.loads(route.request.post_data)}
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps({"run_id": 8, "status": "running"}))
+    page.route("**/api/search/start", start)
+
+    _go_to_tab(page, "Search", "text=No jobs collected yet.")
+    assert page.get_by_role("button", name="Edit search").count() == 0
+    _assert_stop(_tab_to(page, "Keywords"))
+    page.keyboard.type("backend")
+    _assert_stop(_tab_to(page, "Start search"))
+    page.keyboard.press("Enter")
+    page.wait_for_selector("text=Edit search")
+    _assert_stop(_focused(page), "Edit search")
+    context.close()
+
+
 def test_the_preview_fallback_fetches_the_same_pdf_by_keyboard(browser, dist_url):
     """The preview pane is the browser's PDF viewer in an iframe. With that
     request blocked, the visible link still opens the same file — the same
@@ -224,24 +259,38 @@ def test_the_preview_fallback_fetches_the_same_pdf_by_keyboard(browser, dist_url
                                   viewport={"width": 1280, "height": 900})
     page = context.new_page()
     route_fixtures(page)
+    aborted: list[str] = []
     fetched: list[str] = []
 
-    def preview(route, *_):
-        # The pane's request says so in its fetch metadata; the tab the
-        # link opens is a top-level document.
-        if route.request.headers.get("sec-fetch-dest") == "iframe":
-            route.abort()  # the pane's own request: gone
-            return
+    def pane(route, *_):
+        # The pane's request comes from the page's child frame (fetch
+        # metadata headers are not visible at this layer). Registered
+        # after the harness's stub for the same file, so it runs first.
+        if route.request.frame.parent_frame is not None:
+            aborted.append(route.request.url)
+            route.abort()
+        else:
+            route.fallback()
+    page.route("**/api/profile/preview.pdf*", pane)
+
+    def tab(route, *_):
+        # Only the tab the link opens gets here: the page's own routes
+        # answer everything the page itself asks for.
         fetched.append(route.request.url)
         route.fulfill(status=200, content_type="application/pdf",
                       body=b"%PDF-1.4\n% synthetic\n")
-    # On the context, so the tab the link opens is covered too.
-    context.route("**/api/profile/preview.pdf*", preview)
+    context.route("**/api/profile/preview.pdf*", tab)
 
     page.goto(dist_url)
     page.wait_for_selector("text=Claude sign-in required")
     _go_to_tab(page, "Profile", "text=Draft v5")
-    assert fetched == [], "the pane's request must not have got through"
+    for _ in range(50):
+        if aborted:
+            break
+        page.wait_for_timeout(100)
+    assert [u.split("/api")[-1] for u in aborted] == [
+        "/profile/preview.pdf?version=5&inline=1"], "the pane's own request was not refused"
+    assert fetched == []
 
     _assert_stop(_tab_to(page, "Open the preview PDF"))
     with context.expect_page():

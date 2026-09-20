@@ -102,7 +102,11 @@ echo "=== [9/9] full test suite, browser tests required in this container"
 # fails the session if none ran: a missing dist, Chromium or axe bundle
 # cannot pass quietly here. The one engine-dependent backend skip is
 # unaffected.
-UI_TESTS_REQUIRED=1 uv run pytest backend/tests -q 2>&1 | tail -3 || {
-  echo "FAIL: test suite did not pass in this container"; exit 1; }
+UI_TESTS_REQUIRED=1 uv run pytest backend/tests -q > /tmp/pytest.log 2>&1 || {
+  tail -40 /tmp/pytest.log; echo "FAIL: test suite did not pass in this container"; exit 1; }
+tail -3 /tmp/pytest.log
+# What axe could not decide, kept in the log and shown here: "for review"
+# means a reader of this run can review it.
+sed -n '/= axe needs-review =/,$p' /tmp/pytest.log
 
 echo "=== UBUNTU FRESH-CLONE TEST PASS"

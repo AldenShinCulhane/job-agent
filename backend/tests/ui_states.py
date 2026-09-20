@@ -24,9 +24,10 @@ class State:
     fixtures: dict = field(default_factory=dict)
     ready: tuple[str, ...] = ("text=Your profile",)
     setup: Callable | None = None
-    # Substrings of console errors this state is EXPECTED to log — the
-    # deliberately failing fixtures. Anything else is unexpected.
-    allow_console: tuple[str, ...] = ()
+    # Endpoints this state deliberately makes fail, whose "Failed to load
+    # resource" console error is therefore expected. Nothing else is: a
+    # failure on any other endpoint, and every uncaught page error, counts.
+    allow_failed_requests: tuple[str, ...] = ()
 
 
 def _engine(**over):
@@ -116,7 +117,7 @@ STATES: list[State] = [
     State("search-generate-error", tab="Search", ready=SEARCH_READY,
           fixtures={("POST", "/api/packages/generate"):
                     Response(503, {"detail": "engine unavailable"})},
-          setup=_generate_error, allow_console=("status of 503",)),
+          setup=_generate_error, allow_failed_requests=("/api/packages/generate",)),
     State("search-stale-run", tab="Search",
           fixtures={"/api/search/latest": dict(API_FIXTURES["/api/search/latest"],
                                                id=8, status="running", message=None)},
@@ -149,7 +150,7 @@ STATES: list[State] = [
     State("settings-read-failed", tab="Settings",
           fixtures={"/api/settings": Response(500, {"detail": "settings store unavailable"})},
           ready=("text=settings store unavailable", "text=Appearance"),
-          allow_console=("status of 500",)),
+          allow_failed_requests=("/api/settings",)),
 ]
 
 STATE_IDS = [s.name for s in STATES]
@@ -157,18 +158,24 @@ STATE_IDS = [s.name for s in STATES]
 
 def open_state(browser, dist_url, state: State, *, width=1280, height=900,
                scheme="light"):
-    """A page in `state`. Returns (context, page, unexpected console errors)."""
+    """A page in `state`. Returns (context, page, unexpected errors): every
+    uncaught page error, and every console error except the HTTP failure
+    of an endpoint the state expects to fail."""
     context = browser.new_context(color_scheme=scheme,
                                   viewport={"width": width, "height": height})
     page = context.new_page()
     errors: list[str] = []
 
-    def record(text: str):
-        if not any(allowed in text for allowed in state.allow_console):
-            errors.append(text)
+    def console(message):
+        if message.type != "error":
+            return
+        url = message.location.get("url", "")
+        if any(endpoint in url for endpoint in state.allow_failed_requests):
+            return
+        errors.append(f"{message.text} ({url})")
 
-    page.on("pageerror", lambda e: record(str(e)))
-    page.on("console", lambda m: record(m.text) if m.type == "error" else None)
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.on("console", console)
     table = dict(API_FIXTURES)
     table.update(state.fixtures)
     route_fixtures(page, table)
