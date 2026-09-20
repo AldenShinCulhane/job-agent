@@ -6,6 +6,7 @@ import { useEpochEffect } from '../useEventStream'
 import type { Epochs } from '../useEventStream'
 import { useLatestOnly } from '../useLatestOnly'
 import { badgeFor, btnPrimary, btnSecondary, chip, inputCls, labelCls } from '../styles'
+import { useFocusLanding } from '../focus'
 import type { Badge } from '../styles'
 import type { ReadOptions } from '../useLatestOnly'
 
@@ -151,6 +152,12 @@ export default function Search({
   // keyboard just focused. scroll-padding on the root is how the browser
   // is told that the bottom of the viewport ends where the bar starts.
   const barRef = useRef<HTMLDivElement | null>(null)
+  // Landing spots for focus when the control that had it goes away.
+  const editButtonRef = useRef<HTMLButtonElement | null>(null)
+  const keywordsRef = useRef<HTMLInputElement | null>(null)
+  const jobsHeadingRef = useRef<HTMLHeadingElement | null>(null)
+  const packagesHeadingRef = useRef<HTMLHeadingElement | null>(null)
+  const land = useFocusLanding()
   // Which run the rows ON SCREEN came from. Two copies on purpose: the
   // ref is read synchronously inside the response handler (a useCallback
   // closure cannot see current state), the state is what the render needs
@@ -396,7 +403,10 @@ export default function Search({
         experience,
         cap,
       })
-      if (editSeq.current === seq) setEditing(false)
+      if (editSeq.current === seq) {
+        setEditing(false)
+        land(editButtonRef)
+      }
       await refresh()
     } catch (e) {
       setError(String(e))
@@ -475,6 +485,7 @@ export default function Search({
       // never saw.
       await api.packagesGenerate(selectedVisible, jobsRunId)
       setSelected(new Set())
+      land(packagesHeadingRef)
       await refresh()
     } catch (e) {
       // Beside the button that failed, not in the search card a screen
@@ -570,6 +581,7 @@ export default function Search({
       setCap(c.cap ?? 100)
     }
     setEditing(true)
+    land(keywordsRef)
   }
   // Typing is the user opening the editor, even when it was merely
   // showing because no run existed yet: a run started elsewhere must
@@ -721,6 +733,7 @@ export default function Search({
           <h2 className="text-lg font-semibold">Job search</h2>
           {run !== null && !fieldsOpen && (
             <button
+              ref={editButtonRef}
               className={`${btnSecondary} rounded-md px-3 py-1.5 text-sm`}
               aria-expanded={false}
               onClick={beginEdit}
@@ -735,6 +748,7 @@ export default function Search({
               <label className="col-span-2 block">
                 <span className={labelCls}>Keywords</span>
                 <input
+                  ref={keywordsRef}
                   className={inputCls}
                   value={keywords}
                   onChange={(e) => {
@@ -842,7 +856,10 @@ export default function Search({
               {run !== null && (
                 <button
                   className={`${btnSecondary} rounded-md px-4 py-2 text-sm`}
-                  onClick={() => setEditing(false)}
+                  onClick={() => {
+                    setEditing(false)
+                    land(editButtonRef)
+                  }}
                 >
                   Cancel
                 </button>
@@ -886,7 +903,9 @@ export default function Search({
       <section
         className={`${card} xl:sticky xl:top-4 xl:col-start-2 xl:row-span-3 xl:row-start-1 xl:self-start`}
       >
-        <h2 className="mb-2 text-lg font-semibold">Packages</h2>
+        <h2 ref={packagesHeadingRef} tabIndex={-1} className="mb-2 text-lg font-semibold">
+          Packages
+        </h2>
         {packages.length === 0 ? (
           <p className="text-sm text-ink-3">
             None yet. Tick jobs in the list and generate packages for them.
@@ -918,7 +937,7 @@ export default function Search({
       <section className={`${card} xl:col-start-1 xl:row-start-3`}>
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-3">
-            <h2 className="text-lg font-semibold">
+            <h2 ref={jobsHeadingRef} tabIndex={-1} className="text-lg font-semibold">
               Jobs ({visibleJobs.length}
               {visibleJobs.length !== jobs.length ? ` of ${jobs.length}` : ''})
             </h2>
@@ -1173,6 +1192,7 @@ export default function Search({
               onClick={() => {
                 setSelected(new Set())
                 setGenerateError(null)
+                land(jobsHeadingRef)
               }}
             >
               Clear selection

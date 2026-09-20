@@ -22,7 +22,11 @@ export interface Badge {
  * at all, because the index type says the lookup is never undefined and
  * TypeScript then drops the right operand's type. */
 export function badgeFor(map: Record<string, Badge>, status: string): Badge {
-  return map[status] ?? { label: status, tone: 'neutral' }
+  // Own entries only: a status named like an Object.prototype member
+  // ('constructor') must not resolve to a function.
+  return Object.hasOwn(map, status)
+    ? (map[status] as Badge)
+    : { label: status, tone: 'neutral' }
 }
 
 /** A pill or badge: tinted background with its matching text. */

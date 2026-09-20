@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import type { Education, Experience, Profile, ProfilePayload, Project, SkillGroup } from '../api'
 import { useEpochEffect } from '../useEventStream'
+import { useFocusLanding } from '../focus'
 import { useLatestOnly } from '../useLatestOnly'
 import { btnPrimary, btnSecondary, chip, inputCls, labelCls } from '../styles'
 import type { ReadOptions } from '../useLatestOnly'
@@ -69,6 +70,7 @@ function BulletsEditor({
         <div key={i} className="flex gap-1">
           <textarea
             className={`${inputCls} min-h-[3.5rem]`}
+            aria-label={`${addLabel} ${i + 1}`}
             value={bullet}
             onChange={(e) => onChange(bullets.map((b, j) => (j === i ? e.target.value : b)))}
           />
@@ -170,6 +172,11 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
   // while it was in flight — checking `dirty` before the request is not
   // enough, because the user can start typing during it.
   const localSeq = useRef(0)
+  // Where focus goes when an action replaces the control that had it:
+  // confirm swaps the buttons for a chip, discard and upload replace
+  // the whole editor.
+  const headingRef = useRef<HTMLHeadingElement | null>(null)
+  const land = useFocusLanding()
 
   // Invalidations are COUNTED, not flagged. A second profile event
   // arriving while the first is still being served has to be
@@ -275,12 +282,13 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
       setDraft(structuredClone(p.profile!))
       setDirty(false)
       setReplacing(false)
+      land(headingRef)
     } catch (e) {
       setError(String(e))
     } finally {
       setBusy(null)
     }
-  }, [])
+  }, [land])
 
   const save = useCallback(async () => {
     if (!draft) return
@@ -296,12 +304,13 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
       // through the clean-and-idle guard and overwrite the newer text
       // with what was saved.
       if (localSeq.current === seq) setDirty(false)
+      land(headingRef)
     } catch (e) {
       setError(String(e))
     } finally {
       setBusy(null)
     }
-  }, [draft])
+  }, [draft, land])
 
   const discard = useCallback(async () => {
     localSeq.current += 1
@@ -313,12 +322,13 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
       setDraft(structuredClone(p.profile!))
       setDirty(false)
       setReplacing(false)
+      land(headingRef)
     } catch (e) {
       setError(String(e))
     } finally {
       setBusy(null)
     }
-  }, [])
+  }, [land])
 
   const confirm = useCallback(async () => {
     if (!payload?.version) return
@@ -326,12 +336,13 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
     setBusy('Confirming…')
     try {
       setPayload(await api.confirmProfile(payload.version))
+      land(headingRef)
     } catch (e) {
       setError(String(e))
     } finally {
       setBusy(null)
     }
-  }, [payload])
+  }, [payload, land])
 
   const edit = (updater: (p: Profile) => void) => {
     if (!draft) return
@@ -364,12 +375,13 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
   // an upload or an edit puts a newer, unconfirmed row on top, and the
   // pipeline is then paused rather than running on either one.
   const live = payload.live_version ?? null
+  const previewUrl = `/api/profile/preview.pdf?version=${payload.version}&inline=1`
 
   return (
     <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
       <section className="space-y-6 rounded-xl border border-line bg-surface p-6 shadow-card">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-lg font-semibold">
+          <h2 ref={headingRef} tabIndex={-1} className="text-lg font-semibold">
             Your profile
             <span className="ml-2 text-sm font-normal text-ink-3">
               {dirty
@@ -583,9 +595,22 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
         <iframe
           key={payload.version}
           title="Resume preview"
-          src={`/api/profile/preview.pdf?version=${payload.version}&inline=1`}
+          src={previewUrl}
           className="h-[85vh] w-full rounded-lg"
         />
+        {/* The pane needs the browser's own PDF viewer; where that is
+            off or the frame fails, this is the same file by another
+            door. */}
+        <p className="py-2 text-center text-sm">
+          <a
+            className="text-ink-2 underline hover:text-ink"
+            href={previewUrl}
+            target="_blank"
+            rel="noreferrer"
+          >
+            Open the preview PDF in a new tab
+          </a>
+        </p>
       </section>
     </div>
   )

@@ -76,7 +76,9 @@ export default function RecoveryBanners({
 
   if (banners.length === 0) return null
   return (
-    <div>
+    // A named region: page content outside every landmark is content a
+    // screen-reader user navigating by landmark never reaches.
+    <section aria-label="Recovery notices">
       {banners.map((b) => (
         <div
           key={b.key}
@@ -93,6 +95,6 @@ export default function RecoveryBanners({
           )}
         </div>
       ))}
-    </div>
+    </section>
   )
 }

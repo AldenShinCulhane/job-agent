@@ -40,6 +40,13 @@ const ZERO: Epochs = {
 // becoming one refetch per event.
 const DEBOUNCE_MS = 200
 
+// EventSource retries a dropped connection by itself, but a non-200
+// answer — a server mid-restart, a proxy's 502 page — makes it give up
+// for good (readyState CLOSED, no further attempts). The stream is then
+// gone for the life of the page while polling quietly covers at its
+// slowest rate. So a closed source is replaced, after a pause.
+const REOPEN_MS = 5_000
+
 /** One EventSource for the whole app.
  *
  * The stream is INVALIDATION, NOT TRUTH: the payloads are ignored
@@ -73,28 +80,37 @@ export function useEventStream(): EventStream {
       if (timer === null) timer = setTimeout(flush, DEBOUNCE_MS)
     }
 
-    const source = new EventSource('/api/events')
+    let source: EventSource
+    let reopen: ReturnType<typeof setTimeout> | null = null
+    const handlers = TOPICS.map((topic) => ({ topic, handler: () => bump(topic) }))
 
-    source.onopen = () => {
-      setConnected(true)
-      // Every open, the first included. Before the first one there is a
-      // window between the consumers' initial fetch and the subscription
-      // existing; a change landing in it is announced to nobody, and
-      // once `connected` turns off idle polling nothing would ever go
-      // back for it. A reconnect is the same hole, reopened. Nothing is
-      // redelivered either way, so every surface is stale until refetched.
-      bump(...TOPICS)
+    const open = () => {
+      reopen = null
+      source = new EventSource('/api/events')
+      source.onopen = () => {
+        setConnected(true)
+        // Every open, the first included. Before the first one there is
+        // a window between the consumers' initial fetch and the
+        // subscription existing; a change landing in it is announced to
+        // nobody, and once `connected` turns off idle polling nothing
+        // would ever go back for it. A reconnect is the same hole,
+        // reopened. Nothing is redelivered either way, so every surface
+        // is stale until refetched.
+        bump(...TOPICS)
+      }
+      source.onerror = () => {
+        setConnected(false)
+        // A dropped connection: EventSource is already retrying. A
+        // refused one: it has stopped, and only a new source will try.
+        if (source.readyState === EventSource.CLOSED && reopen === null) {
+          reopen = setTimeout(open, REOPEN_MS)
+        }
+      }
+      // Named events never arrive through onmessage — each topic needs
+      // its own listener.
+      for (const { topic, handler } of handlers) source.addEventListener(topic, handler)
     }
-    // EventSource reconnects on its own; this only records the gap.
-    source.onerror = () => setConnected(false)
-
-    // Named events never arrive through onmessage — each topic needs its
-    // own listener.
-    const listeners = TOPICS.map((topic) => {
-      const handler = () => bump(topic)
-      source.addEventListener(topic, handler)
-      return { topic, handler }
-    })
+    open()
 
     // A backgrounded tab can have its stream throttled or torn down with
     // no error surfaced, so returning to it re-reads everything.
@@ -105,8 +121,9 @@ export function useEventStream(): EventStream {
 
     return () => {
       if (timer !== null) clearTimeout(timer)
+      if (reopen !== null) clearTimeout(reopen)
       document.removeEventListener('visibilitychange', onVisible)
-      for (const { topic, handler } of listeners) {
+      for (const { topic, handler } of handlers) {
         source.removeEventListener(topic, handler)
       }
       source.close()

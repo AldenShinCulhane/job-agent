@@ -13,6 +13,10 @@ gates on the UI, not on the environment.
 
 from __future__ import annotations
 
+import os
+import queue
+from dataclasses import dataclass
+
 import functools
 import http.server
 import json
@@ -72,6 +76,42 @@ def _package(pid: int, status: str, error: str | None = None) -> dict:
 ENGINE = {"status": "auth_required", "model": None, "retry_in_seconds": None,
           "last_error": "not logged in"}
 
+# Set to "1" where the browser tests are a gate rather than a courtesy:
+# then a missing dist, Chromium or axe bundle FAILS instead of skipping,
+# and conftest fails the session if any UI test was skipped or none ran.
+UI_REQUIRED = os.environ.get("UI_TESTS_REQUIRED") == "1"
+
+
+def unavailable(reason: str):
+    (pytest.fail if UI_REQUIRED else pytest.skip)(reason)
+
+
+AXE_PATH = DIST.parent / "node_modules" / "axe-core" / "axe.min.js"
+
+
+@dataclass(frozen=True)
+class Response:
+    """A fixture answer with a status code, for the failing cases."""
+    status: int
+    body: dict
+
+
+def profile_payload(version=5, *, confirmed=False, live=4, name="Sample Person"):
+    return {
+        "version": version, "confirmed": confirmed, "live_version": live,
+        "profile": {
+            "name": name, "headline": "Engineer",
+            "contact": {"phone": None, "email": "sample@example.invalid",
+                        "linkedin": None, "github": None, "website": None,
+                        "location": "Toronto, ON"},
+            "experiences": [{"title": "Engineer", "company": "Example Co",
+                             "location": None, "start": "2025", "end": "2026",
+                             "bullets": ["Did things"]}],
+            "projects": [], "education": [], "skills": [
+                {"category": "Languages", "items": ["Python"]}],
+        },
+    }
+
 # Chosen so that every tone in styles.ts renders on the first paint of some
 # tab: danger (engine banner, failed package), warn (LinkedIn banner, run
 # message, waiting package, missing LaTeX), info (generating package), ok
@@ -96,66 +136,202 @@ API_FIXTURES: dict[str, dict] = {
         # neutral tone, under its raw name.
         _package(6, "archived"),
     ]},
-    "/api/profile": {
-        "version": 5, "confirmed": False, "live_version": 4,
-        "profile": {
-            "name": "Sample Person", "headline": "Engineer",
-            "contact": {"phone": None, "email": "sample@example.invalid",
-                        "linkedin": None, "github": None, "website": None,
-                        "location": "Toronto, ON"},
-            "experiences": [{"title": "Engineer", "company": "Example Co",
-                             "location": None, "start": "2025", "end": "2026",
-                             "bullets": ["Did things"]}],
-            "projects": [], "education": [], "skills": [
-                {"category": "Languages", "items": ["Python"]}],
-        },
-    },
+    "/api/profile": profile_payload(),
     "/api/settings": {"resume_page_limit": 1, "engine": ENGINE,
                       "latex_engines": []},
 }
 
 
-def route_fixtures(page) -> None:
-    """Answer every /api request from API_FIXTURES.
+# What a mutation answers, by method and path. Every gate and button on
+# the pages has an answer here, so a keyboard walkthrough can press them
+# all without a real backend.
+API_POSTS: dict[tuple[str, str], dict] = {
+    ("POST", "/api/profile/upload"): profile_payload(6, live=4, name="Uploaded Person"),
+    ("PUT", "/api/profile"): profile_payload(),
+    ("POST", "/api/profile/confirm"): profile_payload(confirmed=True, live=5),
+    ("POST", "/api/profile/discard"): profile_payload(4, confirmed=True, live=4),
+    ("POST", "/api/linkedin/connect"): {"state": "connecting", "detail": None},
+    ("POST", "/api/search/start"): {"run_id": 8, "status": "running"},
+    ("POST", "/api/search/resume"): {"id": 7, "status": "running"},
+    ("POST", "/api/search/rerank"): {"reranked": 2},
+    ("POST", "/api/search/retry-scoring"): {"resumed": True},
+    ("POST", "/api/packages/generate"): {"package_ids": [9], "created": 1},
+    ("POST", "/api/engine/reprobe"): {"ok": False, "verified": True,
+                                      "error": "auth_required",
+                                      "detail": "not logged in"},
+    ("PUT", "/api/settings"): {"resume_page_limit": 2},
+}
+EXPLANATION = {"strengths": ["Python every day"], "gaps": ["No Go"],
+               "pitch": "A close fit on the backend work."}
 
-    The event stream gets a complete, empty stream: EventSource reconnects
-    quietly, whereas an aborted or non-200 response is logged by Chromium as
-    a console error and would trip the no-console-errors assertion. The
-    preview iframe gets a text stub for the same reason.
+
+def route_fixtures(page, fixtures: dict | None = None, *,
+                   live_events: bool = False) -> dict:
+    """Answer every /api request from a fixture table, and return that
+    table: it is consulted per request, so a test can change an answer
+    after the page is up and see the change land through an event or a
+    poll.
+
+    The event stream gets a complete, empty stream unless `live_events`,
+    which lets it through to the static server's real stream: EventSource
+    reconnects quietly, whereas an aborted or non-200 response is logged
+    by Chromium as a console error and would trip the no-console-errors
+    assertion. The preview iframe gets a text stub for the same reason.
     """
+    table = dict(API_FIXTURES) if fixtures is None else fixtures
 
-    def api(route):
+    def fulfill(route, answer):
+        if isinstance(answer, Response):
+            route.fulfill(status=answer.status, content_type="application/json",
+                          body=json.dumps(answer.body))
+        else:
+            route.fulfill(status=200, content_type="application/json",
+                          body=json.dumps(answer))
+
+    def api(route, *_):
         path = route.request.url.split("?", 1)[0]
         path = path[path.index("/api"):]
+        method = route.request.method
         if path == "/api/events":
-            route.fulfill(status=200, content_type="text/event-stream",
-                          body=": connected\n\n")
+            if live_events:
+                route.continue_()
+            else:
+                route.fulfill(status=200, content_type="text/event-stream",
+                              body=": connected\n\n")
             return
-        body = API_FIXTURES.get(path)
-        if body is None or route.request.method != "GET":
+        if method == "GET":
+            answer = table.get(path)
+        elif (method, path) in table:
+            answer = table[(method, path)]
+        elif (method, path) in API_POSTS:
+            answer = API_POSTS[(method, path)]
+        elif method == "POST" and path.endswith("/explain"):
+            answer = EXPLANATION
+        elif method == "POST" and path.endswith("/detail"):
+            job_id = path.split("/")[3]
+            jobs = table.get("/api/jobs", {}).get("jobs", [])
+            job = next((j for j in jobs if j["job_id"] == job_id), None)
+            answer = None if job is None else dict(
+                job, description="Fetched description.", refetched=True,
+                changed=False)
+        else:
+            answer = None
+        if answer is None:
             route.fulfill(status=404, content_type="application/json",
-                          body=json.dumps({"detail": f"no fixture for {path}"}))
+                          body=json.dumps({"detail": f"no fixture for {method} {path}"}))
             return
-        route.fulfill(status=200, content_type="application/json",
-                      body=json.dumps(body))
+        fulfill(route, answer)
 
     page.route("**/api/**", api)
-    page.route("**/api/profile/preview.pdf*", lambda route: route.fulfill(
+    page.route("**/api/profile/preview.pdf*", lambda route, *_: route.fulfill(
         status=200, content_type="text/plain", body="preview stub"))
+    return table
+
+
+# ------------------------------------------------------------- live events
+
+
+class EventHub:
+    """The static server's /api/events, driven from the test: push a named
+    event to every open stream, or drop them all and decide whether the
+    reconnects are accepted."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._clients: list[queue.Queue] = []
+        self.accepting = True
+
+    def _add(self, q):
+        with self._lock:
+            self._clients.append(q)
+
+    def _remove(self, q):
+        with self._lock:
+            if q in self._clients:
+                self._clients.remove(q)
+
+    @property
+    def connections(self) -> int:
+        with self._lock:
+            return len(self._clients)
+
+    def push(self, topic: str, data: dict | None = None) -> None:
+        message = f"event: {topic}\ndata: {json.dumps(data or {})}\n\n"
+        with self._lock:
+            for q in self._clients:
+                q.put(message)
+
+    def drop(self) -> None:
+        with self._lock:
+            for q in self._clients:
+                q.put(None)
+
+    def wait_for_connections(self, n: int, timeout: float = 5.0, *,
+                             page=None) -> None:
+        """Wait until exactly `n` streams are open. With `page`, the wait
+        pumps Playwright: the page's route handler for a reconnect only
+        runs while some Playwright call is in progress, so a plain sleep
+        here would be waiting for a request it is itself blocking."""
+        import time
+        deadline = time.monotonic() + timeout
+        while self.connections != n:
+            if time.monotonic() > deadline:
+                raise AssertionError(
+                    f"expected {n} stream connection(s), have {self.connections}")
+            if page is not None:
+                page.wait_for_timeout(20)
+            else:
+                time.sleep(0.02)
 
 
 # ---------------------------------------------------------------- servers
 
 
 class _DistHandler(http.server.SimpleHTTPRequestHandler):
+    hub: EventHub  # set by the server fixture
+
     def log_message(self, *_):  # keep pytest output clean
         pass
+
+    def do_GET(self):
+        if not self.path.startswith("/api/events"):
+            return super().do_GET()
+        hub = type(self).hub
+        if not hub.accepting:
+            self.send_response(503)
+            self.end_headers()
+            return
+        q: queue.Queue = queue.Queue()
+        hub._add(q)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            # A short retry so a dropped stream is back within the test's
+            # patience; the app's own reconnect logic is what is under test.
+            self.wfile.write(b"retry: 200\n: connected\n\n")
+            self.wfile.flush()
+            while True:
+                message = q.get()
+                if message is None:
+                    break
+                self.wfile.write(message.encode())
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            hub._remove(q)
+
+
+_HUB = EventHub()
 
 
 @pytest.fixture(scope="session")
 def dist_url():
     if not (DIST / "index.html").exists():
-        pytest.skip("frontend/dist is missing: `cd frontend && npm run build`")
+        unavailable("frontend/dist is missing: `cd frontend && npm run build`")
+    _DistHandler.hub = _HUB
     handler = functools.partial(_DistHandler, directory=str(DIST))
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -174,11 +350,44 @@ def browser():
         try:
             instance = playwright.chromium.launch()
         except Error as exc:  # no browser downloaded on this machine
-            pytest.skip(f"Chromium unavailable: {str(exc).splitlines()[0]}")
+            unavailable(f"Chromium unavailable: {str(exc).splitlines()[0]}")
         try:
             yield instance
         finally:
             instance.close()
+
+
+@pytest.fixture
+def events(dist_url):
+    """The live stream for one test. Every stream is dropped afterwards
+    so the next test starts with none open."""
+    _HUB.accepting = True
+    yield _HUB
+    _HUB.accepting = False
+    _HUB.drop()
+    _HUB.wait_for_connections(0)
+    _HUB.accepting = True
+
+
+# --------------------------------------------------------------------- axe
+
+AXE_RUN = """() => axe.run(document, { exclude: [['iframe']] }).then(r => ({
+  violations: r.violations.map(v => ({
+    id: v.id, impact: v.impact,
+    nodes: v.nodes.slice(0, 5).map(n => n.target.join(' ')),
+  })),
+  incomplete: r.incomplete.map(i => ({ id: i.id, nodes: i.nodes.length })),
+}))"""
+
+
+def axe_check(page) -> dict:
+    """axe-core's default rules over the page, browser-rendered PDF content
+    excluded (the preview iframe is the browser's viewer, not ours).
+    Returns violations and the incomplete (needs-review) list."""
+    if not AXE_PATH.exists():
+        unavailable(f"axe-core bundle missing at {AXE_PATH}: `cd frontend && npm install`")
+    page.add_script_tag(path=str(AXE_PATH))
+    return page.evaluate(AXE_RUN)
 
 
 # ---------------------------------------------------------------- measuring
