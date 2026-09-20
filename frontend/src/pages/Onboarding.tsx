@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import type { Education, Experience, Profile, ProfilePayload, Project, SkillGroup } from '../api'
 import { useEpochEffect } from '../useEventStream'
+import { editAt } from '../entries'
 import { useFocusLanding } from '../focus'
 import { useLatestOnly } from '../useLatestOnly'
 import { btnPrimary, btnSecondary, chip, inputCls, labelCls } from '../styles'
@@ -492,15 +493,15 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
               <div key={i} className="relative mb-4 space-y-2 rounded-lg border border-line p-3 pr-8">
                 <RemoveEntryButton title="Remove experience" onRemove={() => edit((p) => p.experiences.splice(i, 1))} />
                 <div className="grid grid-cols-2 gap-2">
-                  <Field label="Title" value={exp.title} onChange={(v) => edit((p) => (p.experiences[i].title = v))} />
-                  <Field label="Company" value={exp.company} onChange={(v) => edit((p) => (p.experiences[i].company = v))} />
-                  <Field label="Location" value={exp.location ?? ''} onChange={(v) => edit((p) => (p.experiences[i].location = v || null))} />
+                  <Field label="Title" value={exp.title} onChange={(v) => edit((p) => editAt(p.experiences, i, (e) => (e.title = v)))} />
+                  <Field label="Company" value={exp.company} onChange={(v) => edit((p) => editAt(p.experiences, i, (e) => (e.company = v)))} />
+                  <Field label="Location" value={exp.location ?? ''} onChange={(v) => edit((p) => editAt(p.experiences, i, (e) => (e.location = v || null)))} />
                   <div className="grid grid-cols-2 gap-2">
-                    <Field label="Start" value={exp.start} onChange={(v) => edit((p) => (p.experiences[i].start = v))} />
-                    <Field label="End" value={exp.end} onChange={(v) => edit((p) => (p.experiences[i].end = v))} />
+                    <Field label="Start" value={exp.start} onChange={(v) => edit((p) => editAt(p.experiences, i, (e) => (e.start = v)))} />
+                    <Field label="End" value={exp.end} onChange={(v) => edit((p) => editAt(p.experiences, i, (e) => (e.end = v)))} />
                   </div>
                 </div>
-                <BulletsEditor bullets={exp.bullets} onChange={(b) => edit((p) => (p.experiences[i].bullets = b))} />
+                <BulletsEditor bullets={exp.bullets} onChange={(b) => edit((p) => editAt(p.experiences, i, (e) => (e.bullets = b)))} />
               </div>
             ))}
           </div>
@@ -515,18 +516,18 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
               <div key={i} className="relative mb-4 space-y-2 rounded-lg border border-line p-3 pr-8">
                 <RemoveEntryButton title="Remove project" onRemove={() => edit((p) => p.projects.splice(i, 1))} />
                 <div className="grid grid-cols-2 gap-2">
-                  <Field label="Name" value={proj.name} onChange={(v) => edit((p) => (p.projects[i].name = v))} />
-                  <Field label="Date" value={proj.date ?? ''} onChange={(v) => edit((p) => (p.projects[i].date = v || null))} />
+                  <Field label="Name" value={proj.name} onChange={(v) => edit((p) => editAt(p.projects, i, (e) => (e.name = v)))} />
+                  <Field label="Date" value={proj.date ?? ''} onChange={(v) => edit((p) => editAt(p.projects, i, (e) => (e.date = v || null)))} />
                   <Field
                     label="Technologies (comma-separated)"
                     value={proj.technologies.join(', ')}
                     onChange={(v) =>
-                      edit((p) => (p.projects[i].technologies = v.split(',').map((s) => s.trim()).filter(Boolean)))
+                      edit((p) => editAt(p.projects, i, (e) => (e.technologies = v.split(',').map((s) => s.trim()).filter(Boolean))))
                     }
                   />
-                  <Field label="Link" value={proj.link ?? ''} onChange={(v) => edit((p) => (p.projects[i].link = v || null))} />
+                  <Field label="Link" value={proj.link ?? ''} onChange={(v) => edit((p) => editAt(p.projects, i, (e) => (e.link = v || null)))} />
                 </div>
-                <BulletsEditor bullets={proj.bullets} onChange={(b) => edit((p) => (p.projects[i].bullets = b))} />
+                <BulletsEditor bullets={proj.bullets} onChange={(b) => edit((p) => editAt(p.projects, i, (e) => (e.bullets = b)))} />
               </div>
             ))}
           </div>
@@ -541,18 +542,18 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
               <div key={i} className="relative mb-4 space-y-2 rounded-lg border border-line p-3 pr-8">
                 <RemoveEntryButton title="Remove education" onRemove={() => edit((p) => p.education.splice(i, 1))} />
                 <div className="grid grid-cols-2 gap-2">
-                  <Field label="Institution" value={edu.institution} onChange={(v) => edit((p) => (p.education[i].institution = v))} />
-                  <Field label="Degree" value={edu.degree} onChange={(v) => edit((p) => (p.education[i].degree = v))} />
-                  <Field label="Location" value={edu.location ?? ''} onChange={(v) => edit((p) => (p.education[i].location = v || null))} />
+                  <Field label="Institution" value={edu.institution} onChange={(v) => edit((p) => editAt(p.education, i, (e) => (e.institution = v)))} />
+                  <Field label="Degree" value={edu.degree} onChange={(v) => edit((p) => editAt(p.education, i, (e) => (e.degree = v)))} />
+                  <Field label="Location" value={edu.location ?? ''} onChange={(v) => edit((p) => editAt(p.education, i, (e) => (e.location = v || null)))} />
                   <div className="grid grid-cols-2 gap-2">
-                    <Field label="Start" value={edu.start ?? ''} onChange={(v) => edit((p) => (p.education[i].start = v || null))} />
-                    <Field label="End" value={edu.end ?? ''} onChange={(v) => edit((p) => (p.education[i].end = v || null))} />
+                    <Field label="Start" value={edu.start ?? ''} onChange={(v) => edit((p) => editAt(p.education, i, (e) => (e.start = v || null)))} />
+                    <Field label="End" value={edu.end ?? ''} onChange={(v) => edit((p) => editAt(p.education, i, (e) => (e.end = v || null)))} />
                   </div>
                 </div>
                 <BulletsEditor
                   bullets={edu.details}
                   addLabel="detail"
-                  onChange={(d) => edit((p) => (p.education[i].details = d))}
+                  onChange={(d) => edit((p) => editAt(p.education, i, (e) => (e.details = d)))}
                 />
               </div>
             ))}
@@ -567,13 +568,13 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
             {draft.skills.map((group, i) => (
               <div key={i} className="mb-2 flex items-start gap-2">
                 <div className="grid flex-1 grid-cols-3 gap-2">
-                  <Field label="Category" value={group.category} onChange={(v) => edit((p) => (p.skills[i].category = v))} />
+                  <Field label="Category" value={group.category} onChange={(v) => edit((p) => editAt(p.skills, i, (e) => (e.category = v)))} />
                   <div className="col-span-2">
                     <Field
                       label="Items (comma-separated)"
                       value={group.items.join(', ')}
                       onChange={(v) =>
-                        edit((p) => (p.skills[i].items = v.split(',').map((s) => s.trim()).filter(Boolean)))
+                        edit((p) => editAt(p.skills, i, (e) => (e.items = v.split(',').map((s) => s.trim()).filter(Boolean))))
                       }
                     />
                   </div>

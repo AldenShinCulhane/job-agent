@@ -67,7 +67,7 @@ how to install it. The pieces:
 | Dependency | Used for | Required? |
 |---|---|---|
 | [uv](https://docs.astral.sh/uv/) | Python environment | yes (auto-installed) |
-| Node.js 20+ / npm | frontend build | yes |
+| Node.js 22.18+ / npm | frontend build, unit tests | yes |
 | [Tectonic](https://tectonic-typesetting.github.io) **0.17+** or pdflatex | PDF typesetting | for PDF generation |
 | Tesseract + OCRmyPDF (+ Ghostscript) | scanned-resume OCR fallback | only for image-based PDFs |
 | Playwright Chromium | LinkedIn browser | installed by setup when needed |
@@ -178,12 +178,31 @@ flight at the moment of the kill runs again).
 uv run job-agent                        # backend + built frontend on :8700
 cd frontend && npm run dev              # optional: Vite dev server w/ HMR, proxies /api
 uv run python -m backend.tests.smoke_llm  # live engine smoke test (uses your subscription)
+```
 
-# clean-Ubuntu fresh-clone test
-# (setup -> build -> boot -> health -> Chromium launch -> backend test suite):
+Tests and checks:
+
+```bash
+uv run pytest                           # backend + browser tests (see below)
+cd frontend && npm test                 # unit tests for the pure modules (node --test)
+cd frontend && npm run lint             # oxlint
+cd frontend && npm run check:contrast   # every colour-token pair against WCAG AA
+cd frontend && npx tsc -b --noEmit      # type-check (strict, noUncheckedIndexedAccess)
+
+# clean-Ubuntu fresh-clone test (setup -> frontend gates -> boot -> health
+# -> Chromium launch -> full test suite with the browser tests required):
 docker run --rm -v "$PWD":/src:ro -v "$PWD/scripts/ci":/scratch:ro \
   ubuntu:24.04 bash /scratch/ubuntu_freshclone.sh
 ```
+
+The browser tests (`backend/tests/test_ui_*.py`) drive the built frontend
+in Playwright's Chromium over synthetic API fixtures — no backend, no real
+data. They need `frontend/dist` (`cd frontend && npm run build`) and the
+Chromium that setup installs, and skip when either is missing. Set
+`UI_TESTS_REQUIRED=1` to make that a failure instead, and to fail the run
+if any browser test skipped or none ran; the Ubuntu script does. `npm
+test` needs Node 22.18 or newer, which strips TypeScript types itself; it
+does not type-check, `tsc` does.
 
 `PLAN.md` is the working spec. Architecture in short: FastAPI backend
 (SQLite state, SSE progress), React + Vite + Tailwind frontend, Playwright

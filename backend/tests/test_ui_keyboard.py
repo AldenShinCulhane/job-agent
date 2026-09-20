@@ -199,11 +199,18 @@ def test_appearance_by_keyboard_only(browser, dist_url):
     context, page, table = _open(browser, dist_url)
     _go_to_tab(page, "Settings", "text=Appearance")
     _assert_stop(_tab_to(page, "System"))  # the checked radio takes the stop
+    # The arrow moves focus and checks the next radio natively; React then
+    # re-renders the controlled group. Wait for both to have happened.
     page.keyboard.press("ArrowRight")
+    page.wait_for_function(
+        "() => document.activeElement.labels[0].textContent.trim() === 'Light'")
     _assert_stop(_focused(page), "Light")
     assert not _is_dark(page)
     page.keyboard.press("ArrowRight")
+    page.wait_for_function(
+        "() => document.activeElement.labels[0].textContent.trim() === 'Dark'")
     _assert_stop(_focused(page), "Dark")
+    page.wait_for_function("() => document.documentElement.dataset.theme === 'dark'")
     assert _is_dark(page)
     assert page.get_by_label("Dark", exact=True).is_checked()
     context.close()

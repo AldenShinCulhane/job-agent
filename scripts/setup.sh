@@ -38,21 +38,22 @@ else
   fi
 fi
 
-# --- Node / npm (frontend build) -------------------------------------------
-# Vite requires ^20.19 or >=22.12 — a bare "Node 20" is not enough.
+# --- Node / npm (frontend build + unit tests) ------------------------------
+# Vite needs ^20.19 or >=22.12; `npm test` runs TypeScript through node's
+# own type stripping, which is on by default from 22.18. The floor is the
+# higher of the two.
 if command -v npm >/dev/null 2>&1; then
   NODE_V=$(node --version | sed 's/^v//')
   NODE_MAJOR=${NODE_V%%.*}
   NODE_MINOR=$(printf '%s' "$NODE_V" | cut -d. -f2)
-  if { [ "$NODE_MAJOR" -eq 20 ] && [ "$NODE_MINOR" -ge 19 ]; } \
-     || { [ "$NODE_MAJOR" -eq 22 ] && [ "$NODE_MINOR" -ge 12 ]; } \
+  if { [ "$NODE_MAJOR" -eq 22 ] && [ "$NODE_MINOR" -ge 18 ]; } \
      || [ "$NODE_MAJOR" -ge 23 ]; then
     ok "node v$NODE_V / npm $(npm --version)"
   else
-    fail "node v$NODE_V is too old for the frontend build — need ^20.19 or >=22.12: macOS: brew install node | Ubuntu/Debian: https://nodejs.org or NodeSource | nvm install 22"
+    fail "node v$NODE_V is too old — need 22.18 or newer: macOS: brew install node | Ubuntu/Debian: https://nodejs.org or NodeSource | nvm install 22"
   fi
 else
-  fail "Node.js not found — install Node 20.19+ or 22.12+: macOS: brew install node | Ubuntu/Debian: https://nodejs.org or NodeSource | nvm install 22"
+  fail "Node.js not found — install Node 22.18 or newer: macOS: brew install node | Ubuntu/Debian: https://nodejs.org or NodeSource | nvm install 22"
 fi
 
 # --- LaTeX engine (PDF generation) -----------------------------------------
