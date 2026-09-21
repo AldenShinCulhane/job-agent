@@ -6,6 +6,9 @@ With UI_TESTS_REQUIRED=1 the browser tests are a gate: a skipped UI test,
 or a run in which none executed, fails the session. Skips elsewhere in
 the suite (the engine-dependent ones) are unaffected."""
 
+import json
+import os
+
 import pytest
 
 from backend.tests.ui_harness import (  # noqa: F401
@@ -23,24 +26,38 @@ def pytest_runtest_logreport(report):
 
 
 def pytest_terminal_summary(terminalreporter):
-    """What axe could not decide across the state matrix, by rule, once any
-    browser test has run. Not a gate: these are the items a reviewer looks
-    at, and this is where they can be looked at."""
+    """What axe could not decide across the state matrix, once any browser
+    test has run: grouped by rule and reason, with the states and sample
+    selectors, and the whole list written to $AXE_REPORT as JSON when
+    that is set. Not a gate: these are neither violations nor passes,
+    they are what a reviewer looks at."""
     if not (_UI_OUTCOMES["passed"] + _UI_OUTCOMES["failed"]):
         return
-    by_rule: dict[str, dict] = {}
+    groups: dict[tuple[str, str], dict] = {}
     for where, items in AXE_INCOMPLETE:
         for item in items:
-            entry = by_rule.setdefault(item["id"], {"nodes": 0, "states": []})
-            entry["nodes"] += item["nodes"]
-            entry["states"].append(where)
+            for node in item["nodes"]:
+                g = groups.setdefault((item["id"], node["reason"]),
+                                      {"nodes": 0, "states": set(), "samples": []})
+                g["nodes"] += 1
+                g["states"].add(where)
+                if len(g["samples"]) < 3:
+                    g["samples"].append(f"{where} {node['target']}")
     terminalreporter.section("axe needs-review")
-    if not by_rule:
+    if not groups:
         terminalreporter.line("none: axe decided every check it ran")
-    for rule, entry in sorted(by_rule.items()):
+    for (rule, reason), g in sorted(groups.items()):
         terminalreporter.line(
-            f"{rule}: {entry['nodes']} node(s) across {len(entry['states'])} state(s), "
-            f"first {entry['states'][0]}")
+            f"{rule}: {g['nodes']} node(s) in {len(g['states'])} state(s): {reason}")
+        for sample in g["samples"]:
+            terminalreporter.line(f"    e.g. {sample}")
+    report = os.environ.get("AXE_REPORT")
+    if report:
+        with open(report, "w") as f:
+            json.dump([{"state": where, "rule": item["id"], **node}
+                       for where, items in AXE_INCOMPLETE
+                       for item in items for node in item["nodes"]], f, indent=1)
+        terminalreporter.line(f"full list: {report}")
 
 
 def pytest_sessionfinish(session, exitstatus):

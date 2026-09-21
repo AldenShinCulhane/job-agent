@@ -386,12 +386,20 @@ AXE_RUN = """() => axe.run({ exclude: [['iframe']] }).then(r => ({
     id: v.id, impact: v.impact,
     nodes: v.nodes.slice(0, 5).map(n => n.target.join(' ')),
   })),
-  incomplete: r.incomplete.map(i => ({ id: i.id, nodes: i.nodes.length })),
+  incomplete: r.incomplete.map(i => ({
+    id: i.id,
+    nodes: i.nodes.map(n => ({
+      target: n.target.join(' '),
+      reason: [...n.any, ...n.all, ...n.none].map(c => c.message).filter(Boolean).join('; '),
+    })),
+  })),
 }))"""
 
 
-# What axe could not decide, per checked state, for the session's terminal
-# summary (conftest prints it): a passing test's own output is captured.
+# What axe could not decide, per checked state — each node with its
+# selector and axe's reason, so that it can be reviewed. conftest prints
+# the session's summary (a passing test's own output is captured) and
+# writes the whole list to $AXE_REPORT when that is set.
 AXE_INCOMPLETE: list[tuple[str, list[dict]]] = []
 
 
