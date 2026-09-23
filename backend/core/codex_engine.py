@@ -12,9 +12,11 @@ boundary for the Codex engine:
   and leaves the environment context out of the prompt.
 - Before a configuration is used, `verify` runs that builder against a
   localhost-only stand-in for the Responses API and asserts the exact
-  request Codex would send: the app's instructions, the user message only,
-  and no tool beyond `request_user_input` (no file, process or network
-  access; exec mode rejects it). It then proves the loop guard: a model
+  request Codex would send: the chosen model, the app's instructions, the
+  user message only with no earlier response or stored conversation, a
+  response the service does not keep, no request field the check does not
+  know, and no tool beyond `request_user_input` (no file, process or
+  network access; exec mode rejects it). It then proves the loop guard: a model
   that insists on calling a tool is stopped at its first refusal. A pass
   is bound to a fingerprint of the executable (path and content hash), the
   launch arguments, the catalog entry and the environment allowlist; any
@@ -74,6 +76,19 @@ CONFIG_OVERRIDES = (
 # The one tool Codex still declares. No file, process or network access,
 # and exec mode rejects a call to it.
 ALLOWED_TOOLS = frozenset({"request_user_input"})
+
+# Every top-level field a locked request may carry; `check_request` bounds
+# each one's value. Any other field fails the check: a new Codex build
+# could use it to add context or a capability this check never reasoned
+# about.
+REQUEST_FIELDS = frozenset({
+    "model", "instructions", "input", "tools", "tool_choice",
+    "parallel_tool_calls", "reasoning", "store", "stream", "include", "text",
+    "prompt_cache_key", "client_metadata",
+})
+# Fields that would bring in context from outside this one prompt: an
+# earlier response, a stored conversation, a stored prompt template.
+CONTEXT_FIELDS = ("previous_response_id", "conversation", "prompt")
 
 NORMAL_EVENTS = frozenset({"thread.started", "turn.started", "turn.completed"})
 ANSWER_ITEMS = frozenset({"agent_message", "reasoning"})
@@ -569,24 +584,56 @@ class LocalResponses:
     patch_input = "*** Begin Patch\n*** End Patch\n"
 
 
-def check_request(body: dict) -> list[str]:
-    """What is wrong with a captured request, empty when it is exactly the
-    locked shape."""
+def check_request(body: dict, model: str) -> list[str]:
+    """What is wrong with a captured request for `model`, empty when it is
+    exactly the locked shape: the chosen model, the app's instructions, the
+    prompt alone with nothing carried over, no tool beyond the allowlist,
+    nothing kept by the service, and the app's JSON schema as the answer
+    format."""
     problems = []
+    carried = [name for name in CONTEXT_FIELDS if name in body]
+    if carried:
+        problems.append(f"carries context from outside the prompt: {carried}")
+    unexpected = sorted(set(body) - REQUEST_FIELDS - set(CONTEXT_FIELDS))
+    if unexpected:
+        problems.append(f"unexpected request fields: {unexpected}")
+    if body.get("model") != model:
+        problems.append(f"asks for model {body.get('model')!r}, not the chosen {model!r}")
+    if body.get("store") is not False:
+        # Unset means kept: the service stores responses by default.
+        problems.append("store is not false: the service would keep the response")
     if body.get("instructions") != BASE_INSTRUCTIONS:
         problems.append("instructions are not the app's")
     tools = sorted(str(t.get("name") or t.get("type")) for t in body.get("tools") or [])
     extra = sorted(set(tools) - ALLOWED_TOOLS)
     if extra:
         problems.append(f"tools beyond the allowlist: {extra}")
+    if body.get("tool_choice", "auto") not in ("auto", "none"):
+        problems.append("tool_choice is not auto or none")
     items = body.get("input") or []
-    if len(items) != 1 or items[0].get("role") != "user":
-        problems.append(f"input is not the user message alone: "
-                        f"{[i.get('role') or i.get('type') for i in items]}")
+    if (len(items) != 1 or not isinstance(items[0], dict)
+            or items[0].get("type") != "message" or items[0].get("role") != "user"):
+        problems.append("input is not the user message alone: "
+                        f"{[(i.get('type'), i.get('role')) for i in items if isinstance(i, dict)]}")
     else:
         texts = [c.get("text") for c in items[0].get("content") or [] if isinstance(c, dict)]
         if texts != [PROBE_TEXT]:
             problems.append("the user message carries more than the prompt")
+    include = body.get("include") or []
+    if not isinstance(include, list) or set(include) - {"reasoning.encrypted_content"}:
+        problems.append(f"include asks for more than the encrypted reasoning: {include}")
+    answer_format = (body.get("text") or {}).get("format") or {}
+    if (answer_format.get("type") != "json_schema"
+            or answer_format.get("schema") != PROBE_SCHEMA):
+        problems.append("the answer format is not the app's JSON schema")
+    reasoning = body.get("reasoning") or {}
+    if not isinstance(reasoning, dict) or set(reasoning) - {"effort", "summary"}:
+        problems.append("reasoning carries more than effort and summary: "
+                        f"{sorted(reasoning) if isinstance(reasoning, dict) else reasoning}")
+    metadata = body.get("client_metadata") or {}
+    if not isinstance(metadata, dict) or not all(
+            isinstance(v, str) for v in metadata.values()):
+        problems.append("client_metadata is not flat text")
     return problems
 
 
@@ -620,7 +667,7 @@ async def verify(model: str) -> str:
     if len(captured.requests) != 1:
         raise llm.ConfigError(f"Codex lockdown check: expected one request, "
                               f"saw {len(captured.requests)}")
-    problems = check_request(captured.requests[0])
+    problems = check_request(captured.requests[0], model)
     if problems:
         raise llm.ConfigError("Codex lockdown check failed: " + "; ".join(problems))
 

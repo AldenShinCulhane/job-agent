@@ -426,6 +426,39 @@ async def test_a_success_after_the_wait_ends_the_episode(engine):
     assert engine_fakes.engine_value("backoff_minutes") is None
 
 
+async def test_a_late_limit_cannot_reopen_a_limit_a_newer_success_ended(engine):
+    """Two calls in flight both hit the limit. The first starts the episode,
+    a call sent after the cooldown succeeds and ends it, and only then does
+    the second answer arrive: it was sent before both changes, so it is old
+    news and reopens nothing."""
+    engine_fakes.pin(CLAUDE_A)
+    first, first_call = await dispatch_held(engine)
+    late, late_call = await dispatch_held(engine)
+
+    first.fail(usage())
+    with pytest.raises(llm.UsageExhausted):
+        await first_call
+    _cooldown_over()
+    engine.calls.outcomes.append(ANSWER)
+    await llm.structured("p", SCHEMA, task="extract")
+    assert llm.engine_status()["status"] == "ok"
+
+    late.fail(usage(resets_at=datetime.now(timezone.utc) + timedelta(hours=1)))
+    with pytest.raises(llm.UsageExhausted):
+        await late_call  # its own caller still hears about it
+    status = llm.engine_status()
+    assert (status["status"], status["episode"], status["next_retry_at"],
+            status["limit_resets_at"], status["last_error"]) == (
+        "ok", None, None, None, None)
+    assert engine_fakes.engine_value("backoff_minutes") is None
+
+    # A limit that is really back is news again on the next call.
+    engine.calls.outcomes.append(usage())
+    with pytest.raises(llm.UsageExhausted):
+        await llm.structured("p", SCHEMA, task="extract")
+    assert llm.engine_status()["status"] == "waiting_usage_exhausted"
+
+
 async def test_switching_models_within_a_provider_keeps_the_limit(engine):
     engine_fakes.pin(CLAUDE_A)
     engine.calls.outcomes.append(usage())
@@ -645,6 +678,47 @@ async def test_present_credentials_never_clear_what_the_service_reported(engine)
         "auth_required", "OAuth token revoked")
 
     # Only a call that works proves the service accepts the login again.
+    engine.calls.outcomes.append(ANSWER)
+    await llm.structured("p", SCHEMA, task="extract")
+    assert llm.engine_status()["status"] == "ok"
+
+
+@pytest.mark.parametrize("rejection, status, local", [
+    (llm.AuthRequired("OAuth token revoked"), "auth_required",
+     ("auth", "not signed in — run: login")),
+    (llm.ConfigError("tool lockdown breached"), "config_error",
+     ("auth", "not signed in — run: login")),
+    (llm.ConfigError("tool lockdown breached"), "config_error",
+     ("setup", "credentials check failed: RuntimeError: status hung")),
+])
+async def test_a_service_rejection_outlives_a_local_problem_that_comes_and_goes(
+        engine, rejection, status, local):
+    """The service rejected the call; then the local check finds the login
+    missing, then present again. Neither local finding is the service
+    saying yes: the rejection stands until a call succeeds."""
+    engine_fakes.pin(CLAUDE_A)
+    engine.calls.outcomes.append(rejection)
+    with pytest.raises(type(rejection)):
+        await llm.structured("p", SCHEMA, task="extract")
+
+    engine.signin.problem["claude"] = local
+    assert await llm.refresh_credentials("claude") == local[1]
+    assert llm.credentials_present("claude") is False
+    # Nothing is sent while the local problem lasts, and it is reported as
+    # what it is.
+    raised = llm.ConfigError if local[0] == "setup" else llm.AuthRequired
+    with pytest.raises(raised, match=local[1].split(":")[0]):
+        await llm.structured("p", SCHEMA, task="extract")
+    assert len(engine.calls.sent) == 1
+    assert (llm.engine_status()["status"], llm.engine_status()["last_error"]) == (
+        status, str(rejection))
+
+    engine.signin.problem["claude"] = None
+    assert await llm.refresh_credentials("claude") is None
+    assert (llm.engine_status()["status"], llm.engine_status()["last_error"]) == (
+        status, str(rejection))
+
+    # Only a call that works proves the service accepts it again.
     engine.calls.outcomes.append(ANSWER)
     await llm.structured("p", SCHEMA, task="extract")
     assert llm.engine_status()["status"] == "ok"

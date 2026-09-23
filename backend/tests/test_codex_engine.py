@@ -148,20 +148,43 @@ def launch_for(exe):
 
 # --- request and event checks --------------------------------------------------------
 
+DROP = object()
+SAMPLE_ID = "00000000-0000-4000-8000-000000000000"
+
+
 def locked_request(**overrides):
+    """The request the lockdown check expects: every field the real Codex
+    sends (codex-cli 0.156.0), with sample ids. `DROP` removes a field."""
     body = {
+        "model": MODEL,
         "instructions": codex_engine.BASE_INSTRUCTIONS,
-        "tools": [{"type": "function", "name": "request_user_input"}],
         "input": [{"type": "message", "role": "user",
                    "content": [{"type": "input_text", "text": codex_engine.PROBE_TEXT}]}],
+        "tools": [{"type": "function", "name": "request_user_input"}],
+        "tool_choice": "auto",
+        "parallel_tool_calls": True,
+        "reasoning": {"effort": "medium"},
+        "store": False,
+        "stream": True,
+        "include": ["reasoning.encrypted_content"],
+        "text": {"verbosity": "low",
+                 "format": {"type": "json_schema", "strict": True,
+                            "name": "codex_output_schema",
+                            "schema": codex_engine.PROBE_SCHEMA}},
+        "prompt_cache_key": SAMPLE_ID,
+        "client_metadata": {"session_id": SAMPLE_ID, "turn_id": SAMPLE_ID},
     }
-    body.update(overrides)
+    for key, value in overrides.items():
+        if value is DROP:
+            body.pop(key, None)
+        else:
+            body[key] = value
     return body
 
 
 def test_the_locked_request_shape_passes():
-    assert codex_engine.check_request(locked_request()) == []
-    assert codex_engine.check_request(locked_request(tools=[])) == []
+    assert codex_engine.check_request(locked_request(), MODEL) == []
+    assert codex_engine.check_request(locked_request(tools=[]), MODEL) == []
 
 
 @pytest.mark.parametrize("overrides, problem", [
@@ -176,9 +199,36 @@ def test_the_locked_request_shape_passes():
     ({"input": [{"type": "message", "role": "user", "content": [
         {"type": "input_text", "text": "# AGENTS.md instructions"},
         {"type": "input_text", "text": codex_engine.PROBE_TEXT}]}]}, "more than the prompt"),
+    # Tools declared inside the input rather than in `tools`, as newer
+    # Codex models do.
+    ({"input": [{"type": "additional_tools", "role": "user",
+                 "tools": [{"type": "custom", "name": "exec"}]}]},
+     "not the user message alone"),
+    ({"instructions": DROP}, "instructions"),
+    # Context from outside this one prompt: an earlier response, a stored
+    # conversation, a stored prompt template.
+    ({"previous_response_id": "resp_earlier"}, "previous_response_id"),
+    ({"conversation": {"id": "conv_earlier"}}, "conversation"),
+    ({"prompt": {"id": "pmpt_stored"}}, "prompt"),
+    # Kept by the service, so a later request could build on it.
+    ({"store": True}, "store"),
+    ({"store": DROP}, "store"),  # the service keeps responses by default
+    # Not the model the user chose.
+    ({"model": "gpt-other"}, "model"),
+    ({"model": DROP}, "model"),
+    # Anything this check has not reasoned about.
+    ({"background": True}, "unexpected"),
+    ({"some_future_field": {"x": 1}}, "unexpected"),
+    ({"include": ["web_search_call.action.sources"]}, "include"),
+    ({"text": {"format": {"type": "text"}}}, "schema"),
+    ({"text": {"format": {"type": "json_schema", "strict": True, "name": "x",
+                          "schema": {"type": "object"}}}}, "schema"),
+    ({"tool_choice": {"type": "function", "name": "request_user_input"}}, "tool_choice"),
+    ({"reasoning": {"effort": "low", "context": "all_turns"}}, "reasoning"),
+    ({"client_metadata": {"session_id": {"nested": "value"}}}, "client_metadata"),
 ])
 def test_any_deviation_from_the_locked_request_is_caught(overrides, problem):
-    problems = codex_engine.check_request(locked_request(**overrides))
+    problems = codex_engine.check_request(locked_request(**overrides), MODEL)
     assert problems and any(problem in p for p in problems)
 
 
@@ -436,6 +486,10 @@ async def test_a_verification_is_reused_until_something_it_bound_changes(fake, m
         {"type": "function", "name": "exec_command"}])]), "tools beyond the allowlist"),
     (lambda c: setattr(c, "captured", [locked_request(), locked_request()]),
      "expected one request"),
+    (lambda c: setattr(c, "captured", [locked_request(previous_response_id="resp_1")]),
+     "previous_response_id"),
+    (lambda c: setattr(c, "captured", [locked_request(model="gpt-other")]),
+     "not the chosen"),
     (lambda c: setattr(c, "refusal", None), "was not detected"),
     (lambda c: setattr(c, "guard_requests", codex_engine.LOOP_GUARD_MAX_REQUESTS + 1),
      "loop guard let"),
@@ -705,7 +759,8 @@ async def test_the_real_capture_is_exactly_the_locked_request(real_codex):
                                               "capture")
     assert len(server.requests) == 1
     body = server.requests[0]
-    assert codex_engine.check_request(body) == []
+    assert codex_engine.check_request(body, real_codex.model) == []
+    assert codex_engine.check_request(body, "gpt-other") != []
     assert {t.get("name") or t.get("type") for t in body.get("tools") or []} <= (
         codex_engine.ALLOWED_TOOLS)
 

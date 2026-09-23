@@ -463,21 +463,22 @@ def _record_problem(ctx: CallContext | None, provider: str, status: str,
     if ctx is None or _may_write(ctx):
         _put(provider, "status", status)
         _put(provider, "last_error", error)
+        _put(provider, "problem_source", "service")
         _bump(provider)
     _announce(previous)
 
 
 def _record_usage(ctx: CallContext, exc: UsageExhausted) -> None:
     """Start a quota episode, or extend the current one when a call sent
-    during it (after its cooldown) hit the limit again. Concurrent calls
-    sent before the episode began add nothing: one limit, one episode,
-    one backoff step."""
+    during it (after its cooldown) hit the limit again. A call sent before
+    the provider's latest change adds nothing: concurrent calls sent before
+    the episode began (one limit, one episode, one backoff step), and a
+    late answer after a newer success ended the episode, which must not
+    reopen it. A limit that is really back is hit again by the next call."""
     provider = ctx.provider
     previous = _signature()
-    episode = _get(provider, "episode")
-    if episode is None or _may_write(ctx):
-        if episode is None:
-            episode = uuid.uuid4().hex
+    if _may_write(ctx):
+        episode = _get(provider, "episode") or uuid.uuid4().hex
         try:
             minutes = int(_get(provider, "backoff_minutes",
                                str(_BACKOFF_START_MIN)) or _BACKOFF_START_MIN)
@@ -494,6 +495,7 @@ def _record_usage(ctx: CallContext, exc: UsageExhausted) -> None:
         _put(provider, "limit_resets_at",
              exc.resets_at.isoformat() if exc.resets_at else None)
         _put(provider, "last_error", str(exc) or None)
+        _put(provider, "problem_source", None)
         _bump(provider)
     _announce(previous)
 
@@ -518,10 +520,10 @@ def _record_success(ctx: CallContext) -> None:
     if _may_write(ctx):
         dirty = any(_get(provider, name) is not None for name in (
             "last_error", "next_retry_at", "backoff_minutes",
-            "limit_resets_at", "episode"))
+            "limit_resets_at", "episode", "problem_source"))
         if _get(provider, "status", "ok") != "ok" or dirty:
             for name in ("last_error", "next_retry_at", "backoff_minutes",
-                         "limit_resets_at", "episode"):
+                         "limit_resets_at", "episode", "problem_source"):
                 _put(provider, name, None)
             _put(provider, "status", "ok")
             _bump(provider)
@@ -535,6 +537,7 @@ def _clear_problem(provider: str) -> None:
     waiting = _get(provider, "episode") is not None
     _put(provider, "status", "waiting_usage_exhausted" if waiting else "ok")
     _put(provider, "last_error", None)
+    _put(provider, "problem_source", None)
     _bump(provider)
 
 
@@ -564,9 +567,9 @@ _credential_checks: dict[str, asyncio.Task] = {}
 async def refresh_credentials(provider: str, *, max_age: float = 0.0) -> str | None:
     """Check local credentials, at most once per `max_age` seconds and at
     most once at a time per provider. Records the result; a missing login
-    becomes auth_required. Present credentials never clear anything: only
-    a successful call proves the service works (and a limit or a broken
-    CLI is not a sign-in problem)."""
+    becomes auth_required. Present credentials clear only a problem a
+    local check found: only a successful call proves the service works, so
+    a rejection it reported, a limit or a lockdown breach stays."""
     cached = _get_json(provider, "credentials", None)
     if cached and max_age > 0:
         try:
@@ -592,23 +595,26 @@ async def _check_credentials(provider: str) -> str | None:
         result = ("setup", f"credentials check failed: {type(exc).__name__}: {exc}")
     previous = _signature()
     problem = None if result is None else result[1]
-    before = _get_json(provider, "credentials", None) or {}
     _put_json(provider, "credentials", {
         "present": result is None, "problem": problem,
+        "kind": None if result is None else result[0],
         "checked_at": _now().isoformat()})
-    if (result is None
-            and _get(provider, "status", "ok") in ("auth_required", "config_error")
-            and before.get("problem") is not None
-            and _get(provider, "last_error") == before.get("problem")):
-        # The sign-in or setup problem this check itself found is gone. A
-        # rejection the service reported, or a lockdown breach, stays
-        # until a call succeeds.
+    # Whose finding the provider's sign-in or setup problem is. Only one a
+    # local check made can be ended by one; anything else (the service's
+    # rejection, a lockdown breach, a state from before sources were
+    # recorded) is left for a call that succeeds.
+    standing = _get(provider, "status", "ok") in ("auth_required", "config_error")
+    local = _get(provider, "problem_source") == "local"
+    if result is None and standing and local:
         _clear_problem(provider)
-    if result is not None:
+    if result is not None and (local or not standing):
+        # A local finding never writes over the service's own: it is kept
+        # in `credentials`, and stops calls before they are sent.
         status = "auth_required" if result[0] == "auth" else "config_error"
         if _get(provider, "status", "ok") != status or _get(provider, "last_error") != problem:
             _put(provider, "status", status)
             _put(provider, "last_error", problem)
+            _put(provider, "problem_source", "local")
             _bump(provider)
     _announce(previous)
     return problem
@@ -624,7 +630,12 @@ async def _require_credentials(provider: str, *, max_age: float) -> None:
     problem = await refresh_credentials(provider, max_age=max_age)
     if problem is not None:
         # A missing or broken CLI is a setup problem, not a sign-in one.
-        if _get(provider, "status") == "config_error":
+        # Read from the check itself: the provider's status may be the
+        # service's finding, which a local one never overwrites.
+        cached = _get_json(provider, "credentials", None) or {}
+        kind = cached.get("kind") or (
+            "setup" if _get(provider, "status") == "config_error" else "auth")
+        if kind == "setup":
             raise ConfigError(problem)
         raise AuthRequired(problem)
 
