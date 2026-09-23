@@ -266,6 +266,8 @@ def _signature() -> str:
             "credentials": [credentials.get("present"), credentials.get("problem")],
             "models": {m: [s.get("status"), s.get("last_error")]
                        for m, s in _models(provider).items()},
+            "catalog": _get(provider, "catalog"),
+            "catalog_error": _get(provider, "catalog_error"),
         }
     return json.dumps(view, sort_keys=True)
 

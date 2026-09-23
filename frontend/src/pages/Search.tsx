@@ -103,9 +103,12 @@ const acceptPlaceholderOnTab =
 export default function Search({
   epochs,
   connected,
+  onHold,
 }: {
   epochs: Epochs
   connected: boolean
+  /** Told whether this page has work the user would lose if it went away. */
+  onHold: (hold: boolean) => void
 }) {
   const [linkedin, setLinkedin] = useState<LinkedInStatus | null>(null)
   const [run, setRun] = useState<SearchRun | null>(null)
@@ -141,6 +144,11 @@ export default function Search({
   // so no response arriving later can fold an editor that is in use.
   // With no run there is nothing to summarise and the fields simply show.
   const [editing, setEditing] = useState(false)
+  // Typed search fields, or an answer of theirs still on its way.
+  const held =
+    editing || busyGenerate || busyRerank || busyExplain !== null || busyDetail !== null
+  useEffect(() => onHold(held), [held, onHold])
+  useEffect(() => () => onHold(false), [onHold])
   // Bumped by every edit. Start captures it and folds the fields on
   // completion only if nothing was typed while the request was out;
   // otherwise the newer text is exactly what must stay on screen.
@@ -953,7 +961,7 @@ export default function Search({
                   title={scoringStall.detail ?? undefined}
                 >
                   {scoringStall.reason === 'engine_blocked'
-                    ? 'Scoring paused — Claude engine needs attention'
+                    ? 'Scoring paused — the AI engine needs attention'
                     : 'Scoring paused — automatic retries exhausted'}
                 </span>
                 <button

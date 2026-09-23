@@ -77,6 +77,53 @@ def _package(pid: int, status: str, error: str | None = None) -> dict:
 ENGINE = {"status": "auth_required", "model": None, "retry_in_seconds": None,
           "last_error": "not logged in"}
 
+SIGNED_IN = {"present": True, "problem": None, "checked_at": "2026-09-15T12:00:00Z"}
+SIGNED_OUT = {"present": False, "problem": "not logged in",
+              "checked_at": "2026-09-15T12:00:00Z"}
+CATALOGS = {
+    "claude": [
+        {"id": "claude-sample", "label": "Claude Sample", "description": "",
+         "efforts": ["low", "medium", "high", "xhigh"]},
+        {"id": "claude-small", "label": "Claude Small", "description": "", "efforts": []},
+    ],
+    "codex": [
+        {"id": "gpt-sample", "label": "GPT Sample", "description": "",
+         "efforts": ["low", "medium", "high", "xhigh"]},
+        {"id": "gpt-mini", "label": "GPT Mini", "description": "",
+         "efforts": ["low", "medium"]},
+    ],
+}
+
+
+def provider_view(provider: str, **over) -> dict:
+    """One engine as GET /api/engines shows it: signed in, not yet
+    checked, with its model list."""
+    view = {
+        "provider": provider, "status": "unprobed", "model": None,
+        "retry_in_seconds": None, "next_retry_at": None, "limit_resets_at": None,
+        "episode": None, "last_error": None, "credentials": SIGNED_IN,
+        "verified_at": None, "catalog": CATALOGS[provider], "catalog_error": None,
+        "models": {},
+    }
+    if provider == "claude":
+        view["auto_model"] = None
+    return {**view, **over}
+
+
+def engines_view(claude: dict | None = None, codex: dict | None = None,
+                 selection: dict | None = None) -> dict:
+    """Both engines. By default Claude is selected and signed out, as ENGINE
+    says, so every page opens under the sign-in banner."""
+    signed_out = {"status": "auth_required", "last_error": "not logged in",
+                  "credentials": SIGNED_OUT}
+    return {
+        "selection": selection or {"provider": "claude", "model": None},
+        "providers": {
+            "claude": provider_view("claude", **{**signed_out, **(claude or {})}),
+            "codex": provider_view("codex", **(codex or {})),
+        },
+    }
+
 # Set to "1" where the browser tests are a gate rather than a courtesy:
 # then a missing dist, Chromium or axe bundle FAILS instead of skipping,
 # and conftest fails the session if any UI test was skipped or none ran.
@@ -120,6 +167,7 @@ def profile_payload(version=5, *, confirmed=False, live=4, name="Sample Person")
 # package whose status the UI does not know).
 API_FIXTURES: dict[str, dict] = {
     "/api/status": {"app": "job-agent", "engine": ENGINE},
+    "/api/engines": engines_view(),
     "/api/linkedin/status": {"state": "logged_out", "detail": "session expired"},
     "/api/search/latest": {"id": 7, "status": "stopped_cap", "collected": 4,
                            "message": "Daily cap reached",
@@ -161,6 +209,11 @@ API_POSTS: dict[tuple[str, str], dict] = {
                                       "error": "auth_required",
                                       "detail": "not logged in"},
     ("PUT", "/api/settings"): {"resume_page_limit": 2},
+    ("PUT", "/api/engine/selection"): {
+        "selection": {"provider": "codex", "model": "gpt-sample"},
+        "ok": True, "verified": True, "model": "gpt-sample"},
+    ("POST", "/api/engines/claude/catalog"): engines_view(),
+    ("POST", "/api/engines/codex/catalog"): engines_view(),
 }
 EXPLANATION = {"strengths": ["Python every day"], "gaps": ["No Go"],
                "pitch": "A close fit on the backend work."}

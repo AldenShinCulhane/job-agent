@@ -793,6 +793,21 @@ def test_a_damaged_selection_reads_as_the_default(engine, raw):
     assert llm.selection() == {"provider": "claude", "model": None}
 
 
+async def test_a_changed_model_list_announces_and_an_unchanged_one_does_not(
+        engine, published, monkeypatch):
+    listed = [{"id": CLAUDE_A, "label": "Opus", "description": "", "efforts": []}]
+
+    async def models():
+        return listed
+
+    monkeypatch.setattr(llm.claude_cli, "models", models)
+    await llm.refresh_catalog("claude")
+    assert published == [("engine", {"status": "unprobed"})]
+    published.clear()
+    await llm.refresh_catalog("claude")
+    assert published == []
+
+
 def test_selecting_announces_once(engine, published):
     llm.select("codex", CODEX)
     assert published == [("engine", {"status": "unprobed"})]

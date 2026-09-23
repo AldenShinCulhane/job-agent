@@ -10,8 +10,8 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from backend.tests.ui_harness import (
-    API_FIXTURES, ENGINE, Response, _job, _package, profile_payload,
-    route_fixtures,
+    API_FIXTURES, ENGINE, SIGNED_IN, Response, _job, _package, engines_view,
+    profile_payload, route_fixtures,
 )
 
 SEARCH_READY = ("text=Backend Engineer a", "text=Ready", "text=Daily cap reached")
@@ -30,8 +30,13 @@ class State:
     allow_failed_requests: tuple[str, ...] = ()
 
 
-def _engine(**over):
-    return {"/api/status": {"app": "job-agent", "engine": {**ENGINE, **over}}}
+def _engine(codex=None, selection=None, **claude):
+    """The engines view with Claude's state changed. A Claude that is not
+    asking for a sign-in is signed in."""
+    if claude.get("status", "auth_required") != "auth_required":
+        claude.setdefault("credentials", SIGNED_IN)
+    return {"/api/engines": engines_view(claude=claude, codex=codex,
+                                         selection=selection)}
 
 
 def _dirty(page):
@@ -75,6 +80,12 @@ def _generate_error(page):
     page.get_by_role("checkbox", name="Select Backend Engineer a", exact=True).check()
     page.get_by_role("button", name="Generate packages").click()
     page.get_by_role("alert").wait_for()
+
+
+def _custom_model(page):
+    page.get_by_label("Model for every task").select_option("custom")
+    page.get_by_label("Model ID").fill("not a model id")
+    page.wait_for_selector("text=Letters, digits")
 
 
 def _history_open(page):
@@ -147,6 +158,34 @@ STATES: list[State] = [
                                       "latex_engines": ["tectonic", "pdflatex"]},
                     **_engine(status="ok", model="claude-sample", last_error=None)},
           ready=("text=Available: tectonic, pdflatex", "text=Claude ready")),
+    State("settings-engine-codex", tab="Settings",
+          fixtures=_engine(status="ok", model="claude-sample", last_error=None,
+                           codex={"status": "ok", "model": "gpt-sample",
+                                  "verified_at": "2026-09-15T12:00:00Z"},
+                           selection={"provider": "codex", "model": "gpt-sample"}),
+          ready=("text=Codex ready", "text=Every task uses GPT Sample on Codex.")),
+    State("settings-engine-waiting", tab="Settings",
+          fixtures=_engine(status="waiting_usage_exhausted", model="claude-sample",
+                           retry_in_seconds=1500, last_error="usage limit reached",
+                           episode="matrix-episode",
+                           next_retry_at="2026-09-15T12:25:00Z",
+                           limit_resets_at="2026-09-15T15:00:00Z"),
+          ready=("text=switch models to keep working now", "text=Limit resets")),
+    State("settings-engine-not-entitled", tab="Settings",
+          fixtures=_engine(status="not_entitled", model="claude-small",
+                           last_error="model not_found",
+                           selection={"provider": "claude", "model": "claude-small"}),
+          ready=("text=isn't available on your Claude plan",)),
+    State("settings-engine-codex-missing", tab="Settings",
+          fixtures=_engine(status="ok", model="claude-sample", last_error=None,
+                           codex={"status": "config_error", "catalog": None,
+                                  "catalog_error": "FileNotFoundError: Codex CLI not found",
+                                  "credentials": {
+                                      "present": False, "checked_at": "2026-09-15T12:00:00Z",
+                                      "problem": "Codex CLI not found on PATH."}}),
+          ready=("text=Codex CLI not found on PATH.", "text=Couldn't list Codex models")),
+    State("settings-engine-custom", tab="Settings", ready=("text=AI engine",),
+          setup=_custom_model),
     State("settings-read-failed", tab="Settings",
           fixtures={"/api/settings": Response(500, {"detail": "settings store unavailable"})},
           ready=("text=settings store unavailable", "text=Appearance"),
@@ -180,7 +219,7 @@ def open_state(browser, dist_url, state: State, *, width=1280, height=900,
     table.update(state.fixtures)
     route_fixtures(page, table)
     page.goto(dist_url)
-    page.wait_for_selector("text=Claude sign-in required") if "/api/status" not in state.fixtures \
+    page.wait_for_selector("text=Claude sign-in required") if "/api/engines" not in state.fixtures \
         else None
     page.get_by_role("button", name=state.tab, exact=True).click()
     for selector in state.ready:

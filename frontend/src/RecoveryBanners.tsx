@@ -1,12 +1,19 @@
-import type { EngineStatus, LinkedInStatus } from './api'
-import { retryText } from './engineStatus'
+import type { EnginesView, LinkedInStatus } from './api'
+import {
+  clockText,
+  modelLabel,
+  otherProvider,
+  providerName,
+  retryText,
+  selectedEngine,
+} from './engineStatus'
 import { banner } from './styles'
 import type { Tone } from './styles'
 
 interface Props {
-  engine: EngineStatus | null
+  engines: EnginesView | null
   linkedin: LinkedInStatus | null
-  onOpenSettings: () => void
+  onOpenEngine: () => void
   onOpenSearch: () => void
 }
 
@@ -21,40 +28,61 @@ interface Banner {
  * app can be in gets one visible line with the way out — never a modal,
  * never an approval prompt. */
 export default function RecoveryBanners({
-  engine,
+  engines,
   linkedin,
-  onOpenSettings,
+  onOpenEngine,
   onOpenSearch,
 }: Props) {
   const banners: Banner[] = []
+  const engine = engines ? selectedEngine(engines) : null
+  const name = engine ? providerName(engine.provider) : ''
 
   if (engine?.status === 'auth_required') {
     banners.push({
       key: 'engine-auth',
       tone: 'danger',
-      text: 'Claude sign-in required — scoring and package generation are paused until you log in.',
-      action: { label: 'How to fix', run: onOpenSettings },
+      text: `${name} sign-in required — scoring and package generation are paused until you sign in.`,
+      action: { label: 'How to fix', run: onOpenEngine },
     })
   }
   if (engine?.status === 'config_error') {
     banners.push({
       key: 'engine-config',
       tone: 'danger',
-      text: `Claude engine configuration error${engine.last_error ? `: ${engine.last_error}` : ''}.`,
-      action: { label: 'Details', run: onOpenSettings },
+      text: `${name} engine configuration error${engine.last_error ? `: ${engine.last_error}` : ''}.`,
+      action: { label: 'Details', run: onOpenEngine },
     })
   }
-  if (engine?.status === 'waiting_usage_exhausted') {
+  if (engines && engine?.status === 'not_entitled') {
+    const model = modelLabel(engines, engine.provider, engine.model) ?? 'The selected model'
+    banners.push({
+      key: 'engine-model',
+      tone: 'danger',
+      text: `${model} isn't available on your ${name} plan — choose another model. Scoring and package generation wait until you do.`,
+      action: { label: 'Choose model', run: onOpenEngine },
+    })
+  }
+  if (engines && engine?.status === 'waiting_usage_exhausted') {
     const retry = retryText(engine.retry_in_seconds)
+    const other = otherProvider(engine.provider)
+    const otherName = providerName(other)
+    const signedIn = engines.providers[other].credentials?.present === true
+    const reset = clockText(engine.limit_resets_at)
+    // Honest scope: queued scoring/package work has a retry timer and
+    // is never lost; one-off actions (upload, Explain, Re-rank) are
+    // request-scoped — they fail now and the user retries them.
+    const wait = retry
+      ? `queued scoring and package work resumes on its own in ${retry}${reset ? ` (${name} says the limit resets at ${reset})` : ''} and is never lost`
+      : 'the wait is over, so queued scoring and package work retries on its own; run any action of yours that failed again'
+    const bothLimited = engines.providers[other].status === 'waiting_usage_exhausted'
+    const way = bothLimited
+      ? `${otherName} is at its limit too, so for now`
+      : `To keep working now, ${signedIn ? `switch to a ${otherName} model` : `sign in to ${otherName} and switch to one of its models`} — another ${name} model doesn't help, the limit covers them all. Or wait:`
     banners.push({
       key: 'engine-usage',
       tone: 'warn',
-      // Honest scope: queued scoring/package work has a retry timer and
-      // is never lost; one-off actions (upload, Explain, Re-rank) are
-      // request-scoped — they fail now and the user retries them.
-      text: retry
-        ? `Claude usage limit reached — queued scoring and package work is paused, resumes automatically in ${retry}, and is never lost. Actions you trigger yourself (resume upload, Explain, Re-rank) will fail until then — retry them after the countdown.`
-        : 'Claude usage limit was reached — the cooldown has passed. Queued scoring and package work retries on its own; if an action of yours failed (resume upload, Explain, Re-rank), run it again now.',
+      text: `${name} usage limit reached. ${way} ${wait}.`,
+      action: { label: 'Switch model', run: onOpenEngine },
     })
   }
   if (linkedin?.state === 'captcha_stop') {

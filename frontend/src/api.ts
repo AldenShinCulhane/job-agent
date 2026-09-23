@@ -63,11 +63,66 @@ export interface ProfilePayload {
   extraction_method?: string
 }
 
+export type Provider = 'claude' | 'codex'
+
+export const PROVIDERS: readonly Provider[] = ['claude', 'codex']
+
+/** A model the provider lists, as the engine picker offers it. `efforts`
+ * is empty for a model that takes no effort setting. */
+export interface ModelOption {
+  id: string
+  label: string
+  description: string
+  efforts: string[]
+}
+
+export interface ModelState {
+  status: string | null
+  last_error: string | null
+  verified_at: string | null
+}
+
+/** One provider's state, for one model. `status` combines the provider's
+ * own state (sign-in, usage limit, setup) with the model's (entitlement):
+ * ok | unprobed | not_entitled | auth_required | config_error |
+ * waiting_usage_exhausted. */
 export interface EngineStatus {
+  provider: Provider
   status: string
   model: string | null
   retry_in_seconds: number | null
+  /** The app's own estimate of its next automatic retry. */
+  next_retry_at: string | null
+  /** When the provider said the limit resets; null when it did not say. */
+  limit_resets_at: string | null
+  /** One usage limit, from the first hit until a call succeeds again. */
+  episode: string | null
   last_error: string | null
+  /** The last local sign-in check; null before the first. */
+  credentials: { present: boolean; problem: string | null; checked_at: string } | null
+  verified_at: string | null
+}
+
+export interface ProviderView extends EngineStatus {
+  catalog: ModelOption[] | null
+  catalog_error: string | null
+  models: Record<string, ModelState>
+  /** Claude only: the model the default selection settled on. */
+  auto_model?: string | null
+}
+
+export interface Selection {
+  provider: Provider
+  /** Null only for Claude's default (Fable 5 when the plan has it, else
+   * Opus 5). */
+  model: string | null
+}
+
+/** Both engines, as GET /api/engines answers: the one source App reads
+ * engine state from. */
+export interface EnginesView {
+  selection: Selection
+  providers: Record<Provider, ProviderView>
 }
 
 export interface LinkedInStatus {
@@ -184,9 +239,25 @@ export interface ProbeResult {
   engine?: EngineStatus
 }
 
+export interface SelectionResult extends ProbeResult {
+  selection: Selection
+}
+
 export const api = {
-  status: () =>
-    fetch('/api/status').then(toJson<{ app: string; engine: EngineStatus }>),
+  engines: () => fetch('/api/engines').then(toJson<EnginesView>),
+  /** Re-read a provider's model list. No prompt is spent. */
+  refreshCatalog: (provider: Provider) =>
+    fetch(`/api/engines/${provider}/catalog`, { method: 'POST' }).then(
+      toJson<EnginesView>,
+    ),
+  /** The one model for every task. A model not yet proven on this plan
+   * is checked before this answers. */
+  selectEngine: (provider: Provider, model: string | null) =>
+    fetch('/api/engine/selection', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider, model }),
+    }).then(toJson<SelectionResult>),
   getSettings: () => fetch('/api/settings').then(toJson<Settings>),
   putSettings: (resumePageLimit: number) =>
     fetch('/api/settings', {

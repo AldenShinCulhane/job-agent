@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from './api'
-import type { EngineStatus, LinkedInStatus } from './api'
-import { engineBadge } from './engineStatus'
+import type { EnginesView, LinkedInStatus } from './api'
+import { engineBadge, modelLabel, selectedEngine } from './engineStatus'
+import { useFocusLanding } from './focus'
+import { episodeShown, markEpisodeShown } from './shownEpisodes'
 import { chip } from './styles'
 import { usePreference } from './theme'
 import { useEpochEffect, useEventStream } from './useEventStream'
@@ -23,9 +25,18 @@ type TabId = (typeof TABS)[number]['id']
 const STATUS_POLL_MS = 20_000
 
 export default function App() {
-  const [engine, setEngine] = useState<EngineStatus | null>(null)
+  // All engine state — the selection, both engines, their model lists —
+  // is read here and only here; Settings and the banners are handed it.
+  const [engines, setEngines] = useState<EnginesView | null>(null)
+  const engine = engines ? selectedEngine(engines) : null
   const [linkedin, setLinkedin] = useState<LinkedInStatus | null>(null)
   const [tab, setTab] = useState<TabId>('profile')
+  // Whether the page on screen has work the user would lose if it went
+  // away: unsaved edits, or an action of theirs still in flight. Reported
+  // by the pages themselves.
+  const [hold, setHold] = useState(false)
+  const engineHeadingRef = useRef<HTMLHeadingElement | null>(null)
+  const land = useFocusLanding()
   // The theme preference lives here, not in Settings, because it has to
   // outlive Settings: the listener that follows other tabs must be up
   // while any tab is showing, and with storage blocked this state is the
@@ -42,11 +53,7 @@ export default function App() {
 
   const loadEngine = useCallback(
     (options?: ReadOptions) =>
-      readStatus(
-        () => api.status(),
-        (s) => setEngine(s.engine),
-        options,
-      ).catch(() => setEngine(null)),
+      readStatus(() => api.engines(), setEngines, options).catch(() => setEngines(null)),
     [readStatus],
   )
   const loadLinkedin = useCallback(
@@ -85,7 +92,24 @@ export default function App() {
     return () => clearInterval(timer)
   }, [connected, counting, unknown, loadEngine, loadLinkedin])
 
-  const badge = engine ? engineBadge(engine.status) : null
+  // A usage limit opens the engine picker, once per limit: the way to
+  // keep working now is another provider's model, while queued work still
+  // resumes on its own when the limit lifts. Never over work in progress —
+  // switching tabs would throw away unsaved edits or an answer still on
+  // its way — so then the banner, which says the same, is the way there.
+  const openEngine = useCallback(() => {
+    setTab('settings')
+    land(engineHeadingRef)
+  }, [land])
+  const episode = engine?.status === 'waiting_usage_exhausted' ? engine.episode : null
+  useEffect(() => {
+    if (!episode || episodeShown(episode)) return
+    markEpisodeShown(episode)
+    if (tab !== 'settings' && !hold) openEngine()
+  }, [episode, tab, hold, openEngine])
+
+  const badge = engine ? engineBadge(engine) : null
+  const model = engine ? modelLabel(engines, engine.provider, engine.model) : null
 
   return (
     <div className="min-h-screen bg-bg text-ink">
@@ -102,14 +126,14 @@ export default function App() {
             title={engine?.last_error ?? undefined}
           >
             {badge.label}
-            {engine?.model ? ` · ${engine.model}` : ''}
+            {model ? ` · ${model}` : ''}
           </span>
         )}
       </header>
       <RecoveryBanners
-        engine={engine}
+        engines={engines}
         linkedin={linkedin}
-        onOpenSettings={() => setTab('settings')}
+        onOpenEngine={openEngine}
         onOpenSearch={() => setTab('search')}
       />
       <nav className="border-b border-line bg-surface px-4 sm:px-8">
@@ -131,13 +155,18 @@ export default function App() {
       </nav>
       <main className="mx-auto max-w-7xl p-4 sm:p-8">
         {tab === 'profile' ? (
-          <Onboarding profileEpoch={epochs.profile} />
+          <Onboarding
+            profileEpoch={epochs.profile}
+            engineProvider={engine?.provider ?? null}
+            onHold={setHold}
+          />
         ) : tab === 'search' ? (
-          <Search epochs={epochs} connected={connected} />
+          <Search epochs={epochs} connected={connected} onHold={setHold} />
         ) : (
           <Settings
-            engine={engine}
+            engines={engines}
             refreshEngine={loadEngine}
+            headingRef={engineHeadingRef}
             appearance={appearance}
             setAppearance={setAppearance}
           />

@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { api } from '../api'
-import type { Education, Experience, Profile, ProfilePayload, Project, SkillGroup } from '../api'
+import type {
+  Education,
+  Experience,
+  Profile,
+  ProfilePayload,
+  Project,
+  Provider,
+  SkillGroup,
+} from '../api'
+import { PROVIDER_NAME, PROVIDER_VENDOR } from '../engineStatus'
 import { useEpochEffect } from '../useEventStream'
 import { editAt } from '../entries'
 import { useFocusLanding } from '../focus'
@@ -161,13 +170,27 @@ function ResumePicker({
   )
 }
 
-export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
+export default function Onboarding({
+  profileEpoch,
+  engineProvider,
+  onHold,
+}: {
+  profileEpoch: number
+  /** The engine that will read the resume; null while unknown. */
+  engineProvider: Provider | null
+  /** Told whether this page has work the user would lose if it went away. */
+  onHold: (hold: boolean) => void
+}) {
   const [payload, setPayload] = useState<ProfilePayload | null>(null)
   const [draft, setDraft] = useState<Profile | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [dirty, setDirty] = useState(false)
   const [replacing, setReplacing] = useState(false)
+  const held = dirty || busy !== null || replacing
+  useEffect(() => onHold(held), [held, onHold])
+  useEffect(() => () => onHold(false), [onHold])
+  const engineName = engineProvider ? PROVIDER_NAME[engineProvider] : 'the AI engine'
   // Bumped by every local change to the editor: a keystroke, or the start
   // of an action. A refetch is only safe to apply if none of those landed
   // while it was in flight — checking `dirty` before the request is not
@@ -275,7 +298,7 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
 
   const upload = useCallback(async (file: File) => {
     localSeq.current += 1
-    setBusy('Extracting your resume with Claude — this takes a minute…')
+    setBusy(`Extracting your resume with ${engineName} — this takes a minute…`)
     setError(null)
     try {
       const p = await api.uploadResume(file)
@@ -289,7 +312,7 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
     } finally {
       setBusy(null)
     }
-  }, [land])
+  }, [land, engineName])
 
   const save = useCallback(async () => {
     if (!draft) return
@@ -364,7 +387,11 @@ export default function Onboarding({ profileEpoch }: { profileEpoch: number }) {
         <h2 className="mb-2 text-lg font-semibold">Upload your resume</h2>
         <p className="mb-6 text-sm text-ink-3">
           PDF or DOCX. It will be re-rendered into a clean, ATS-friendly template that you can
-          correct and confirm. Content is sent to Claude for extraction.
+          correct and confirm. Its content is sent to{' '}
+          {engineProvider
+            ? `${PROVIDER_VENDOR[engineProvider]} (${PROVIDER_NAME[engineProvider]})`
+            : 'the AI engine you chose in Settings'}{' '}
+          for extraction.
         </p>
         <ResumePicker label="Choose file" busy={busy} onPick={upload} />
         {error && <p className="mt-4 text-sm text-danger-fg">{error}</p>}

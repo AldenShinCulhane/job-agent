@@ -14,8 +14,8 @@ from pathlib import Path
 import pytest
 
 from backend.tests.ui_harness import (
-    MEASURE_JS, PLACEHOLDER_JS, luminance_of_css_rgb, resolved_token,
-    route_fixtures,
+    MEASURE_JS, PLACEHOLDER_JS, engines_view, luminance_of_css_rgb,
+    resolved_token, route_fixtures,
 )
 
 AA_TEXT = 4.5
@@ -157,11 +157,10 @@ def test_unknown_statuses_get_the_neutral_chip(browser, dist_url):
             if m.type == "error" else None)
     page.on("pageerror", lambda e: console_errors.append(str(e)))
     route_fixtures(page)
-    page.route("**/api/status", lambda route: route.fulfill(
+    page.route("**/api/engines", lambda route: route.fulfill(
         status=200, content_type="application/json",
-        body=json.dumps({"app": "job-agent", "engine": {
-            "status": "rebooting", "model": None,
-            "retry_in_seconds": None, "last_error": None}})))
+        body=json.dumps(engines_view(claude={"status": "rebooting",
+                                             "last_error": None}))))
     page.route("**/api/linkedin/status", lambda route: route.fulfill(
         status=200, content_type="application/json",
         body=json.dumps({"state": "rate_limited", "detail": None})))

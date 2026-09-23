@@ -12,13 +12,15 @@ import json
 
 import pytest
 
-from backend.tests.ui_harness import API_FIXTURES, Response, _package, route_fixtures
+from backend.tests.ui_harness import (
+    API_FIXTURES, SIGNED_IN, Response, _package, engines_view, route_fixtures,
+)
 
 # What one event on each topic refetches while the Search page is mounted.
 # App owns engine and linkedin; Search re-reads linkedin for its own card,
 # and profile changes what scores /api/jobs can show.
 FANOUT_SEARCH = {
-    "engine": ["/api/status"],
+    "engine": ["/api/engines"],
     "linkedin": ["/api/linkedin/status", "/api/linkedin/status"],
     "search": ["/api/jobs", "/api/search/latest"],
     "scoring": ["/api/jobs"],
@@ -26,7 +28,7 @@ FANOUT_SEARCH = {
     "profile": ["/api/jobs", "/api/profile"],
 }
 FANOUT_PROFILE = {
-    "engine": ["/api/status"],
+    "engine": ["/api/engines"],
     "linkedin": ["/api/linkedin/status"],
     "search": [],
     "scoring": [],
@@ -202,24 +204,24 @@ def test_disconnected_polling_reconciles_on_its_own_intervals(live, events):
     assert p.paths() == [], "nothing is due before 20 s"
     p.page.clock.run_for(2_000)  # 21 s: App's status poll
     p.drain()
-    assert p.paths() == ["/api/linkedin/status", "/api/status"]
+    assert p.paths() == ["/api/engines", "/api/linkedin/status"]
     p.page.clock.run_for(10_000)  # 31 s: Search's own reconciliation
     p.drain()
-    assert p.paths() == ["/api/jobs", "/api/linkedin/status", "/api/linkedin/status",
-                         "/api/packages", "/api/search/latest", "/api/status"]
+    assert p.paths() == ["/api/engines", "/api/jobs", "/api/linkedin/status",
+                         "/api/linkedin/status", "/api/packages", "/api/search/latest"]
 
 
 def test_the_usage_countdown_polls_even_while_connected(live, events):
-    waiting = {**IDLE, "/api/status": {"app": "job-agent", "engine": {
+    waiting = {**IDLE, "/api/engines": engines_view(claude={
         "status": "waiting_usage_exhausted", "model": "claude-sample",
-        "retry_in_seconds": 600, "last_error": None}}}
+        "retry_in_seconds": 600, "last_error": None, "credentials": SIGNED_IN})}
     p = live(tab="Search", fixtures=waiting,
-             ready=("text=Waiting — usage limit reached",),
+             ready=("text=Claude usage limit reached",),
              status_ready="text=usage limit")
     p.reset()
     p.page.clock.run_for(20_500)
     p.drain()
-    assert p.paths() == ["/api/linkedin/status", "/api/status"]
+    assert p.paths() == ["/api/engines", "/api/linkedin/status"]
 
 
 def test_a_failed_event_read_retries_without_another_event(live, events):
@@ -306,9 +308,9 @@ def test_first_open_and_visibility_return_refetch_everything(live, events):
     p = live(tab="Profile", ready=("text=Your profile",))
     # The constructor did not reset the log: what is there is the initial
     # fetch plus the first-open round for each consumer.
-    assert p.paths() == ["/api/linkedin/status", "/api/linkedin/status",
-                         "/api/profile", "/api/profile",
-                         "/api/status", "/api/status"]
+    assert p.paths() == ["/api/engines", "/api/engines",
+                         "/api/linkedin/status", "/api/linkedin/status",
+                         "/api/profile", "/api/profile"]
     p.reset()
     p.page.evaluate("""() => {
       Object.defineProperty(document, 'visibilityState', { get: () => 'visible', configurable: true })
@@ -316,7 +318,7 @@ def test_first_open_and_visibility_return_refetch_everything(live, events):
     }""")
     p.page.clock.run_for(250)
     p.drain()
-    assert p.paths() == ["/api/linkedin/status", "/api/profile", "/api/status"]
+    assert p.paths() == ["/api/engines", "/api/linkedin/status", "/api/profile"]
 
 
 def test_a_superseded_poll_answer_never_lands(live, events):
