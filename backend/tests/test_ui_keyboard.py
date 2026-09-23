@@ -200,7 +200,9 @@ def test_discard_by_keyboard_only(browser, dist_url):
 
 def test_appearance_by_keyboard_only(browser, dist_url):
     context, page, table = _open(browser, dist_url)
-    _go_to_tab(page, "Settings", "text=Appearance")
+    # Wait for the settings read: the sections above Appearance grow when
+    # it lands, and a stop measured before that can be pushed off-screen.
+    _go_to_tab(page, "Settings", "#page-limit")
     _assert_stop(_tab_to(page, "System"))  # the checked radio takes the stop
     # The arrow moves focus and checks the next radio natively; React then
     # re-renders the controlled group. Wait for both to have happened.
