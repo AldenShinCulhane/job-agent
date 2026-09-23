@@ -30,7 +30,7 @@ The app stops at PDFs. The user clicks Apply on LinkedIn themselves. (Easy Apply
 
   No score confirmation, no trim approval, no per-document review, no model-choice prompt.
 - **Generalized.** No assumptions about who the user is. Profile comes entirely from the uploaded resume + a small settings form. Clear README, one-command setup, sensible defaults.
-- **Subscription-only LLM.** No API keys, no per-token billing. The engine is the user's **Claude subscription** via the Claude Agent SDK, or (rev 6) their **ChatGPT subscription via the Codex CLI** when they pick a Codex model in Settings. Usage is subject to the user's plan limits — the app handles allowance exhaustion as a durable wait/retry state, never as a prompt or an API-key fallback. When a limit is hit, the app shows the engine picker with that limit and its reset time, so the user can switch models to keep going; if they don't, work resumes on its own at the reset. The app never switches engines by itself.
+- **Subscription-only LLM.** No API keys, no per-token billing. The engine is the user's **Claude subscription** via the Claude Agent SDK, or (rev 6) their **ChatGPT subscription via the Codex CLI** when they pick a Codex model in Settings. Usage is subject to the user's plan limits — the app handles allowance exhaustion as a durable wait/retry state, never as a prompt or an API-key fallback. When a limit is hit, the app shows the engine picker with that limit, and its reset time when the provider reports one, so the user can switch models to keep going; if they don't, work resumes on its own at the reset. The app never switches engines by itself.
 
 ---
 
@@ -141,7 +141,8 @@ job-agent/
 Optional second engine on the user's ChatGPT subscription, through the
 Codex CLI's non-interactive `codex exec`. Everything in §4.1 about
 single-turn calls, JSON-only output, effort tiers, typed failure routing,
-the durable usage wait and provenance applies unchanged. What differs:
+the durable usage wait and provenance applies to both engines. What
+differs, or is tightened for both, follows:
 
 - **Auth and isolation.** A dedicated `CODEX_HOME` inside `.data/`
   (0700) with its own ChatGPT login, never the user's global Codex home:
@@ -152,17 +153,35 @@ the durable usage wait and provenance applies unchanged. What differs:
   non-claude.ai auth.
 - **Tool lockdown.** Codex is an agent with shell, patch, web and image
   tools, and job postings are untrusted text, so this is the security
-  boundary. Every tool-bearing feature is disabled, web search is
-  disabled, and the model runs from a custom catalog entry that drops the
-  patch tool, the skills list and Codex's own system prompt in favour of
-  the app's. The prompt carries no environment context. Before first use
-  of a Codex version, the app points `codex exec` at a localhost-only
-  capture endpoint and asserts the exact request it would send: the
-  app's instructions, the user message only, and exactly one tool,
-  `request_user_input`, which has no file or network access and which
-  exec mode rejects. Anything else fails closed as `config_error`. At run
-  time, any item in the `--json` event stream other than the answer and
-  reasoning is a lockdown breach, as a real tool call is in §4.1.
+  boundary. **The guarantee is: no executable or side-effect-capable
+  tool is ever offered to the model.** The one exception is
+  `request_user_input`, which has no file, process or network access and
+  which exec mode rejects. Every tool-bearing feature is disabled, web
+  search is disabled, and the model runs from a custom catalog entry that
+  drops the patch tool, the skills list and Codex's own system prompt in
+  favour of the app's. The prompt carries no environment context.
+  - *Prevention is the verified tool surface; detection is only a
+    backstop.* A tool item seen in the event stream may already have run,
+    so the run-time check never stands in for the pre-use verification.
+  - *Pre-use verification.* One launch builder produces every Codex
+    invocation, production and verification alike. Before a Codex
+    configuration is used, the app runs that builder against a
+    localhost-only capture endpoint and asserts the exact request it
+    would send: the app's instructions, the user message only, and
+    exactly the one allowed tool. A pass is bound to a fingerprint of the
+    resolved executable (path and content hash), the effective launch
+    arguments, the catalog entry and model metadata, and the environment
+    allowlist. Any change to any of them requires a new pass. Anything
+    unexpected fails closed as `config_error`, and Claude stays usable.
+  - *Defence in depth at run time.* Read-only sandbox without network, an
+    empty isolated working directory per call, ephemeral sessions, stdin
+    closed, and a bounded wall-clock timeout that kills the process tree.
+  - *Event classification.* Thread and turn lifecycle events, reasoning
+    items and the answer item are normal. Turn failures and error events
+    are routed by type (auth, quota, not-entitled, transient, config) as
+    in §4.1, never as a breach. Any command, file-change, MCP, web-search
+    or other tool item is a lockdown breach: the process is killed, the
+    call fails as `config_error`, and nothing from it is used.
 - **Structured output.** `--output-schema` with the task's schema,
   validated again app-side. Schemas must satisfy OpenAI's strict rules.
 - **Effort.** The §4.1 tiers map onto the chosen model's supported
@@ -170,10 +189,40 @@ the durable usage wait and provenance applies unchanged. What differs:
   Codex's delegating `ultra` level is never used.
 - **One model, user-chosen.** Settings lists each engine's models (the
   Claude SDK's model list and `codex debug models`, visible entries only)
-  plus a checked custom ID. The choice applies to every task. A package
-  in progress continues from its last checkpoint on the model selected
-  when it resumes, and provenance records the engine and model for each
-  stage.
+  plus a checked custom ID. The choice applies to every task. The
+  fable→opus fallback of §4.1 applies only to the default, unchosen
+  selection: a model the user chose explicitly never falls back silently,
+  it reports not-entitled on that selection.
+- **Execution identity is frozen before dispatch.** Every call captures
+  an immutable context before it is sent: provider, model, effective
+  effort, and the lockdown fingerprint for Codex. The result comes back
+  with that context, and ledger entries, provenance, health updates and
+  retry handling are written from it, never from the current global
+  selection. A completion from a provider the user has since moved away
+  from cannot change the new provider's badge, clear its wait, or be
+  attributed to it.
+- **Changing the selection mid-work.** Completed checkpoints are kept.
+  Requests not yet sent use the new selection; requests already
+  dispatched keep their original context and provenance. Switching never
+  resets a package's repair allowance and never rebuilds cached results.
+- **Auth freshness, both engines.** A backend monitor checks each
+  engine's local credentials on a bounded, coalesced schedule that does
+  not depend on any browser tab polling, and publishes an `engine`
+  invalidation on change. A cheap pre-dispatch check runs before each
+  call. `/api/status` only reads cached monitor state and stays
+  responsive. Two facts are kept apart: credentials present locally, and
+  service access last verified by a successful call. Healthy local
+  credentials never clear a quota or configuration failure.
+- **Usage limits: reset time versus retry estimate.** `next_retry_at` is
+  the app's own backoff estimate. `limit_resets_at` is stored only when
+  the provider reports it, and the UI says "unknown" otherwise. Limits
+  are tracked per provider as account-wide; switching models within the
+  same provider does not clear them. Each limit is one quota episode: the
+  engine picker opens once per episode, never on countdown ticks or on
+  concurrent failures from the same episode. It does not open over an
+  editor that is dirty or busy, upload and save included; a banner links
+  to it instead. Auto-resume still happens without the user visiting the
+  picker.
 
 ### 4.2 Resume ingestion (`backend/resume/`)
 
@@ -237,6 +286,25 @@ generate structured resume + cover (JSON) → validate both → fit both
 4. **Final compile + hard assertions:** resume ≤ N pages AND cover letter == 1 page AND truth validation passed after the last rewrite. Any assertion failing → package **failed** — never delivered oversized or unvalidated.
 5. **Atomic publish:** artifacts written to a temp dir, then moved into `output/<company>_<jobid>/` (`resume.pdf`, `cover_letter.pdf`, `job.md` with pinned posting snapshot + link + score reasons) in one step; the package is marked `done` only after publish. Packages page lists them with preview + download + posting link. Failures are isolated — one failed package never blocks the batch.
 
+### 4.5a Package attempts (rev 6)
+
+- Package identity gains `attempt`. Existing rows become attempt 1 in
+  one atomic migration, with IDs and download paths unchanged.
+- Normal Generate stays idempotent: re-selecting a job returns its latest
+  attempt for the same inputs.
+- **Try again** on a failed package and **Regenerate** on a done one are
+  explicit user actions, never automatic. Each creates a fresh row with
+  its own stage state, validation cache and two-round repair ledger, on
+  the current model selection. Old rows and their artifacts are
+  immutable.
+- Retry submissions are idempotent server-side: the client sends a
+  request key that is stored unique, so repeated or concurrent
+  submissions of one click create exactly one attempt. `MAX(attempt)+1`
+  alone is not enough.
+- If the profile, posting or templates have changed since the original,
+  the new row is a package for the current inputs, labelled as such, and
+  never presented as another attempt of the old identity.
+
 ### 4.6 Durability (`backend/core/db.py`)
 
 - **Generation state machine, persisted per package:** `queued → generating → validating → fitting (with revalidation) → asserting → publishing → done | failed | waiting(usage_exhausted)`. Every transition written to SQLite.
@@ -276,6 +344,39 @@ Each milestone independently runnable/testable; no milestone requires user decis
 - **M3 — Normalization, scoring + job UI.** Criteria: normalization cached by JD hash (hash change invalidates the dependent cascade); deterministic scores reproducible run-to-run; **scoring quality asserted against a small labeled fixture set** — exact skill match, skill aliases, false substring matches (e.g. "Java" vs "JavaScript"), YoE boundary cases, missing requirements, education matching — with expected ordering and filter behavior; `deterministic_score` stored separately from optional `llm_rerank`, baseline never overwritten; LLM explanations on demand; scored list renders < 2 s from cache; sort/filter/select work.
 - **M4 — Tailoring pipeline.** Criteria: 5 selected jobs → 5 complete packages unattended; **restart-mid-batch test** — kill the app mid-generation, restart, batch completes with no duplicated work; 20-job stress batch asserts **truth validation passes, resume ≤ N, cover == 1, and failure isolation** (an induced failure affects only its package). Max-effort escalation evaluated here (kept only if it measurably helps).
 - **M5 — Polish & generalization.** Criteria: onboarding UX; recovery banners (login expired, captcha stop, usage exhausted, claude not authenticated, invalid upload); settings page; README + screenshots; fresh-clone test with no hidden host state on both platforms — a clean *environment* on macOS (empty HOME, system-only PATH, no Homebrew) and a clean *container* on Linux (`ubuntu:24.04`). Both runs fetch uv, its managed Python, Node, the npm packages, Playwright's Chromium and Tectonic from upstream, then build, boot via the documented entrypoint, answer `/api/*`, launch Chromium, and run the backend test suite in that environment. **Rev 5 (owner-approved, 2026-08-21):** this criterion originally read "fresh-clone test on a clean machine (macOS and Linux)". Both runs are retained in `docs/ci-logs/`. Two limits are deliberate and must not be overstated: (a) pristine-hardware and ephemeral-runner testing are out of scope for a local personal tool — the macOS runs share the host's kernel, system frameworks and Xcode command line tools, and no pristine-image claim is made anywhere; (b) the OCR stack (Tesseract, OCRmyPDF, Ghostscript) is **not** installed in the macOS clean-environment run — it ships no official standalone macOS binary and is only needed for scanned image-only resumes — so that run is evidence about setup, boot and PDF generation, not about the OCR fallback path. WSL documented.
+
+### v4 milestones (rev 6)
+
+Each slice is reviewed on its own before the next starts.
+
+- **P6a — Engine isolation, selection and health.** Criteria: provider
+  interface with Claude and Codex adapters; the §4.1a launch builder,
+  pre-use verification and fingerprint; adversarial mocked-response
+  tests in which the model attempts shell, patch and
+  `request_user_input` calls, each proving the call is rejected, nothing
+  runs, no file changes, and the run ends without an interactive or
+  unbounded loop; event classification tests covering lifecycle,
+  reasoning, answer, typed errors and breaches; frozen execution context
+  with the acceptance case "a request to model A is pending, the user
+  selects B, then A succeeds or fails: its provenance stays A, and it
+  changes neither B's badge nor B's wait"; explicitly chosen unavailable
+  models do not fall back; the auth monitor works with every tab idle and
+  the stream connected; `next_retry_at` and `limit_resets_at` are stored
+  and shown separately; the picker opens once per quota episode and
+  never over a dirty or busy editor; settings UI with both model lists
+  and the custom ID; live smoke on each engine.
+- **P6b — Package attempts.** Criteria: the §4.5a migration with a
+  failure-injection rollback test, preserved IDs and downloads, duplicate
+  and concurrent retry POSTs creating one attempt, a restart immediately
+  after attempt creation, superseded inputs labelled as a new package,
+  and Generate still idempotent.
+- **P7 — UX batch one.** Criteria as proposed, plus: a fixture assertion
+  that formatting-only description changes keep the existing canonical
+  description hash, and untrusted descriptions rendered as text or
+  sanitized markup, never raw HTML.
+- **P8 — separate design pass before any code.** Duplicate grouping must
+  keep original posting IDs, package references and application history.
+  P6b's migration does not constrain P8's schema.
 
 ---
 
