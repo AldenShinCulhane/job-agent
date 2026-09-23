@@ -18,10 +18,13 @@ output/     generated packages (gitignored)
 
 ## Hard rules
 
-- **LLM = Claude Agent SDK on subscription auth. Never add API keys or
-  alternate providers.** All calls go through `backend/core/llm.py`:
-  single-turn, `tools=[]` lockdown, JSON-schema output only. The LLM never
-  emits raw LaTeX; app code renders all LaTeX from templates.
+- **LLM = the user's own subscription, never an API key: Claude (Claude
+  Agent SDK, claude.ai login) or Codex (Codex CLI, ChatGPT login).** The
+  user picks one model for every task in Settings; the app never switches
+  engines by itself. Never add API keys, per-token billing, or any other
+  provider. All calls go through `backend/core/llm.py`: single-turn,
+  zero-tool lockdown, JSON-schema output only (PLAN.md §4.1, §4.1a). The
+  LLM never emits raw LaTeX; app code renders all LaTeX from templates.
 - **Exactly three human gates** (resume confirm, LinkedIn auth, job
   selection). Never add approval prompts; failures are `waiting` or
   `user_intervention_required` states.

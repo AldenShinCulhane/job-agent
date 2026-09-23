@@ -2,7 +2,8 @@
 
 **Status:** Approved for M0 (working spec, rev 4 — final planning revision;
 rev 5 amends one M5 acceptance criterion only, owner-approved 2026-08-21 —
-see M5 in §6)
+see M5 in §6; rev 6 adds a second, user-chosen subscription engine, Codex
+on the user's ChatGPT plan, owner-approved 2026-09-22 — see §4.1a)
 **Branch:** `v2-linkedin-webapp`
 **Goal:** Fundamentally rework job-agent from a hiring.cafe CLI pipeline into a generalized, cloneable web app: anyone uploads their resume, searches LinkedIn jobs, sees them scored in a nice UI, selects the ones they want, and gets tailored LaTeX-typeset resume + cover letter PDFs.
 
@@ -29,7 +30,7 @@ The app stops at PDFs. The user clicks Apply on LinkedIn themselves. (Easy Apply
 
   No score confirmation, no trim approval, no per-document review, no model-choice prompt.
 - **Generalized.** No assumptions about who the user is. Profile comes entirely from the uploaded resume + a small settings form. Clear README, one-command setup, sensible defaults.
-- **Subscription-only LLM.** No API keys, no per-token billing. The engine is the user's **Claude subscription** via the Claude Agent SDK. Usage is subject to the user's plan limits — the app handles allowance exhaustion as a durable wait/retry state, never as a prompt or an API-key fallback.
+- **Subscription-only LLM.** No API keys, no per-token billing. The engine is the user's **Claude subscription** via the Claude Agent SDK, or (rev 6) their **ChatGPT subscription via the Codex CLI** when they pick a Codex model in Settings. Usage is subject to the user's plan limits — the app handles allowance exhaustion as a durable wait/retry state, never as a prompt or an API-key fallback. When a limit is hit, the app shows the engine picker with that limit and its reset time, so the user can switch models to keep going; if they don't, work resumes on its own at the reset. The app never switches engines by itself.
 
 ---
 
@@ -40,11 +41,11 @@ The app stops at PDFs. The user clicks Apply on LinkedIn themselves. (Easy Apply
 | UI stack | **FastAPI backend + React (Vite) frontend** | Nice-looking, full control over job cards/selection/progress. One command starts both. |
 | Job source | **LinkedIn, via Playwright + user's own login**, behind a `JobSource` interface | LinkedIn is where the user applies. **Risk is stated honestly:** LinkedIn's User Agreement prohibits scraping and automated access. Human pacing and the user's own session reduce *load and detection surface*, not ToS exposure. Account restriction is an **accepted product limitation** — documented in README, stop-cleanly-on-captcha, never any bypass attempt. The thin `JobSource` interface keeps the provider swappable if LinkedIn becomes untenable. |
 | Resume ingestion | **Re-render into our LaTeX template** | Upload PDF/DOCX → structured extraction → rendered in the `resume_subheading2`-style template. Consistent spacing control makes page-limit enforcement reliable. Original visual design is not preserved (documented clearly). OCR fallback for scanned PDFs. |
-| LLM engine | **Claude Agent SDK (Python), subscription auth** — no API keys | The SDK bundles the Claude Code CLI, so a separate `claude` install is not required in the default path; setup only has to verify *authentication* (and offer login instructions if absent). All previous multi-provider/API-key code is removed. |
-| Model | **`claude-fable-5` if available on the user's plan, else `claude-opus-5`** | Probe at startup with a tiny request; cache the result; re-probe from settings. |
+| LLM engine | **Claude Agent SDK (Python), subscription auth** — no API keys. **Rev 6:** or the **Codex CLI on the user's ChatGPT subscription**, when the user chooses a Codex model (§4.1a) | The SDK bundles the Claude Code CLI, so a separate `claude` install is not required in the default path; setup only has to verify *authentication* (and offer login instructions if absent). All previous multi-provider/API-key code is removed. Codex is optional, not bundled, and detected on `PATH`. |
+| Model | **Default: `claude-fable-5` if available on the user's plan, else `claude-opus-5`.** **Rev 6:** the user may instead choose any model either engine lists; one model runs every task | Probe at startup with a tiny request; cache the result; re-probe from settings. A chosen model is probed the same way before it is used. |
 | Effort | **Tiered per task** (see §4.1) — medium for extraction/scoring, high for tailoring, xhigh for difficult repair, max only for final failed-layout repair | Blanket xhigh would burn subscription allowance and make 50-job runs slow for no quality gain on mechanical steps. |
 | Application submission | **Stop at PDFs** | Lower account risk; wrong auto-submission is unrecoverable. |
-| Legacy pipeline | **Dropped** (hiring.cafe scraper, CLI menu, ReAct agent, multi-provider `llm_client`) | Single product surface. v1's deterministic scorer and LaTeX build code are **ported** (see §5); v1's page-shrink logic is **rewritten**, not ported. |
+| Legacy pipeline | **Dropped** (hiring.cafe scraper, CLI menu, ReAct agent, multi-provider `llm_client`; its automatic provider failover stays dropped under rev 6) | Single product surface. v1's deterministic scorer and LaTeX build code are **ported** (see §5); v1's page-shrink logic is **rewritten**, not ported. |
 | LaTeX toolchain | **Tectonic preferred, `pdflatex` fallback** | Tectonic is a single binary that auto-fetches packages — easiest install story. Engine actually used is **recorded per artifact** (Tectonic and pdfLaTeX can paginate differently). |
 | Platforms | **macOS + Linux natively; Windows via WSL** (documented) | `setup.sh` targets POSIX; README states WSL path for Windows. |
 | Data store | **SQLite** (single file in `.data/`) | Jobs, normalized requirements, scores, generation state machine, artifact provenance. Zero-config, survives restarts, trivially inspectable. |
@@ -134,6 +135,45 @@ job-agent/
 - **Tool lockdown (explicit implementation criteria):** the SDK exposes the full Claude Code toolset by default, and `allowed_tools=[]` alone may not remove tools. The wrapper must: explicitly **disable Read/Write/Edit/Bash/Web tools** (disallowed-tools / permission configuration per current SDK docs), run **single-turn**, **JSON structured output only**. **The LLM never emits raw LaTeX.** All outputs are schema-validated JSON (tailored bullets, cover paragraphs, layout preferences); application code escapes content and renders every LaTeX document from templates. Our code does all file I/O. Verify the exact option surface against the Agent SDK README at M0; treat "model produced a tool call" as a bug.
 - **Allowance handling:** subscription usage is subject to plan limits. On limit/quota errors the engine enters a **durable `usage_exhausted → waiting → retry` state** persisted in SQLite: queue pauses, UI banner shows wait state, automatic retry with backoff resumes work. No API-key fallback, no user decision.
 - **Concurrency:** only LinkedIn *browser* actions are serialized (the supervisor queue). Generation has no LinkedIn constraint — LLM calls run with bounded concurrency (small worker pool) plus retry/backoff on transient failures.
+
+### 4.1a Codex engine (rev 6, owner-approved 2026-09-22)
+
+Optional second engine on the user's ChatGPT subscription, through the
+Codex CLI's non-interactive `codex exec`. Everything in §4.1 about
+single-turn calls, JSON-only output, effort tiers, typed failure routing,
+the durable usage wait and provenance applies unchanged. What differs:
+
+- **Auth and isolation.** A dedicated `CODEX_HOME` inside `.data/`
+  (0700) with its own ChatGPT login, never the user's global Codex home:
+  the global one injects the user's AGENTS.md and memories into every
+  prompt (verified 2026-09-22). `forced_login_method="chatgpt"`, and the
+  spawn environment is scrubbed of `OPENAI_*` and `CODEX_*` except the
+  app's own `CODEX_HOME`. API-key login is rejected like §4.1's
+  non-claude.ai auth.
+- **Tool lockdown.** Codex is an agent with shell, patch, web and image
+  tools, and job postings are untrusted text, so this is the security
+  boundary. Every tool-bearing feature is disabled, web search is
+  disabled, and the model runs from a custom catalog entry that drops the
+  patch tool, the skills list and Codex's own system prompt in favour of
+  the app's. The prompt carries no environment context. Before first use
+  of a Codex version, the app points `codex exec` at a localhost-only
+  capture endpoint and asserts the exact request it would send: the
+  app's instructions, the user message only, and exactly one tool,
+  `request_user_input`, which has no file or network access and which
+  exec mode rejects. Anything else fails closed as `config_error`. At run
+  time, any item in the `--json` event stream other than the answer and
+  reasoning is a lockdown breach, as a real tool call is in §4.1.
+- **Structured output.** `--output-schema` with the task's schema,
+  validated again app-side. Schemas must satisfy OpenAI's strict rules.
+- **Effort.** The §4.1 tiers map onto the chosen model's supported
+  reasoning levels, clamped; `max` stays disabled for both engines and
+  Codex's delegating `ultra` level is never used.
+- **One model, user-chosen.** Settings lists each engine's models (the
+  Claude SDK's model list and `codex debug models`, visible entries only)
+  plus a checked custom ID. The choice applies to every task. A package
+  in progress continues from its last checkpoint on the model selected
+  when it resumes, and provenance records the engine and model for each
+  stage.
 
 ### 4.2 Resume ingestion (`backend/resume/`)
 
@@ -246,6 +286,7 @@ Each milestone independently runnable/testable; no milestone requires user decis
 | LinkedIn ToS / account restriction | **Accepted limitation, not a mitigated problem.** Automated access violates the User Agreement; pacing/caps reduce load and detection surface only. Stop cleanly on captcha/restriction, never bypass, document plainly. `JobSource` interface keeps the provider swappable. |
 | LinkedIn DOM changes | Central selectors with fallbacks; fixture-based parser tests; per-job graceful skip. |
 | Fable not on user's plan | Automatic opus-5 fallback via probe; visible in settings. |
+| Codex CLI update changes its tools or flags (rev 6) | The pre-use request capture in §4.1a fails closed on any new tool, instruction or message, and the Codex engine reports `config_error` until the lockdown is re-verified. Claude stays available. |
 | Claude not authenticated / allowance exhausted | Setup card / durable waiting state with auto-retry. Never blocks on a user decision. |
 | LaTeX install friction | Tectonic single-binary default; pdflatex autodetect; engine recorded per artifact (pagination differs between engines); compile errors surfaced with log tail. |
 | Page-limit edge cases | Geometry-aware loop with readability floors + relevance-aware trimming + hard assertions; a package that can't meet N pages fails rather than ships oversized. |
