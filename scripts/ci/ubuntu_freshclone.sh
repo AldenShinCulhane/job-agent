@@ -9,6 +9,12 @@
 #   docker run --rm -v "$PWD":/src:ro -v "$PWD/scripts/ci":/scratch:ro \
 #     ubuntu:24.04 bash /scratch/ubuntu_freshclone.sh
 #
+# Everything the run writes inside the container goes with it under --rm.
+# To keep the full test log and the axe needs-review report (JSON, every
+# node), also mount a writable directory at /out, e.g.
+#   -v "$HOME/ci-out":/out
+# The console output carries the summary of both either way.
+#
 # Scope: the container is clean, the clone is fresh, and every dependency
 # below is fetched inside it. It is a LOCAL clone of the host checkout on
 # whatever architecture the container runs — not a remote clone, and not
@@ -102,13 +108,33 @@ echo "=== [9/9] full test suite, browser tests required in this container"
 # fails the session if none ran: a missing dist, Chromium or axe bundle
 # cannot pass quietly here. The one engine-dependent backend skip is
 # unaffected.
+PYTEST_STATUS=0
 UI_TESTS_REQUIRED=1 AXE_REPORT=/tmp/axe-needs-review.json \
-  uv run pytest backend/tests -q > /tmp/pytest.log 2>&1 || {
-  tail -40 /tmp/pytest.log; echo "FAIL: test suite did not pass in this container"; exit 1; }
+  uv run pytest backend/tests -q > /tmp/pytest.log 2>&1 || PYTEST_STATUS=$?
+# Kept before the verdict, so a failed run keeps its evidence too. A /out
+# that is mounted but cannot be written fails the run: a report the
+# reader was told to expect must not go missing quietly.
+if [ -d /out ]; then
+  RUN_ID="ubuntu-$(uname -m)-$(git rev-parse --short HEAD)"
+  for artifact in pytest.log axe-needs-review.json; do
+    if [ -f "/tmp/$artifact" ]; then
+      cp "/tmp/$artifact" "/out/$RUN_ID-$artifact" || {
+        echo "FAIL: could not write /out/$RUN_ID-$artifact"; exit 1; }
+      echo "kept: /out/$RUN_ID-$artifact"
+    else
+      echo "not written by this run, so not kept: $artifact"
+    fi
+  done
+else
+  echo "not kept: mount a writable directory at /out to keep the test log and axe report"
+fi
+if [ "$PYTEST_STATUS" -ne 0 ]; then
+  tail -40 /tmp/pytest.log; echo "FAIL: test suite did not pass in this container"; exit 1
+fi
 tail -3 /tmp/pytest.log
-# What axe could not decide, by rule and reason with sample selectors,
-# kept in the log and shown here; every node is in the JSON report.
-# "For review" means a reader of this run can review it.
+# What axe could not decide, by rule and reason with sample selectors.
+# Every node, with its state, selector and reason, is in the JSON report,
+# which outlives the container only through /out.
 sed -n '/= axe needs-review =/,$p' /tmp/pytest.log
 
 echo "=== UBUNTU FRESH-CLONE TEST PASS"

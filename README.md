@@ -193,6 +193,7 @@ cd frontend && npx tsc -b --noEmit      # type-check (strict, noUncheckedIndexed
 # -> Chromium launch -> full test suite with the browser tests required):
 docker run --rm -v "$PWD":/src:ro -v "$PWD/scripts/ci":/scratch:ro \
   ubuntu:24.04 bash /scratch/ubuntu_freshclone.sh
+# add -v "$HOME/ci-out":/out to keep its full test log and axe report
 ```
 
 The browser tests (`backend/tests/test_ui_*.py`) drive the built frontend
@@ -200,9 +201,12 @@ in Playwright's Chromium over synthetic API fixtures — no backend, no real
 data. They need `frontend/dist` (`cd frontend && npm run build`) and the
 Chromium that setup installs, and skip when either is missing. Set
 `UI_TESTS_REQUIRED=1` to make that a failure instead, and to fail the run
-if any browser test skipped or none ran; the Ubuntu script does. `npm
-test` needs Node 22.18 or newer, which strips TypeScript types itself; it
-does not type-check, `tsc` does.
+if any browser test skipped or none ran; the Ubuntu script does. The
+axe checks the tests could not decide are not failures; the run ends with
+a summary of them by rule and reason, and `AXE_REPORT=<path>` writes every
+one, with its state and selector, as JSON. `npm test` needs Node 22.18 or
+newer, which strips TypeScript types itself; it does not type-check, `tsc`
+does.
 
 `PLAN.md` is the working spec. Architecture in short: FastAPI backend
 (SQLite state, SSE progress), React + Vite + Tailwind frontend, Playwright
