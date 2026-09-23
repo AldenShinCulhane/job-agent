@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from backend.api import routes
 from backend.core import db
+from backend.tests.engine_fakes import engine_value, set_engine
 from backend.tailor import compile as latex
 from backend.tests.test_resume import SAMPLE_PROFILE
 
@@ -227,8 +228,7 @@ def test_status_polls_are_pure_and_cover_recovery_states(client, monkeypatch):
 
     # Engine-side banner states surface verbatim on /api/status.
     for status in ("auth_required", "config_error", "waiting_usage_exhausted"):
-        db.set_state("engine_status", status)
-        db.set_state("last_error", f"probe says {status}")
+        set_engine(status=status, last_error=f"probe says {status}")
         before = snapshot()
         for _ in range(3):  # a poll is repeatable with zero side effects
             body = client.get("/api/status").json()
@@ -239,11 +239,11 @@ def test_status_polls_are_pure_and_cover_recovery_states(client, monkeypatch):
     # The usage countdown derives from persisted retry_at — polling never
     # clears or rearms it.
     retry_at = (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat()
-    db.set_state("retry_at", retry_at)
+    set_engine(next_retry_at=retry_at)
     first = client.get("/api/status").json()["engine"]["retry_in_seconds"]
     second = client.get("/api/status").json()["engine"]["retry_in_seconds"]
     assert 0 < second <= first <= 120
-    assert db.get_state("retry_at") == retry_at
+    assert engine_value("next_retry_at") == retry_at
 
     # LinkedIn-side banner states surface verbatim on /api/linkedin/status.
     for state in ("captcha_stop", "logged_out"):

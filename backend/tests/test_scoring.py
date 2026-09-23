@@ -7,6 +7,7 @@ import asyncio
 import pytest
 
 from backend.core import db
+from backend.tests import engine_fakes
 from backend.scoring import score as scoring
 from backend.scoring.score import (
     education_score,
@@ -413,6 +414,29 @@ async def test_pipeline_stops_on_session_loss_and_isolates_failures(
     assert pipeline.pending_count(run_id) == 2  # p2 + p3 remain
 
 
+async def test_a_blocked_tool_call_fails_only_its_job(test_db, fake_source,
+                                                     monkeypatch):
+    """A posting that makes the model reach for a tool fails that job
+    alone: the engine refused the tool and is healthy, so the pass goes on
+    instead of stopping on an engine problem."""
+    from backend.core import llm
+    from backend.scoring import pipeline
+
+    _confirm_profile()
+    run_id = _seed_run(["p1", "p2", "p3"])
+
+    async def structured(prompt, schema, task, system_prompt=""):
+        if "Description for p2" in prompt:
+            raise llm.ToolCallBlocked("the model tried to call a tool")
+        return req(required_skills=["Python"])
+
+    monkeypatch.setattr(llm, "structured", structured)
+    summary = await pipeline.run_pipeline(run_id)
+    assert (summary["scored"], summary["failed"], summary["stopped"]) == (2, 1, None)
+    assert "job p2: ToolCallBlocked" in summary["detail"]
+    assert db.get_score("p1") and db.get_score("p3") and db.get_score("p2") is None
+
+
 async def test_pipeline_needs_confirmed_profile(test_db):
     from backend.scoring import pipeline
 
@@ -786,7 +810,7 @@ async def test_probe_with_pinned_model_does_not_clear_stall(test_db, monkeypatch
     from backend.api import routes
     from backend.core import llm
 
-    db.set_state("pinned_model", "claude-fable-5")
+    engine_fakes.pin("claude-fable-5")
     routes._set_scoring_stall("engine_blocked", "Not logged in", 1, 1)
     resumed = []
     monkeypatch.setattr(routes, "_maybe_resume_scoring",
@@ -1089,9 +1113,8 @@ async def test_probe_pinned_reports_cached_unhealthy_state(test_db):
     engine state says the engine is broken."""
     from backend.api import routes
 
-    db.set_state("pinned_model", "claude-fable-5")
-    db.set_state("engine_status", "auth_required")
-    db.set_state("last_error", "Not logged in")
+    engine_fakes.pin("claude-fable-5")
+    engine_fakes.set_engine(status="auth_required", last_error="Not logged in")
     result = await routes.probe_engine()
     assert result["ok"] is False
     assert result["verified"] is False

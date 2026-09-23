@@ -7,6 +7,7 @@ app keeps its own login in `.data/claude/` (see claude_env.py):
     uv run python -m backend.core.claude_cli auth status
 """
 
+import asyncio
 import json
 import os
 import subprocess
@@ -58,6 +59,43 @@ def subscription_problem() -> str | None:
             "subscription login — run: uv run python -m backend.core.claude_cli auth login"
         )
     return None
+
+
+MODELS_TIMEOUT_S = 60.0
+
+
+async def models() -> list[dict]:
+    """The models this Claude Code build offers, read from the SDK's
+    startup handshake: no prompt is sent. Each entry is {id, label,
+    description, efforts}; `efforts` is empty for a model that takes no
+    effort setting. The CLI's own "default" alias is left out — the app's
+    default is the fable -> opus probe, offered separately."""
+    harden_process_env()
+    from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+
+    options = ClaudeAgentOptions(tools=[], mcp_servers={}, strict_mcp_config=True,
+                                 setting_sources=[], permission_mode="dontAsk")
+
+    async def handshake() -> dict:
+        async with ClaudeSDKClient(options=options) as client:
+            return await client.get_server_info() or {}
+
+    info = await asyncio.wait_for(handshake(), MODELS_TIMEOUT_S)
+    catalog = []
+    for entry in info.get("models") or []:
+        value = entry.get("value") if isinstance(entry, dict) else None
+        if not isinstance(value, str) or not value or value == "default":
+            continue
+        levels = entry.get("supportedEffortLevels")
+        efforts = [lvl for lvl in levels if isinstance(lvl, str)] \
+            if entry.get("supportsEffort") and isinstance(levels, list) else []
+        catalog.append({
+            "id": value,
+            "label": str(entry.get("displayName") or value),
+            "description": str(entry.get("description") or ""),
+            "efforts": efforts,
+        })
+    return catalog
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ from claude_agent_sdk import (
 )
 
 from backend.core import claude_env, db, llm
+from backend.tests import engine_fakes
 
 
 # --- helpers ----------------------------------------------------------------
@@ -85,7 +86,8 @@ async def test_probe_fable_not_entitled_falls_back_to_opus(engine):
         [Exception("model claude-fable-5 not_found on this plan"), [make_result()]],
     )
     assert await llm.probe() == llm.MODEL_FALLBACK
-    assert db.get_state("pinned_model") == llm.MODEL_FALLBACK
+    assert llm.engine_status()["model"] == llm.MODEL_FALLBACK
+    assert llm.engine_status()["status"] == "ok"
     assert len(fake.calls) == 2
 
 
@@ -119,7 +121,7 @@ async def test_probe_config_error_no_retry(engine):
 # --- usage limits: durable and enforced -------------------------------------
 
 async def test_usage_exhausted_durable_and_enforced(engine):
-    db.set_state("pinned_model", llm.MODEL_PREFERRED)
+    engine_fakes.pin(llm.MODEL_PREFERRED)
     fake = install_query(engine, [Exception("usage limit reached for this period")])
     with pytest.raises(llm.UsageExhausted):
         await llm.structured("p", SCHEMA, task="extract")
@@ -127,7 +129,10 @@ async def test_usage_exhausted_durable_and_enforced(engine):
     status = llm.engine_status()
     assert status["status"] == "waiting_usage_exhausted"
     assert status["retry_in_seconds"] > 0
-    assert db.get_state("retry_at") is not None  # durable, not in-memory
+    assert engine_fakes.engine_value("next_retry_at") is not None  # durable
+    # The app's own backoff, not a reset time the provider never gave.
+    assert status["limit_resets_at"] is None
+    assert status["episode"] is not None
 
     # While the cooldown runs, calls are blocked before any request is made.
     with pytest.raises(llm.UsageExhausted):
@@ -135,13 +140,13 @@ async def test_usage_exhausted_durable_and_enforced(engine):
     assert len(fake.calls) == 1
 
     # Backoff doubles for the next entry.
-    assert db.get_state("usage_backoff_minutes") == "10"
+    assert engine_fakes.engine_value("backoff_minutes") == "10"
 
 
 # --- transient retry --------------------------------------------------------
 
 async def test_transient_retries_then_succeeds(engine):
-    db.set_state("pinned_model", llm.MODEL_PREFERRED)
+    engine_fakes.pin(llm.MODEL_PREFERRED)
     fake = install_query(
         engine,
         [CLIConnectionError("hiccup"), CLIConnectionError("hiccup"), [make_result({"x": "y"})]],
@@ -151,7 +156,7 @@ async def test_transient_retries_then_succeeds(engine):
 
 
 async def test_transient_exhausts_bounded_retries(engine):
-    db.set_state("pinned_model", llm.MODEL_PREFERRED)
+    engine_fakes.pin(llm.MODEL_PREFERRED)
     fake = install_query(engine, [CLIConnectionError("down")] * 5)
     with pytest.raises(llm.TransientFailure):
         await llm.structured("p", SCHEMA, task="extract")
@@ -161,7 +166,7 @@ async def test_transient_exhausts_bounded_retries(engine):
 # --- lockdown ---------------------------------------------------------------
 
 async def test_real_tool_call_is_config_error(engine):
-    db.set_state("pinned_model", llm.MODEL_PREFERRED)
+    engine_fakes.pin(llm.MODEL_PREFERRED)
     breach = AssistantMessage(
         content=[ToolUseBlock(id="t1", name="Bash", input={"command": "ls"})],
         model=llm.MODEL_PREFERRED,
@@ -172,7 +177,7 @@ async def test_real_tool_call_is_config_error(engine):
 
 
 async def test_structured_output_delivery_tool_is_exempt(engine):
-    db.set_state("pinned_model", llm.MODEL_PREFERRED)
+    engine_fakes.pin(llm.MODEL_PREFERRED)
     delivery = AssistantMessage(
         content=[
             TextBlock(text="thinking aloud"),
@@ -188,7 +193,7 @@ async def test_logged_out_cli_envelope_routes_to_auth_required(engine):
     """Real CLI shape when signed out: an error ResultMessage with
     subtype "success", is_error=True, and the signal only in .result —
     followed by a generic SDK exception with useless text."""
-    db.set_state("pinned_model", llm.MODEL_PREFERRED)
+    engine_fakes.pin(llm.MODEL_PREFERRED)
 
     logged_out = ResultMessage(
         subtype="success",
@@ -233,8 +238,7 @@ async def test_unknown_task_tier_rejected(engine):
 async def test_pinned_path_config_error_persisted(engine):
     """A lockdown breach / broken CLI after pinning must not leave
     /api/status reporting ok."""
-    db.set_state("pinned_model", llm.MODEL_PREFERRED)
-    db.set_state("engine_status", "ok")
+    engine_fakes.pin(llm.MODEL_PREFERRED)
     install_query(engine, [CLINotFoundError("claude binary missing")])
     with pytest.raises(llm.ConfigError):
         await llm.structured("p", SCHEMA, task="extract")
@@ -328,9 +332,9 @@ def test_prompt_history_suppression_wins_over_inherited_value(monkeypatch):
 async def test_success_clears_stale_error_state(engine):
     """After an auth failure is fixed, a successful call must leave no
     stale last_error next to an ok status."""
-    db.set_state("pinned_model", llm.MODEL_PREFERRED)
-    db.set_state("engine_status", "auth_required")
-    db.set_state("last_error", "Not logged in · Please run /login")
+    engine_fakes.pin(llm.MODEL_PREFERRED)
+    engine_fakes.set_engine(status="auth_required",
+                            last_error="Not logged in · Please run /login")
 
     install_query(engine, [[make_result({"x": "y"})]])
     assert await llm.structured("p", SCHEMA, task="extract") == {"x": "y"}

@@ -6,6 +6,7 @@ import sqlite3
 import pytest
 
 from backend.core import db
+from backend.tests import engine_fakes
 from backend.tests.pdfbuild import one_page_pdf
 
 pytestmark = pytest.mark.anyio
@@ -870,8 +871,8 @@ def _tailor_env(monkeypatch, tmp_path, behavior=None):
         return {"verdicts": [{"claim_id": cid, "supported": True,
                               "reason": "ok"} for cid in claim_ids]}
 
-    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
-    monkeypatch.setattr(llm, "structured", fake_structured)
+    monkeypatch.setattr(tailor_resume, "generate_tailored", engine_fakes.answering("tailor", fake_generate))
+    monkeypatch.setattr(llm, "structured", engine_fakes.structured(fake_structured))
     return generate_calls, entail_calls
 
 
@@ -1301,7 +1302,7 @@ async def test_restart_mid_batch_completes_without_duplicate_generation(
         return await original_structured(prompt, schema, task,
                                          system_prompt=system_prompt)
 
-    monkeypatch.setattr(llm, "structured", gated_structured)
+    monkeypatch.setattr(llm, "structured", engine_fakes.structured(gated_structured))
     batch = asyncio.create_task(tailor_pipeline.run_batch())
     await asyncio.wait_for(entail_started.wait(), timeout=5)
     batch.cancel()  # the "kill": mid-batch, mid-validation
@@ -1344,6 +1345,35 @@ async def test_batch_failure_is_isolated_to_its_package(
     statuses = [db.get_package(p)["status"] for p in packages]
     assert statuses == ["done", "failed", "done"]
     assert "induced generation failure" in db.get_package(packages[1])["error"]
+
+
+async def test_a_blocked_tool_call_fails_only_its_package(
+    test_db, tmp_path, monkeypatch
+):
+    """The model reaching for a tool on one posting is that posting's
+    failure, not an engine problem: nothing is parked, and the batch
+    finishes the other packages."""
+    from backend.core import llm
+    from backend.tailor import pipeline as tailor_pipeline
+
+    version = _confirm_profile()
+    packages = []
+    for i in (1, 2, 3):
+        _seed_job(f"p{i}")
+        _seed_derived(f"p{i}", version)
+        pkg, _ = _create_package(f"p{i}", version, "hash-a")
+        packages.append(pkg)
+
+    def behavior(job):
+        if job["job_id"] == "p2":
+            raise llm.ToolCallBlocked("the model tried to call a tool")
+        return _cited_tailored()[0]
+
+    _tailor_env(monkeypatch, tmp_path, behavior=behavior)
+    assert await tailor_pipeline.run_batch() == "idle"
+    statuses = [db.get_package(p)["status"] for p in packages]
+    assert statuses == ["done", "failed", "done"]
+    assert "ToolCallBlocked" in db.get_package(packages[1])["error"]
 
 
 async def test_usage_exhausted_is_durable_and_batch_resumes(
@@ -1475,7 +1505,7 @@ async def test_validation_failure_after_repair_fails_package(
         return tailored
 
     monkeypatch.setattr(validate_mod, "validate", always_failing)
-    monkeypatch.setattr(validate_mod, "repair", fake_repair)
+    monkeypatch.setattr(validate_mod, "repair", engine_fakes.answering("repair", fake_repair))
     assert await tailor_pipeline.run_package(pkg) == "failed"
     row = db.get_package(pkg)
     assert repairs == [1, 1]  # bounded: exactly two repair rounds, never more
@@ -1585,7 +1615,7 @@ async def test_restart_during_cover_condense_reuses_persisted_fits(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    db.set_state("pinned_model", "claude-fable-5")
+    engine_fakes.pin("claude-fable-5")
     pkg, _ = _create_package("p1", version, "hash-a")
 
     def pages(tex):
@@ -1617,8 +1647,8 @@ async def test_restart_during_cover_condense_reuses_persisted_fits(
         return {"paragraphs": [{"text": "A short letter.", "source_ids": []},
                                {"text": "Thanks.", "source_ids": []}]}
 
-    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
-    monkeypatch.setattr(llm, "structured", fake_structured)
+    monkeypatch.setattr(tailor_resume, "generate_tailored", engine_fakes.answering("tailor", fake_generate))
+    monkeypatch.setattr(llm, "structured", engine_fakes.structured(fake_structured))
 
     resume_fit_calls = []
     original_fit_resume = pl.fit_resume
@@ -1643,7 +1673,7 @@ async def test_restart_during_cover_condense_reuses_persisted_fits(
     # "Restart" — on a recovered engine running a DIFFERENT model: only
     # the interrupted condense re-runs, and provenance must attribute
     # each stage's call to the model that actually made it.
-    db.set_state("pinned_model", "claude-opus-5")
+    engine_fakes.pin("claude-opus-5")
     release.set()
     assert await tailor_pipeline.run_package(pkg) == "done"
     assert generate_calls == ["p1"]  # generation never repeated
@@ -1759,8 +1789,8 @@ async def test_package_pins_page_limit_at_creation(
         return {"verdicts": [{"claim_id": cid, "supported": True,
                               "reason": "ok"} for cid in claim_ids]}
 
-    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
-    monkeypatch.setattr(llm, "structured", fake_structured)
+    monkeypatch.setattr(tailor_resume, "generate_tailored", engine_fakes.answering("tailor", fake_generate))
+    monkeypatch.setattr(llm, "structured", engine_fakes.structured(fake_structured))
     assert await tailor_pipeline.run_package(pkg) == "done"
     assert seen_limits == [2]  # pinned, not the current global (1)
     assert db.get_package(pkg)["provenance"]["page_limit"] == 2
@@ -1791,7 +1821,7 @@ async def test_resumed_package_keeps_pinned_limit_after_settings_change(
     async def dying_structured(prompt, schema, task, system_prompt=""):
         raise llm.AuthRequired("Not logged in")
 
-    monkeypatch.setattr(llm, "structured", dying_structured)
+    monkeypatch.setattr(llm, "structured", engine_fakes.structured(dying_structured))
     assert await tailor_pipeline.run_package(pkg) == "engine_blocked"
     parked = db.get_package(pkg)
     assert parked["status"] == "queued"
@@ -1806,7 +1836,7 @@ async def test_resumed_package_keeps_pinned_limit_after_settings_change(
         return {"verdicts": [{"claim_id": cid, "supported": True,
                               "reason": "ok"} for cid in claim_ids]}
 
-    monkeypatch.setattr(llm, "structured", healthy_structured)
+    monkeypatch.setattr(llm, "structured", engine_fakes.structured(healthy_structured))
     seen_limits = []
     real_fit = page_limit_mod.fit_resume
 
@@ -1903,7 +1933,7 @@ async def test_engine_blocked_packages_recover_automatically(
     monkeypatch.setattr(routes, "_package_stall_task", None)
     monkeypatch.setattr(routes, "_package_stall_token", None)
     monkeypatch.setattr(routes, "_package_worker_task", None)
-    monkeypatch.setattr(routes.claude_cli, "subscription_problem",
+    monkeypatch.setattr(routes.llm.claude_cli, "subscription_problem",
                         lambda: "Not logged in" if blocked else None)
 
     async def ok_probe():
@@ -1962,7 +1992,7 @@ async def test_posting_change_mid_generation_supersedes_package(
         await release.wait()
         return _cited_tailored()[0]
 
-    monkeypatch.setattr(tailor_resume, "generate_tailored", gated_generate)
+    monkeypatch.setattr(tailor_resume, "generate_tailored", engine_fakes.answering("tailor", gated_generate))
     worker = asyncio.create_task(tailor_pipeline.run_package(pkg))
     await asyncio.wait_for(started.wait(), timeout=5)
     db.save_job_detail("p1", "Rewritten mid-flight.", "hash-new")  # the edit
@@ -2127,7 +2157,7 @@ async def test_provenance_and_jobmd_publish_from_snapshots(
     _seed_derived("p1", version, score=77.7,
                   breakdown={"match_reasons": ["Original overlap"],
                              "gap_reasons": []})
-    db.set_state("pinned_model", "claude-fable-5")
+    engine_fakes.pin("claude-fable-5")
     pkg, _ = _create_package("p1", version, "hash-a")
     _tailor_env(monkeypatch, tmp_path)
 
@@ -2146,7 +2176,7 @@ async def test_provenance_and_jobmd_publish_from_snapshots(
 
     # Between the crash and the resume: engine model changes AND the job
     # is re-scored. Neither may leak into the published record.
-    db.set_state("pinned_model", "claude-opus-5")
+    engine_fakes.pin("claude-opus-5")
     db.save_score("p1", "hash-a", version, 33.3,
                   {"match_reasons": ["Different reasons"], "gap_reasons": []})
 
@@ -2259,7 +2289,7 @@ async def test_condense_survives_entailment_failure_without_respend(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    db.set_state("pinned_model", "claude-fable-5")
+    engine_fakes.pin("claude-fable-5")
     pkg, _ = _create_package("p1", version, "hash-a")
 
     def pages(tex):
@@ -2290,8 +2320,8 @@ async def test_condense_survives_entailment_failure_without_respend(
         return {"verdicts": [{"claim_id": cid, "supported": True,
                               "reason": "ok"} for cid in claim_ids]}
 
-    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
-    monkeypatch.setattr(llm, "structured", fake_structured)
+    monkeypatch.setattr(tailor_resume, "generate_tailored", engine_fakes.answering("tailor", fake_generate))
+    monkeypatch.setattr(llm, "structured", engine_fakes.structured(fake_structured))
 
     assert await tailor_pipeline.run_package(pkg) == "waiting_usage"
     row = db.get_package(pkg)
@@ -2301,7 +2331,7 @@ async def test_condense_survives_entailment_failure_without_respend(
         "generation", "entailment", "cover_condense"]  # spend on record
 
     # Cooldown passes; recovery happens to come back on another model.
-    db.set_state("pinned_model", "claude-opus-5")
+    engine_fakes.pin("claude-opus-5")
     healed[0] = True
     assert await tailor_pipeline.run_package(pkg) == "done"
     assert condense_calls == [1]  # the xhigh call was never repeated
@@ -2328,7 +2358,7 @@ async def test_repair_metadata_survives_revalidation_interruption(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    db.set_state("pinned_model", "claude-fable-5")
+    engine_fakes.pin("claude-fable-5")
     pkg, _ = _create_package("p1", version, "hash-a")
     _fake_compiler(monkeypatch, lambda tex: 1)
     monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
@@ -2358,8 +2388,8 @@ async def test_repair_metadata_survives_revalidation_interruption(
              "reason": "checked"}
             for cid in claim_ids]}
 
-    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
-    monkeypatch.setattr(llm, "structured", fake_structured)
+    monkeypatch.setattr(tailor_resume, "generate_tailored", engine_fakes.answering("tailor", fake_generate))
+    monkeypatch.setattr(llm, "structured", engine_fakes.structured(fake_structured))
 
     assert await tailor_pipeline.run_package(pkg) == "engine_blocked"
     row = db.get_package(pkg)
@@ -2375,6 +2405,7 @@ async def test_repair_metadata_survives_revalidation_interruption(
     assert [c["call"] for c in prov["llm_calls"]] == [
         "generation", "entailment", "truth_repair", "entailment"]
     assert prov["llm_calls"][2] == {"call": "truth_repair",
+                                    "provider": "claude",
                                     "model": "claude-fable-5",
                                     "effort": "xhigh"}
 
@@ -2421,7 +2452,7 @@ async def test_second_repair_round_recovers_package(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    db.set_state("pinned_model", "claude-fable-5")
+    engine_fakes.pin("claude-fable-5")
     pkg, _ = _create_package("p1", version, "hash-a")
     _fake_compiler(monkeypatch, lambda tex: 1)
     monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
@@ -2440,8 +2471,8 @@ async def test_second_repair_round_recovers_package(
     fake_structured = _two_round_structured(
         [half_fixed, fixed], repair_calls,
         {"Claims too much impact", "Still too much"})
-    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
-    monkeypatch.setattr(llm, "structured", fake_structured)
+    monkeypatch.setattr(tailor_resume, "generate_tailored", engine_fakes.answering("tailor", fake_generate))
+    monkeypatch.setattr(llm, "structured", engine_fakes.structured(fake_structured))
 
     assert await tailor_pipeline.run_package(pkg) == "done"
     assert repair_calls == [1, 1]
@@ -2450,6 +2481,7 @@ async def test_second_repair_round_recovers_package(
         "generation", "entailment", "truth_repair", "entailment",
         "truth_repair", "entailment"]
     assert prov["llm_calls"][4] == {"call": "truth_repair",
+                                    "provider": "claude",
                                     "model": "claude-fable-5",
                                     "effort": "xhigh"}
 
@@ -2467,7 +2499,7 @@ async def test_restart_after_second_repair_never_repeats_repairs(
     version = _confirm_profile()
     _seed_job("p1")
     _seed_derived("p1", version)
-    db.set_state("pinned_model", "claude-fable-5")
+    engine_fakes.pin("claude-fable-5")
     pkg, _ = _create_package("p1", version, "hash-a")
     _fake_compiler(monkeypatch, lambda tex: 1)
     monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
@@ -2489,8 +2521,8 @@ async def test_restart_after_second_repair_never_repeats_repairs(
         [half_fixed, fixed], repair_calls,
         {"Claims too much impact", "Still too much"},
         fail_at=3, healed=healed)
-    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
-    monkeypatch.setattr(llm, "structured", fake_structured)
+    monkeypatch.setattr(tailor_resume, "generate_tailored", engine_fakes.answering("tailor", fake_generate))
+    monkeypatch.setattr(llm, "structured", engine_fakes.structured(fake_structured))
 
     assert await tailor_pipeline.run_package(pkg) == "engine_blocked"
     row = db.get_package(pkg)
@@ -2557,8 +2589,8 @@ async def test_entailment_verdicts_persist_with_checkpoint(
             {"claim_id": cid, "supported": not (bad and cid == "exp0:b0"),
              "reason": "checked"} for cid in claim_ids]}
 
-    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
-    monkeypatch.setattr(llm, "structured", fake_structured)
+    monkeypatch.setattr(tailor_resume, "generate_tailored", engine_fakes.answering("tailor", fake_generate))
+    monkeypatch.setattr(llm, "structured", engine_fakes.structured(fake_structured))
 
     worker = asyncio.create_task(tailor_pipeline.run_package(pkg))
     await asyncio.wait_for(repair_started.wait(), timeout=5)
@@ -2625,8 +2657,8 @@ async def test_persisted_condense_authoritative_when_engine_changes(
         return {"verdicts": [{"claim_id": cid, "supported": True,
                               "reason": "ok"} for cid in claim_ids]}
 
-    monkeypatch.setattr(tailor_resume, "generate_tailored", fake_generate)
-    monkeypatch.setattr(llm, "structured", fake_structured)
+    monkeypatch.setattr(tailor_resume, "generate_tailored", engine_fakes.answering("tailor", fake_generate))
+    monkeypatch.setattr(llm, "structured", engine_fakes.structured(fake_structured))
 
     assert await tailor_pipeline.run_package(pkg) == "waiting_usage"
     assert condense_calls == [1]

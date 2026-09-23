@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from jsonschema import Draft202012Validator
 
 from backend import sources
-from backend.core import claude_cli, db, llm
+from backend.core import db, llm
 from backend.core.events import broker
 from backend.resume import facts, ingest, template
 from backend.resume.schema import PROFILE_SCHEMA
@@ -60,10 +60,11 @@ async def probe_engine():
     # never clear a scoring stall from here. Only an unpinned probe
     # (fresh start, or /engine/reprobe which resets the pin first)
     # actually exercises the engine and earns verified:true.
-    live = db.get_state("pinned_model") is None
+    engine = llm.engine_status()
+    live = engine["status"] == "unprobed"
     if not live:
-        engine = llm.engine_status()
-        unhealthy = engine["status"] in ("auth_required", "config_error")
+        unhealthy = engine["status"] in ("auth_required", "config_error",
+                                         "not_entitled")
         response = {
             "ok": not unhealthy,
             "verified": False,  # cached pin — nothing was exercised
@@ -94,6 +95,53 @@ async def probe_engine():
 async def reprobe_engine():
     llm.reset_probe()
     return await probe_engine()
+
+
+@router.get("/engines")
+async def get_engines():
+    """Both engines for the picker: the selection, each provider's state,
+    and each provider's cached model list."""
+    return llm.engines_view()
+
+
+@router.post("/engines/{provider}/catalog")
+async def refresh_engine_catalog(provider: str):
+    """Re-read a provider's model list. No prompt is spent."""
+    if provider not in llm.PROVIDERS:
+        raise HTTPException(status_code=404, detail=f"unknown engine {provider!r}")
+    await llm.refresh_catalog(provider)
+    return llm.engines_view()
+
+
+@router.put("/engine/selection")
+async def put_engine_selection(body: dict):
+    """The user's one model for every task (PLAN.md §4.1a). Not a gate:
+    the app picks a default, and this is a setting the user may change."""
+    provider = body.get("provider")
+    model = body.get("model")
+    if not isinstance(provider, str) or (model is not None and not isinstance(model, str)):
+        raise HTTPException(status_code=422,
+                            detail="provider must be a string and model a string or null")
+    try:
+        llm.select(provider, model or None)
+    except llm.ConfigError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"selection": llm.selection(), **(await _engine_changed())}
+
+
+async def _engine_changed() -> dict:
+    """Check the newly selected engine now. When it works, everything the
+    previous one had parked — a usage wait, a sign-in stall — resumes on
+    it: those reasons belonged to the old engine."""
+    engine = llm.engine_status()
+    if engine["status"] == "unprobed":
+        return await probe_engine()
+    if engine["status"] == "ok":
+        _on_engine_recovered()
+        return {"ok": True, "verified": False, "model": engine["model"],
+                "engine": engine}
+    return {"ok": False, "verified": False, "error": engine["status"],
+            "detail": engine["last_error"], "engine": engine}
 
 
 @router.get("/settings")
@@ -573,7 +621,9 @@ async def _stall_recovery_loop(token: str,
         backoff = float(stall.get("backoff_s", _STALL_AUTH_POLL_S))
         if stall.get("reason") == "engine_blocked":
             try:
-                problem = await asyncio.to_thread(claude_cli.subscription_problem)
+                found = await asyncio.to_thread(
+                    llm.credential_problem, llm.selection()["provider"])
+                problem = None if found is None else found[1]
             except asyncio.CancelledError:
                 raise
             except (Exception, SystemExit) as exc:  # noqa: BLE001
@@ -951,6 +1001,52 @@ def recover_search_runs() -> list[int]:
     return claimed
 
 
+# --- Engine sign-in monitor (PLAN.md §4.1a) -----------------------------------
+# The browser stops polling while the event stream is connected and idle,
+# so a login that lapses while nothing runs would otherwise surface only
+# when work fails. This loop keeps each engine's local sign-in state
+# current on its own schedule, coalesced with the pre-dispatch checks in
+# llm.structured. Local checks only: no request is spent. When the
+# selected engine's login comes back, one live re-check proves it and
+# resumes whatever it had parked.
+
+_engine_monitor_task: asyncio.Task | None = None
+_ENGINE_MONITOR_S = 300.0
+
+
+def start_engine_monitor() -> None:
+    global _engine_monitor_task
+    if _engine_monitor_task is None or _engine_monitor_task.done():
+        _engine_monitor_task = asyncio.create_task(_engine_monitor())
+
+
+async def _engine_monitor() -> None:
+    while True:
+        await engine_monitor_pass()
+        await asyncio.sleep(_ENGINE_MONITOR_S + random.uniform(0, 30))
+
+
+async def engine_monitor_pass() -> None:
+    for provider in llm.PROVIDERS:
+        before = llm.credentials_present(provider)
+        try:
+            problem = await llm.refresh_credentials(provider)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — the loop must survive
+            log.warning("engine monitor: %s check failed: %s", provider, exc)
+            continue
+        if (problem is None and before is False
+                and provider == llm.selection()["provider"]
+                and llm.engine_status()["status"] == "unprobed"):
+            try:
+                await probe_engine()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                log.warning("engine monitor: re-check after sign-in failed: %s", exc)
+
+
 async def shutdown_background_tasks() -> None:
     """Cancel and await every background worker before the browser
     closes. connect() can hold the supervisor lock for up to 15 minutes
@@ -962,7 +1058,7 @@ async def shutdown_background_tasks() -> None:
         for t in [_connect_task, _cap_retry_task, _pipeline_task,
                   _pipeline_retry_task, _stall_recovery_task,
                   _package_worker_task, _package_retry_task,
-                  _package_stall_task,
+                  _package_stall_task, _engine_monitor_task,
                   *_search_tasks.values()]
         # Completed tasks may belong to a previous event loop (an earlier
         # lifespan in the same process); awaiting them there raises.

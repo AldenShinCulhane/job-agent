@@ -10,7 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from backend import sources
 from backend.api import routes as api_routes
 from backend.api.routes import router
-from backend.core import db
+from backend.core import db, llm
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FRONTEND_DIST = REPO_ROOT / "frontend" / "dist"
@@ -28,6 +28,9 @@ async def _lifespan(app: FastAPI):
     # across restarts without user action.
     sources.source.restore_state()
     api_routes.recover_search_runs()
+    # Engine sign-in state is kept current by the backend itself: an idle
+    # UI stops polling, so it cannot be the one to notice a lapsed login.
+    api_routes.start_engine_monitor()
     yield
     # Cancel background workers FIRST — connect() can hold the supervisor
     # lock for minutes of login polling, and close() would deadlock
@@ -40,6 +43,8 @@ async def _lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     db.init()
+    # Engine state from before the second engine lived under global keys.
+    llm.migrate_legacy_state()
     app = FastAPI(title="Job Agent", lifespan=_lifespan)
     app.include_router(router, prefix="/api")
     if FRONTEND_DIST.is_dir():

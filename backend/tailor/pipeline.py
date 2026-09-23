@@ -163,6 +163,20 @@ def _score_if_current(pkg: dict) -> dict | None:
     return score
 
 
+def _ledger_entry(call: str, answer) -> dict:
+    """A ledger entry from the context the answer was produced under,
+    fixed before its call was sent — never from the current engine
+    selection, which the user can change while a call is in flight."""
+    context = getattr(answer, "context", None)
+    if context is None:
+        raise TypeError(f"{call}: the engine answer carries no call context")
+    entry = {"call": call, **context.record()}
+    resolved = getattr(answer, "resolved_model", None)
+    if resolved and resolved != context.model:
+        entry["resolved_model"] = resolved
+    return entry
+
+
 async def run_package(package_id: int) -> str:
     """Drive one package to a terminal or waiting state; returns the
     final status. Never raises except CancelledError (shutdown — the
@@ -240,9 +254,7 @@ async def run_package(package_id: int) -> str:
                 # a later failure can park the package but never lose or
                 # misattribute spend that already happened.
                 "llm_calls": [{
-                    "call": "generation",
-                    "model": db.get_state("pinned_model"),
-                    "effort": llm.effective_effort("tailor"),
+                    **_ledger_entry("generation", tailored),
                     "prompt_version": tailor_resume.PROMPT_VERSION,
                     "schema_version": tailor_resume.SCHEMA_VERSION,
                 }],
@@ -261,16 +273,12 @@ async def run_package(package_id: int) -> str:
         # Every later LLM call checkpoints itself into the append-only
         # ledger the moment it returns; the recorder persists in place so
         # a failure right after a call can never lose its record.
-        def _record(call: str, task: str) -> None:
-            stage.setdefault("llm_calls", []).append({
-                "call": call,
-                "model": db.get_state("pinned_model"),
-                "effort": llm.effective_effort(task),
-            })
+        def _record(call: str, answer) -> None:
+            stage.setdefault("llm_calls", []).append(_ledger_entry(call, answer))
             _transition(package_id, stage=stage)
 
-        def record_entailment(call: str) -> None:
-            _record(call, "entail")
+        def record_entailment(call: str, answer) -> None:
+            _record(call, answer)
 
         # Validation is bound to the exact content it approved: the hash
         # guard means repaired-or-edited JSON can never coast on a stale
@@ -293,11 +301,8 @@ async def run_package(package_id: int) -> str:
                 # and the ledger entry is what caps the round count
                 # across restarts.
                 stage["tailored"] = repaired
-                stage.setdefault("llm_calls", []).append({
-                    "call": "truth_repair",
-                    "model": db.get_state("pinned_model"),
-                    "effort": llm.effective_effort("repair"),
-                })
+                stage.setdefault("llm_calls", []).append(
+                    _ledger_entry("truth_repair", repaired))
                 _transition(package_id, stage=stage)
                 failures = await validate.validate(repaired, profile, ledger,
                                                    cache,
@@ -342,7 +347,7 @@ async def run_package(package_id: int) -> str:
                 # fail — a resume reuses this instead of paying again.
                 stage["cover_condensed"] = cover_letter
                 stage["entail_cache"] = cache
-                _record("cover_condense", "repair")
+                _record("cover_condense", cover_letter)
 
             cover_fit = await page_limit.fit_cover(
                 stage["tailored"], profile, ledger, cache, job_snap,
@@ -454,8 +459,10 @@ async def run_package(package_id: int) -> str:
                      f"{type(exc).__name__}: {exc}"):
             return "superseded"
         return "engine_blocked"
-    except (llm.EngineError, latex.CompileError, page_limit.FitError,
-            page_limit.ValidationFailed) as exc:
+    except (llm.EngineError, llm.ToolCallBlocked, latex.CompileError,
+            page_limit.FitError, page_limit.ValidationFailed) as exc:
+        # ToolCallBlocked: this posting's prompt made the model reach for
+        # a tool. The engine is fine; only this package fails.
         if not _park(package_id, "failed", stage,
                      f"{type(exc).__name__}: {exc}"):
             return "superseded"

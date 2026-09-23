@@ -187,7 +187,7 @@ async def entailment_failures(claims: list[dict], ledger: dict,
             cache[key] = {"supported": verdict["supported"],
                           "reason": verdict["reason"]}
     if record is not None:
-        record("entailment")
+        record("entailment", result)
     for key, claim in pending:
         verdict = cache[key]
         if not verdict["supported"]:

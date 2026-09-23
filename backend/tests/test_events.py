@@ -9,6 +9,7 @@ import pytest
 
 from backend.api import routes
 from backend.core import db, llm
+from backend.tests import engine_fakes
 from backend.core import events as events_mod
 from backend.core.events import EventBroker, broker
 from backend.tailor import pipeline as tailor_pipeline
@@ -98,22 +99,23 @@ def test_error_only_package_writes_announce_once(store, published):
 
 
 def test_engine_announces_changes_and_stays_quiet_otherwise(store, published):
-    """_clear_wait_state runs on every successful LLM call; announcing
-    unconditionally would put one event per scored job on the wire."""
-    llm._persist_failure("auth_required", "not logged in")
+    """A success is recorded on every LLM call; announcing unconditionally
+    would put one event per scored job on the wire."""
+    engine_fakes.pin("claude-opus-5")
+    llm._record_problem(None, "claude", "auth_required", "not logged in")
     assert published == [("engine", {"status": "auth_required"})]
 
     published.clear()
-    llm._persist_failure("auth_required", "not logged in")
+    llm._record_problem(None, "claude", "auth_required", "not logged in")
     assert published == []  # byte-identical repeat: nothing on screen moved
 
     published.clear()
-    llm._clear_wait_state()
+    llm._record_success(llm.dispatch_context("extract"))
     assert published == [("engine", {"status": "ok"})]
 
     published.clear()
-    llm._clear_wait_state()
-    assert published == []
+    llm._record_success(llm.dispatch_context("extract"))
+    assert published == []  # only the verification time moved
 
 
 def test_engine_announces_metadata_changes_under_an_unchanged_status(
@@ -121,24 +123,36 @@ def test_engine_announces_metadata_changes_under_an_unchanged_status(
     """The banner renders the message, the model and the countdown — not
     just the status word. Deduping on status alone leaves a stale message
     on screen for the whole of a second, different failure."""
-    llm._persist_failure("auth_required", "not logged in")
+    llm._record_problem(None, "claude", "auth_required", "not logged in")
     published.clear()
 
-    llm._persist_failure("auth_required", "session expired")
+    llm._record_problem(None, "claude", "auth_required", "session expired")
     assert published == [("engine", {"status": "auth_required"})]
 
-    # A repeat usage limit pushes retry_at out without moving the status.
+    # A usage limit opens a quota episode.
     published.clear()
-    llm._enter_usage_exhausted("limit reached")
+    sent_before = llm.dispatch_context("extract")
+    llm._record_usage(llm.dispatch_context("extract"),
+                      llm.UsageExhausted("limit reached"))
     assert published == [("engine", {"status": "waiting_usage_exhausted"})]
+
+    # A call sent during the episode, after its cooldown, hits the limit
+    # again: the retry moves out under the same status.
     published.clear()
-    llm._enter_usage_exhausted("limit reached")
+    llm._record_usage(llm.dispatch_context("extract"),
+                      llm.UsageExhausted("limit reached"))
     assert published == [("engine", {"status": "waiting_usage_exhausted"})]
+
+    # A call sent before the episode began adds nothing: one limit, one
+    # episode, one backoff step.
     published.clear()
+    llm._record_usage(sent_before, llm.UsageExhausted("limit reached"))
+    assert published == []
 
     # And so does unpinning the model, which the header badge shows.
-    db.set_state("engine_status", "ok")
-    db.set_state("pinned_model", "claude-opus-5")
+    engine_fakes.set_engine(status=None, last_error=None, next_retry_at=None,
+                            backoff_minutes=None, episode=None)
+    engine_fakes.pin("claude-opus-5")
     published.clear()
     llm.reset_probe()
     assert published == [("engine", {"status": "unprobed"})]
