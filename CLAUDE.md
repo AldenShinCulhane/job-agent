@@ -40,5 +40,7 @@ output/     generated packages (gitignored)
 uv run job-agent                          # run the app (:8700)
 uv run python -m backend.tests.smoke_llm  # live engine smoke test (uses subscription)
 uv run python -m backend.core.claude_cli auth status   # bundled-CLI auth check
+uv run python -m backend.core.codex_cli status         # app's own Codex sign-in (ChatGPT only)
+CODEX_TESTS_REQUIRED=1 uv run pytest backend/tests/test_codex_engine.py  # Codex lockdown, local stand-ins only
 cd frontend && npm run build              # rebuild UI served by FastAPI
 ```

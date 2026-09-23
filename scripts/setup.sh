@@ -9,6 +9,7 @@ BOLD=$(tput bold 2>/dev/null || true); RESET=$(tput sgr0 2>/dev/null || true)
 ok()   { printf "  [ok]   %s\n" "$1"; }
 warn() { printf "  [warn] %s\n" "$1"; WARNINGS=$((WARNINGS + 1)); }
 fail() { printf "  [FAIL] %s\n" "$1"; FAILURES=$((FAILURES + 1)); }
+info() { printf "  [info] %s\n" "$1"; }
 WARNINGS=0; FAILURES=0
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -157,15 +158,36 @@ if uv run python -c "import playwright" >/dev/null 2>&1; then
 fi
 
 echo
-echo "3. Claude sign-in (uses your Claude subscription — no API key)"
+echo "3. AI engine sign-in (your own subscription — no API key; one engine is enough)"
 
 # loggedIn alone is not enough — API-key or external-provider auth must not
 # pass as subscription auth.
-PROBLEM=$(uv run python -c "from backend.core.claude_cli import subscription_problem; print(subscription_problem() or '')" 2>/dev/null || echo "auth check failed — run 'uv sync' and retry")
-if [ -z "$PROBLEM" ]; then
-  ok "signed in with a claude.ai subscription"
+CLAUDE_PROBLEM=$(uv run python -c "from backend.core.claude_cli import subscription_problem; print(subscription_problem() or '')" 2>/dev/null || echo "auth check failed — run 'uv sync' and retry")
+if [ -z "$CLAUDE_PROBLEM" ]; then
+  ok "Claude: signed in with a claude.ai subscription"
+fi
+
+# Codex is optional and not bundled. Its sign-in lives in the app's own
+# Codex home (.data/codex), and only a ChatGPT sign-in counts.
+CODEX_SIGNED_IN=0
+if command -v codex >/dev/null 2>&1; then
+  CODEX_VERSION=$(codex --version 2>/dev/null | awk '{print $NF}')
+  CODEX_PROBLEM=$(uv run python -m backend.core.codex_cli status 2>&1)
+  if [ $? -eq 0 ]; then
+    CODEX_SIGNED_IN=1
+    ok "Codex $CODEX_VERSION: signed in with ChatGPT"
+  fi
 else
-  warn "$PROBLEM"
+  CODEX_PROBLEM="Codex CLI not installed — optional, only for ChatGPT models: https://developers.openai.com/codex/cli"
+fi
+
+if [ -n "$CLAUDE_PROBLEM" ] && [ "$CODEX_SIGNED_IN" -eq 0 ]; then
+  warn "no AI engine is signed in — sign in to at least one:"
+  printf "         Claude: %s\n" "$CLAUDE_PROBLEM"
+  printf "         Codex:  %s\n" "$CODEX_PROBLEM"
+else
+  [ -n "$CLAUDE_PROBLEM" ] && info "Claude (not needed while Codex is signed in): $CLAUDE_PROBLEM"
+  [ "$CODEX_SIGNED_IN" -eq 0 ] && info "Codex (optional): $CODEX_PROBLEM"
 fi
 
 echo

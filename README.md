@@ -38,7 +38,8 @@ Scored jobs, selection, and generated packages:
 
 ![Search results with scores and packages](docs/screenshots/search.png)
 
-Settings — resume page limit, engine health, LaTeX engines:
+Settings — the AI engine (one Claude or Codex model for every task), resume page
+limit, appearance, LaTeX engines:
 
 ![Settings page](docs/screenshots/settings.png)
 
@@ -61,6 +62,11 @@ uv run python -m backend.core.claude_cli auth login   # sign in with your Claude
 uv run job-agent                                      # → http://127.0.0.1:8700
 ```
 
+Prefer a ChatGPT plan? Install the [Codex CLI](https://developers.openai.com/codex/cli),
+sign in with `uv run python -m backend.core.codex_cli login`, and pick a Codex
+model under **Settings → AI engine**. One sign-in is enough; with both you can
+switch whenever one runs out of usage.
+
 `setup.sh` needs internet access and will report exactly what's missing and
 how to install it. The pieces:
 
@@ -71,6 +77,7 @@ how to install it. The pieces:
 | [Tectonic](https://tectonic-typesetting.github.io) **0.17+** or pdflatex | PDF typesetting | for PDF generation |
 | Tesseract + OCRmyPDF (+ Ghostscript) | scanned-resume OCR fallback | only for image-based PDFs |
 | Playwright Chromium | LinkedIn browser | installed by setup when needed |
+| [Codex CLI](https://developers.openai.com/codex/cli) | ChatGPT models (optional engine) | only to use Codex |
 
 An installed LaTeX engine is not always a working one — Tectonic 0.16.x
 aborts on this template's fonts. Setup test-compiles both real templates —
@@ -82,38 +89,64 @@ one. Re-check any time with:
 uv run python -m backend.tailor.smoke_pdf
 ```
 
-## Claude subscription — no API keys
+## Your subscription — Claude or Codex, no API keys
 
-All AI work runs through the **Claude Agent SDK using your Claude
-subscription** (Pro/Max). There are no API keys and no per-token billing —
-you sign in once with the same account you use for Claude.
+All AI work runs on **your own subscription**, never an API key and never
+per-token billing. Two engines, and you pick one model for every task:
 
-- The app prefers `claude-fable-5` and automatically falls back to
-  `claude-opus-5` if your plan doesn't include Fable.
-- Subscription usage limits apply. If you hit your plan's limit mid-batch,
-  the app pauses, shows a banner, and resumes automatically — no work is
-  lost and nothing is regenerated.
+- **Claude** — through the Claude Agent SDK on your Claude plan (Pro/Max),
+  signed in with `uv run python -m backend.core.claude_cli auth login`.
+- **Codex** — through the Codex CLI on your ChatGPT plan, signed in with
+  `uv run python -m backend.core.codex_cli login` (ChatGPT sign-in only;
+  an OpenAI API key is refused). Optional: install the CLI only if you
+  want these models.
+
+Choose the model under **Settings → AI engine**: either provider's list, or
+any model ID. The app never switches engines or models by itself.
+
+- The default is Claude: `claude-fable-5`, falling back to `claude-opus-5`
+  if your plan doesn't include Fable. A model you pick yourself never falls
+  back — if your plan doesn't have it, the app says so and waits for you to
+  pick another.
+- Subscription usage limits apply, per provider (every model of that
+  provider shares one limit). When a limit hits, queued work pauses and
+  resumes on its own when the limit lifts — nothing is lost or regenerated.
+  The engine picker opens once to show when it resets (when the provider
+  says) and to let you switch to the other provider's model and keep going;
+  it never opens over unsaved edits or an action still in flight — a banner
+  carries the same way out.
 - The model is locked down for this app: no file, shell, or web tools, and
   no open-ended agent loop — every call is a single prompt that must answer
-  in JSON.
-- The app keeps its own Claude sign-in in `.data/claude/`, separate from
-  any Claude Code install you may have — so the login command above is
-  needed once even if you already use Claude Code.
+  in JSON. For Codex, which is an agent with tools of its own, every
+  tool-bearing feature is switched off, and before a model is first used
+  (and again whenever Codex or its model entry changes) the app checks the
+  exact request Codex would send against a local stand-in: no tool beyond
+  an inert question prompt, and a model that tries to call a tool is
+  stopped at its first attempt. Nothing is sent upstream by that check.
+- Each engine keeps its own sign-in inside the app — `.data/claude/` and
+  `.data/codex/` — separate from any Claude Code or Codex install you may
+  have, so the login commands above are needed once even if you already
+  use those tools.
 
 > **Note for redistributors:** Anthropic requires prior approval for
 > third-party products that offer claude.ai sign-in (see the
 > [Agent SDK terms](https://code.claude.com/docs/en/agent-sdk/overview)).
 > Using this repo yourself on your own account is personal tooling; if you
-> ship a product based on it, get that approval first.
+> ship a product based on it, get that approval first, and check OpenAI's
+> terms before offering ChatGPT sign-in.
 
 ## Privacy
 
-- **Your resume content and job descriptions are sent to Claude (Anthropic)
-  for processing.** See [Anthropic's privacy policy](https://www.anthropic.com/legal/privacy).
+- **Your resume content and job descriptions are sent to the engine you
+  choose for processing: Claude (Anthropic) or Codex (OpenAI).** See
+  [Anthropic's privacy policy](https://www.anthropic.com/legal/privacy) and
+  [OpenAI's privacy policy](https://openai.com/policies/privacy-policy).
   Beyond that, the app's network traffic is LinkedIn itself (through your
   own signed-in browser session) and dependency downloads during setup;
   the bundled Claude CLI runs with telemetry and auto-update traffic
-  disabled.
+  disabled. The Codex CLI runs with web search off and only an allowlisted
+  environment (no API keys or proxy settings from yours reach it); its own
+  traffic goes to OpenAI.
 - The server binds to `127.0.0.1` only — nothing is exposed to your network.
 - All local state (your profile, jobs database, LinkedIn browser session)
   lives in `.data/`, created with owner-only permissions. Generated PDFs go
@@ -159,12 +192,14 @@ shipping something oversized or untrue.
 ## When something stops
 
 Every stop state is autonomous-by-default and visible: a banner explains
-what happened and the way out. Claude usage limit → queued scoring and
-package work pauses and resumes itself (never lost); one-off actions you
-trigger yourself (uploading a resume, Explain, Re-rank) fail with a clear
-error instead — retry them after the countdown; Claude sign-in expired →
-banner with the login command
-(Settings has a re-check button); LinkedIn checkpoint → search stops
+what happened and the way out. Usage limit (either engine) → queued
+scoring and package work pauses and resumes itself (never lost), and the
+engine picker shows when the limit resets and lets you switch to the other
+provider's model; one-off actions you trigger yourself (uploading a resume,
+Explain, Re-rank) fail with a clear error instead — retry them after the
+countdown or on the new model; sign-in expired → banner with the login
+command (Settings has a re-check button); chosen model not on your plan →
+banner, and work waits until you pick another; LinkedIn checkpoint → search stops
 cleanly, you solve it in the browser window and press Connect — the
 search then resumes on its own; LinkedIn session expired → reconnect
 from the Search tab. Interrupted work — including a killed server
@@ -196,6 +231,11 @@ docker run --rm -v "$PWD":/src:ro -v "$PWD/scripts/ci":/scratch:ro \
 # add -v "$HOME/ci-out":/out to keep its full test log and axe report
 ```
 
+The Codex engine tests (`backend/tests/test_codex_engine.py`) run the real
+Codex CLI, but only against localhost stand-ins — nothing is sent upstream
+and no subscription is spent. They skip when Codex is not installed; set
+`CODEX_TESTS_REQUIRED=1` to make that a failure instead.
+
 The browser tests (`backend/tests/test_ui_*.py`) drive the built frontend
 in Playwright's Chromium over synthetic API fixtures — no backend, no real
 data. They need `frontend/dist` (`cd frontend && npm run build`) and the
@@ -210,8 +250,8 @@ does.
 
 `PLAN.md` is the working spec. Architecture in short: FastAPI backend
 (SQLite state, SSE progress), React + Vite + Tailwind frontend, Playwright
-supervisor for LinkedIn, Tectonic/pdflatex for PDFs, Claude Agent SDK for
-all reasoning.
+supervisor for LinkedIn, Tectonic/pdflatex for PDFs, and the Claude Agent
+SDK or the Codex CLI — whichever you choose — for all reasoning.
 
 ## License
 
