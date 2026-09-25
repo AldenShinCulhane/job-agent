@@ -30,6 +30,10 @@ class State:
     allow_failed_requests: tuple[str, ...] = ()
 
 
+LOCKDOWN_FAILURE = ("Codex lockdown check failed for gpt-mini: input is not the "
+                    "user message alone")
+
+
 def _engine(codex=None, selection=None, **claude):
     """The engines view with Claude's state changed. A Claude that is not
     asking for a sign-in is signed in."""
@@ -176,6 +180,16 @@ STATES: list[State] = [
                            last_error="model not_found",
                            selection={"provider": "claude", "model": "claude-small"}),
           ready=("text=isn't available on your Claude plan",)),
+    State("settings-engine-unavailable", tab="Settings",
+          fixtures=_engine(status="ok", model="claude-sample", last_error=None,
+                           codex={"status": "unavailable", "model": "gpt-mini",
+                                  "last_error": LOCKDOWN_FAILURE,
+                                  "models": {"gpt-mini": {"status": "unavailable",
+                                                          "last_error": LOCKDOWN_FAILURE,
+                                                          "verified_at": None}}},
+                           selection={"provider": "codex", "model": "gpt-mini"}),
+          ready=("text=can't run under the app's safety lockdown on this version of Codex.",
+                 "text=Model unavailable")),
     State("settings-engine-codex-missing", tab="Settings",
           fixtures=_engine(status="ok", model="claude-sample", last_error=None,
                            codex={"status": "config_error", "catalog": None,

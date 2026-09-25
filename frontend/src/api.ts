@@ -83,9 +83,10 @@ export interface ModelState {
 }
 
 /** One provider's state, for one model. `status` combines the provider's
- * own state (sign-in, usage limit, setup) with the model's (entitlement):
- * ok | unprobed | not_entitled | auth_required | config_error |
- * waiting_usage_exhausted. */
+ * own state (sign-in, usage limit, setup) with the model's (entitlement,
+ * and whether it can run under the app's lockdown):
+ * ok | unprobed | not_entitled | unavailable | auth_required |
+ * config_error | waiting_usage_exhausted. */
 export interface EngineStatus {
   provider: Provider
   status: string

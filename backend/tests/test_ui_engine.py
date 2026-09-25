@@ -11,7 +11,7 @@ import json
 
 from backend.tests.test_ui_keyboard import _assert_stop, _focused, _tab_to
 from backend.tests.ui_harness import SIGNED_IN, engines_view, route_fixtures
-from backend.tests.ui_states import _busy, _dirty
+from backend.tests.ui_states import LOCKDOWN_FAILURE, _busy, _dirty
 
 WAITING = {"status": "waiting_usage_exhausted", "model": "claude-sample",
            "retry_in_seconds": 1500, "last_error": "usage limit reached",
@@ -186,6 +186,68 @@ def test_a_model_that_cannot_run_stays_chosen_and_says_why(browser, dist_url):
     page.wait_for_selector("header >> text=Model not on your plan")
     # The list says so too, and nothing switched by itself.
     assert "Claude Small — not on your plan" in page.inner_text("#engine-model")
+    context.close()
+
+
+LOCKED_OUT = {"gpt-mini": {"status": "unavailable", "last_error": LOCKDOWN_FAILURE,
+                           "verified_at": None}}
+
+
+def test_a_model_that_fails_the_lockdown_is_listed_but_never_offered(browser, dist_url):
+    """The model list was checked against the lockdown: one that fails it
+    shows as unavailable and cannot be picked, and the page says why."""
+    context, page, table, errors = _open(browser, dist_url, READY)
+    table["/api/engines"] = engines_view(claude={**READY, "episode": None},
+                                         codex={"models": LOCKED_OUT})
+    page.reload()
+    page.get_by_role("button", name="Settings", exact=True).click()
+    page.wait_for_selector("text=GPT Mini can't run under the app's safety lockdown")
+    locked = page.locator("#engine-model option", has_text="GPT Mini")
+    assert locked.inner_text() == "GPT Mini — unavailable"
+    assert locked.is_disabled()
+    assert page.locator("#engine-model option", has_text="GPT Sample").is_enabled()
+    page.wait_for_selector("text=GPT Mini can't run under the app's safety lockdown on "
+                           "this version of Codex.")
+    assert errors == []
+    context.close()
+
+
+def test_the_move_off_an_unavailable_model_is_one_choice(browser, dist_url):
+    context, page, table, errors = _open(browser, dist_url, READY)
+    table["/api/engines"] = engines_view(
+        claude={**READY, "episode": None},
+        codex={"status": "unavailable", "model": "gpt-mini",
+               "last_error": LOCKDOWN_FAILURE, "models": LOCKED_OUT},
+        selection={"provider": "codex", "model": "gpt-mini"})
+    bodies: list = []
+
+    def select(route, *_):
+        bodies.append(json.loads(route.request.post_data))
+        table["/api/engines"] = engines_view(
+            claude={**READY, "episode": None},
+            codex={"status": "ok", "model": "gpt-sample", "models": LOCKED_OUT,
+                   "verified_at": "2026-09-15T12:00:00Z"},
+            selection={"provider": "codex", "model": "gpt-sample"})
+        route.fulfill(status=200, content_type="application/json", body=json.dumps({
+            "selection": {"provider": "codex", "model": "gpt-sample"},
+            "ok": True, "verified": True, "model": "gpt-sample"}))
+    page.route("**/api/engine/selection", select)
+    page.reload()
+    page.wait_for_selector("header >> text=Model unavailable")
+    page.get_by_role("button", name="Choose model").click()
+    page.wait_for_function("() => document.activeElement?.id === 'engine-heading'")
+    page.wait_for_selector("text=GPT Mini can't run under the app's safety lockdown on "
+                           "this version of Codex.")
+    assert LOCKDOWN_FAILURE in page.inner_text("main")
+    # The current choice stays shown for what it is; the way off is one pick.
+    assert page.locator("#engine-model").input_value() == "codex:gpt-mini"
+    page.get_by_label("Model for every task").select_option(label="GPT Sample")
+    page.get_by_role("button", name="Use this model").click()
+    page.wait_for_selector("text=Every task now uses GPT Sample — checked, and it answers.")
+    assert bodies == [{"provider": "codex", "model": "gpt-sample"}]
+    page.wait_for_selector("header >> text=Codex ready · GPT Sample")
+    assert page.get_by_role("button", name="Re-check engine").is_enabled()
+    assert errors == []
     context.close()
 
 

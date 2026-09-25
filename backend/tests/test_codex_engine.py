@@ -40,7 +40,15 @@ ENTRY = {
     "input_modalities": ["text", "image"],
     "include_skills_usage_instructions": True,
     "base_instructions": "Codex's own system prompt",
-    "model_messages": {"instructions_template": "Codex's own template"},
+    "model_messages": {"instructions_template": "Codex's own template",
+                       "persistent_instructions": "Codex's persistent mode",
+                       "multi_agent": {"role": "Codex's sub-agent roles"},
+                       "approvals": "Codex's approval policy"},
+    # The code and multi-agent modes newer Codex models ship with.
+    "tool_mode": "code_mode_only",
+    "multi_agent_version": "v2",
+    "multi_agent_reasoning_effort": "xhigh",
+    "use_responses_lite": True,
 }
 SCHEMA = {"type": "object", "properties": {"x": {"type": "string", "minLength": 3}},
           "required": ["x"], "additionalProperties": False}
@@ -401,8 +409,15 @@ def test_the_catalog_entry_is_rewritten_without_tools_or_codexs_prompt():
     assert locked["input_modalities"] == ["text"]
     assert locked["include_skills_usage_instructions"] is False
     assert locked["base_instructions"] == codex_engine.BASE_INSTRUCTIONS
-    assert locked["model_messages"]["instructions_template"] == codex_engine.BASE_INSTRUCTIONS
+    # The app's instructions are the only prompt text the entry carries.
+    assert locked["model_messages"] == {"instructions_template": codex_engine.BASE_INSTRUCTIONS}
+    # No code mode, no sub-agents, and the request shape with the
+    # instructions in their own field.
+    for field in ("tool_mode", "multi_agent_version", "multi_agent_reasoning_effort"):
+        assert field not in locked
+    assert locked["use_responses_lite"] is False
     assert ENTRY["apply_patch_tool_type"] == "freeform"  # the source is untouched
+    assert ENTRY["tool_mode"] == "code_mode_only"
 
 
 def test_the_picker_never_offers_hidden_models_or_delegation(monkeypatch):
@@ -481,25 +496,35 @@ async def test_a_verification_is_reused_until_something_it_bound_changes(fake, m
     assert third not in (first, second) and len(checks.runs) == 6
 
 
-@pytest.mark.parametrize("setup, message", [
+MODEL_ONLY = llm.ModelUnavailable
+
+
+@pytest.mark.parametrize("setup, message, scope", [
+    # What Codex sends for this model, or does with a forced tool call:
+    # the model is unavailable, the provider is not broken.
     (lambda c: setattr(c, "captured", [locked_request(tools=[
-        {"type": "function", "name": "exec_command"}])]), "tools beyond the allowlist"),
+        {"type": "function", "name": "exec_command"}])]), "tools beyond the allowlist",
+     MODEL_ONLY),
     (lambda c: setattr(c, "captured", [locked_request(), locked_request()]),
-     "expected one request"),
+     "expected one request", MODEL_ONLY),
     (lambda c: setattr(c, "captured", [locked_request(previous_response_id="resp_1")]),
-     "previous_response_id"),
+     "previous_response_id", MODEL_ONLY),
     (lambda c: setattr(c, "captured", [locked_request(model="gpt-other")]),
-     "not the chosen"),
-    (lambda c: setattr(c, "refusal", None), "was not detected"),
+     "not the chosen", MODEL_ONLY),
+    (lambda c: setattr(c, "refusal", None), "was not detected", MODEL_ONLY),
     (lambda c: setattr(c, "guard_requests", codex_engine.LOOP_GUARD_MAX_REQUESTS + 1),
-     "loop guard let"),
+     "loop guard let", MODEL_ONLY),
+    # Codex sent nothing at all: it would not run for any model.
+    (lambda c: setattr(c, "captured", []), "sent no request", llm.ConfigError),
+    (lambda c: setattr(c, "guard_requests", 0), "sent no request", llm.ConfigError),
 ])
 async def test_a_failed_verification_is_a_config_error_and_never_stored(
-        fake, monkeypatch, setup, message):
+        fake, monkeypatch, setup, message, scope):
     checks = Checks(monkeypatch)
     setup(checks)
-    with pytest.raises(llm.ConfigError, match=message):
+    with pytest.raises(llm.ConfigError, match=message) as caught:
         await codex_engine.verify(MODEL)
+    assert isinstance(caught.value, llm.ModelUnavailable) == (scope is MODEL_ONLY)
     assert codex_engine._verified() == {}
 
 
@@ -675,7 +700,9 @@ def real_codex(home, monkeypatch):
         pytest.skip("Codex CLI not installed")
     listed = codex_cli.models()
     assert listed, "Codex lists no models"
-    return SimpleNamespace(exe=exe, model=listed[-1]["id"], home=home)
+    # Every model the picker offers is held to the lockdown, not a sample.
+    return SimpleNamespace(exe=exe, models=[m["id"] for m in listed],
+                           model=listed[-1]["id"], home=home)
 
 
 class Answering(codex_engine.LocalResponses):
@@ -715,12 +742,12 @@ def aim_at(monkeypatch, server, name="standin"):
     monkeypatch.setattr(codex_engine, "build_launch", build_launch)
 
 
-async def _locked_launch(codex, server, work):
-    locked = codex_engine.locked_entry(await codex_engine._catalog_entry(codex.exe, codex.model))
+async def _locked_launch(codex, model, server, work):
+    locked = codex_engine.locked_entry(await codex_engine._catalog_entry(codex.exe, model))
     schema = work / "schema.json"
     schema.write_text(json.dumps(codex_engine.PROBE_SCHEMA))
     return codex_engine.build_launch(
-        codex.exe, codex.model, "low", catalog_path=codex_engine._catalog_file(locked),
+        codex.exe, model, "low", catalog_path=codex_engine._catalog_file(locked),
         schema_path=schema, output_path=work / "answer.json",
         provider=("adversary", server.url))
 
@@ -745,65 +772,93 @@ async def test_the_real_codex_passes_its_lockdown_check(real_codex, monkeypatch)
         return await check(exe, model, locked, mode)
 
     monkeypatch.setattr(codex_engine, "_check_launch", counted)
-    fp = await codex_engine.verify(real_codex.model)
-    assert codex_engine._verified()[real_codex.model]["fingerprint"] == fp
-    assert runs == ["capture", "tool_call"]
-    assert await codex_engine.verify(real_codex.model) == fp
-    assert runs == ["capture", "tool_call"]
+    for model in real_codex.models:
+        runs.clear()
+        fp = await codex_engine.verify(model)
+        assert codex_engine._verified()[model]["fingerprint"] == fp
+        assert runs == ["capture", "tool_call"]
+        assert await codex_engine.verify(model) == fp
+        assert runs == ["capture", "tool_call"], model
 
 
 async def test_the_real_capture_is_exactly_the_locked_request(real_codex):
-    locked = codex_engine.locked_entry(
-        await codex_engine._catalog_entry(real_codex.exe, real_codex.model))
-    server = await codex_engine._check_launch(real_codex.exe, real_codex.model, locked,
-                                              "capture")
-    assert len(server.requests) == 1
-    body = server.requests[0]
-    assert codex_engine.check_request(body, real_codex.model) == []
-    assert codex_engine.check_request(body, "gpt-other") != []
-    assert {t.get("name") or t.get("type") for t in body.get("tools") or []} <= (
-        codex_engine.ALLOWED_TOOLS)
+    for model in real_codex.models:
+        locked = codex_engine.locked_entry(
+            await codex_engine._catalog_entry(real_codex.exe, model))
+        server = await codex_engine._check_launch(real_codex.exe, model, locked, "capture")
+        assert len(server.requests) == 1, model
+        body = server.requests[0]
+        assert codex_engine.check_request(body, model) == [], model
+        assert codex_engine.check_request(body, "gpt-other") != []
+        assert {t.get("name") or t.get("type") for t in body.get("tools") or []} <= (
+            codex_engine.ALLOWED_TOOLS)
+
+
+async def test_the_catalog_rewrite_is_what_locks_the_agent_mode_models(real_codex):
+    """On this Codex build the listed models that ship a code or
+    multi-agent mode fail the check with those fields left in, and pass
+    with the rewrite: the fields, not something else, are the difference."""
+    agent_mode = []
+    for model in real_codex.models:
+        entry = await codex_engine._catalog_entry(real_codex.exe, model)
+        if not (any(entry.get(f) for f in codex_engine._AGENT_MODE_FIELDS)
+                or entry.get("use_responses_lite")):
+            continue
+        agent_mode.append(model)
+        unlocked = codex_engine.locked_entry(entry)
+        for field in (*codex_engine._AGENT_MODE_FIELDS, "use_responses_lite"):
+            if field in entry:
+                unlocked[field] = entry[field]
+        unlocked["model_messages"] = {**(entry.get("model_messages") or {}),
+                                      "instructions_template": codex_engine.BASE_INSTRUCTIONS}
+        server = await codex_engine._check_launch(real_codex.exe, model, unlocked, "capture")
+        assert codex_engine.check_request(server.requests[0], model) != [], model
+    if not agent_mode:
+        pytest.skip("no listed model ships a code or multi-agent mode on this Codex")
 
 
 @pytest.mark.parametrize("tool", TOOLS)
 async def test_a_forced_tool_call_runs_nothing_on_the_real_codex(real_codex, tool):
-    sentinel = real_codex.home / f"sentinel-{tool}"
-    work = real_codex.home / "work"
-    work.mkdir()
-    async with codex_engine.LocalResponses("tool_call", tool=tool) as server:
-        if tool == "apply_patch":
-            server.patch_input = (f"*** Begin Patch\n*** Add File: {sentinel}\n+ran\n"
-                                  "*** End Patch\n")
-        else:
-            server.arguments = adversarial_arguments(sentinel)[tool]
-        launch = await _locked_launch(real_codex, server, work)
-        started = time.monotonic()
-        state = await codex_engine.execute(launch, codex_engine.PROBE_TEXT, timeout=60)
-        elapsed = time.monotonic() - started
-    assert state.refusal or state.breach, f"{tool}: the call was not stopped"
-    assert state.answer is None
-    assert len(server.requests) <= codex_engine.LOOP_GUARD_MAX_REQUESTS
-    assert elapsed < 30
-    await asyncio.sleep(0.5)
-    assert not sentinel.exists()
+    for model in real_codex.models:
+        sentinel = real_codex.home / f"sentinel-{tool}-{model}"
+        work = real_codex.home / f"work-{model}"
+        work.mkdir()
+        async with codex_engine.LocalResponses("tool_call", tool=tool) as server:
+            if tool == "apply_patch":
+                server.patch_input = (f"*** Begin Patch\n*** Add File: {sentinel}\n+ran\n"
+                                      "*** End Patch\n")
+            else:
+                server.arguments = adversarial_arguments(sentinel)[tool]
+            launch = await _locked_launch(real_codex, model, server, work)
+            started = time.monotonic()
+            state = await codex_engine.execute(launch, codex_engine.PROBE_TEXT, timeout=60)
+            elapsed = time.monotonic() - started
+        assert state.refusal or state.breach, f"{model} {tool}: the call was not stopped"
+        assert state.answer is None, model
+        assert len(server.requests) <= codex_engine.LOOP_GUARD_MAX_REQUESTS, model
+        assert elapsed < 30, model
+        await asyncio.sleep(0.5)
+        assert not sentinel.exists(), model
 
 
 @pytest.mark.parametrize("tool", TOOLS)
 async def test_a_forced_tool_call_fails_only_that_call(real_codex, monkeypatch, tool):
-    sentinel = real_codex.home / f"sentinel-{tool}"
-    async with codex_engine.LocalResponses("tool_call", tool=tool) as server:
-        if tool == "apply_patch":
-            server.patch_input = (f"*** Begin Patch\n*** Add File: {sentinel}\n+ran\n"
-                                  "*** End Patch\n")
-        else:
-            server.arguments = adversarial_arguments(sentinel)[tool]
-        aim_at(monkeypatch, server)
-        ctx = llm.CallContext("codex", real_codex.model, "low")
-        with pytest.raises((llm.ToolCallBlocked, llm.ConfigError)):
-            await codex_engine.call(ctx, "Reply.", codex_engine.PROBE_SCHEMA, "s")
-    assert len(server.requests) <= codex_engine.LOOP_GUARD_MAX_REQUESTS
-    await asyncio.sleep(0.5)
-    assert not sentinel.exists()
+    for model in real_codex.models:
+        sentinel = real_codex.home / f"sentinel-{tool}-{model}"
+        async with codex_engine.LocalResponses("tool_call", tool=tool) as server:
+            if tool == "apply_patch":
+                server.patch_input = (f"*** Begin Patch\n*** Add File: {sentinel}\n+ran\n"
+                                      "*** End Patch\n")
+            else:
+                server.arguments = adversarial_arguments(sentinel)[tool]
+            with monkeypatch.context() as m:
+                aim_at(m, server)
+                ctx = llm.CallContext("codex", model, "low")
+                with pytest.raises((llm.ToolCallBlocked, llm.ConfigError)):
+                    await codex_engine.call(ctx, "Reply.", codex_engine.PROBE_SCHEMA, "s")
+        assert len(server.requests) <= codex_engine.LOOP_GUARD_MAX_REQUESTS, model
+        await asyncio.sleep(0.5)
+        assert not sentinel.exists(), model
 
 
 @pytest.mark.parametrize("status, body, kind", [
@@ -844,25 +899,28 @@ async def test_a_structured_call_on_codex_end_to_end(real_codex, monkeypatch):
     monkeypatch.setattr(llm, "_semaphore", None)
     monkeypatch.setattr(llm, "_credential_checks", {})
     monkeypatch.setattr(llm, "credential_problem", lambda provider: None)
-    llm.select("codex", real_codex.model)
-    llm._set_model_state("codex", real_codex.model,
-                         {"status": "ok", "last_error": None, "verified_at": None})
     schema = {"type": "object", "properties": {"x": {"type": "string", "minLength": 1}},
               "required": ["x"], "additionalProperties": False}
+    for model in real_codex.models:
+        llm.select("codex", model)
+        llm._set_model_state("codex", model,
+                             {"status": "ok", "last_error": None, "verified_at": None})
+        async with codex_engine.LocalResponses("answer", answer='{"x": "y"}') as server:
+            with monkeypatch.context() as m:
+                aim_at(m, server)
+                answer = await llm.structured("Say y.", schema, task="extract")
 
-    async with codex_engine.LocalResponses("answer", answer='{"x": "y"}') as server:
-        aim_at(monkeypatch, server)
-        answer = await llm.structured("Say y.", schema, task="extract")
-
-    assert answer == {"x": "y"}
-    stored = codex_engine._verified()[real_codex.model]["fingerprint"]
-    assert answer.context.fingerprint == stored
-    assert answer.context.provider == "codex" and answer.context.model == real_codex.model
-    body = server.requests[0]
-    assert body["instructions"] == codex_engine.BASE_INSTRUCTIONS
-    assert {t.get("name") or t.get("type") for t in body.get("tools") or []} <= (
-        codex_engine.ALLOWED_TOOLS)
-    [message] = body["input"]
-    [text] = [c["text"] for c in message["content"]]
-    assert text.endswith("# Task\nSay y.")
-    assert engine_fakes.engine_value("status", "codex") in (None, "ok")
+        assert answer == {"x": "y"}, model
+        stored = codex_engine._verified()[model]["fingerprint"]
+        assert answer.context.fingerprint == stored
+        assert answer.context.provider == "codex" and answer.context.model == model
+        [body] = server.requests
+        assert body["model"] == model and body["store"] is False
+        assert body["instructions"] == codex_engine.BASE_INSTRUCTIONS
+        assert {t.get("name") or t.get("type") for t in body.get("tools") or []} <= (
+            codex_engine.ALLOWED_TOOLS)
+        [message] = body["input"]
+        assert (message["type"], message["role"]) == ("message", "user"), model
+        [text] = [c["text"] for c in message["content"]]
+        assert text.endswith("# Task\nSay y.")
+        assert engine_fakes.engine_value("status", "codex") in (None, "ok")

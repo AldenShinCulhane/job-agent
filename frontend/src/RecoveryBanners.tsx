@@ -62,6 +62,15 @@ export default function RecoveryBanners({
       action: { label: 'Choose model', run: onOpenEngine },
     })
   }
+  if (engines && engine?.status === 'unavailable') {
+    const model = modelLabel(engines, engine.provider, engine.model) ?? 'The selected model'
+    banners.push({
+      key: 'engine-lockdown',
+      tone: 'danger',
+      text: `${model} can't run under the app's safety lockdown on this version of ${name} — choose another model. Scoring and package generation wait until you do.`,
+      action: { label: 'Choose model', run: onOpenEngine },
+    })
+  }
   if (engines && engine?.status === 'waiting_usage_exhausted') {
     const retry = retryText(engine.retry_in_seconds)
     const other = otherProvider(engine.provider)

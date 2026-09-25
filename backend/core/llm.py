@@ -138,6 +138,13 @@ class ConfigError(EngineError):
     """Invalid engine configuration — fail loudly, do not retry."""
 
 
+class ModelUnavailable(ConfigError):
+    """This one model cannot run under the app's lockdown on the installed
+    engine (the request Codex builds for it fails the check). Scoped to the
+    model: the provider and its other models stay usable. A ConfigError to
+    every caller: nothing is retried and nothing this job did is wrong."""
+
+
 class ToolCallBlocked(Exception):
     """The model tried to call a tool; the engine refused it and the app
     stopped the call. Deliberately NOT an EngineError: the engine is
@@ -500,6 +507,16 @@ def _record_usage(ctx: CallContext, exc: UsageExhausted) -> None:
     _announce(previous)
 
 
+def _record_unavailable(provider: str, model: str | None, error: str) -> None:
+    """A model that failed the lockdown check: shown as unavailable, never
+    as usable, until a check passes for it."""
+    previous = _signature()
+    if model:
+        _set_model_state(provider, model, {
+            "status": "unavailable", "last_error": error, "verified_at": None})
+    _announce(previous)
+
+
 def _record_not_entitled(ctx: CallContext, error: str) -> None:
     previous = _signature()
     if ctx.model:
@@ -807,6 +824,8 @@ def _route_failure(ctx: CallContext, exc: EngineError) -> None:
         _record_usage(ctx, exc)
     elif isinstance(exc, AuthRequired):
         _record_problem(ctx, ctx.provider, "auth_required", str(exc))
+    elif isinstance(exc, ModelUnavailable):
+        _record_unavailable(ctx.provider, ctx.model, str(exc))
     elif isinstance(exc, ConfigError):
         _record_problem(ctx, ctx.provider, "config_error", str(exc))
     elif isinstance(exc, ModelNotEntitled):
@@ -886,6 +905,11 @@ async def _resolve(chosen: dict) -> str:
     if state.get("status") == "not_entitled":
         raise ModelNotEntitled(state.get("last_error")
                                or f"{model} is not available on this plan")
+    if state.get("status") == "unavailable":
+        # Known to fail the lockdown; a re-check or a refreshed model list
+        # checks it again.
+        raise ModelUnavailable(state.get("last_error")
+                               or f"{model} cannot run under the app's lockdown")
     return await _probe_chosen(provider, model)
 
 
@@ -983,7 +1007,34 @@ async def refresh_catalog(provider: str) -> list[dict]:
     _put_json(provider, "catalog", catalog)
     _put(provider, "catalog_error", None)
     _announce(previous)
+    if provider == "codex":
+        await _check_lockdowns([entry["id"] for entry in catalog])
     return catalog
+
+
+async def _check_lockdowns(models: list[str]) -> None:
+    """Check every listed Codex model against the lockdown, so the picker
+    shows one that cannot meet it as unavailable before anyone chooses it.
+    Local only: each check runs Codex against a localhost stand-in, and a
+    pass is reused until Codex or the model's entry changes. A failure of
+    Codex itself (it will not start, its catalog cannot be read) is a
+    provider problem and stops the round."""
+    from backend.core import codex_engine
+    for model in models:
+        try:
+            await codex_engine.ensure_verified(model)
+        except ModelUnavailable as exc:
+            _record_unavailable("codex", model, str(exc))
+        except ConfigError as exc:
+            _record_problem(None, "codex", "config_error", str(exc))
+            return
+        except EngineError:
+            continue  # not in the catalog after all: nothing to show
+        else:
+            if _model_state("codex", model).get("status") == "unavailable":
+                previous = _signature()
+                _set_model_state("codex", model, None)
+                _announce(previous)
 
 
 # --- legacy state -------------------------------------------------------------------

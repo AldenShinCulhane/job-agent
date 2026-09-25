@@ -1964,6 +1964,92 @@ async def test_engine_blocked_packages_recover_automatically(
     assert db.get_package(pkg)["status"] == "done"
 
 
+async def test_a_package_parked_on_an_unavailable_model_resumes_on_a_verified_one(
+    test_db, tmp_path, monkeypatch
+):
+    """P6a R1-4: the chosen Codex model cannot meet the lockdown, so the
+    package parks without anything being sent. The user picks a model that
+    passes: that one choice proves it and the same package resumes to done
+    on it — no Re-check pressed. Real engine routing throughout; only the
+    Codex process (its lockdown check and its answers) is stood in for."""
+    import asyncio
+
+    from backend.api import routes
+    from backend.core import codex_engine, llm
+    from backend.tailor import pipeline as tailor_pipeline
+    from backend.tailor import resume as tailor_resume
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    pkg, _ = _create_package("p1", version, "hash-a")
+    _fake_compiler(monkeypatch, lambda tex: 1)
+    monkeypatch.setattr(tailor_pipeline, "OUTPUT_ROOT", tmp_path / "output")
+    monkeypatch.setattr(llm, "_semaphore", None)
+    monkeypatch.setattr(llm, "_credential_checks", {})
+    monkeypatch.setattr(llm, "credential_problem", lambda provider: None)
+    for name in ("_package_worker_task", "_package_stall_task", "_package_stall_token",
+                 "_package_retry_task"):
+        monkeypatch.setattr(routes, name, None)
+    rechecks = []
+    monkeypatch.setattr(routes.llm, "reset_probe", lambda: rechecks.append(1))
+
+    locked_out, verified = "gpt-test-code-mode", "gpt-test-verified"
+    sent: list[str] = []
+
+    async def ensure_verified(model):
+        if model == locked_out:
+            raise llm.ModelUnavailable(
+                f"Codex lockdown check failed for {model}: input is not the user "
+                "message alone")
+        return "fp-" + model
+
+    async def call_once(ctx, prompt, schema, system_prompt):
+        sent.append(ctx.model)
+        if "claim_id" in prompt:  # entailment: every claim supported
+            ids = [json.loads(line)["claim_id"] for line in prompt.splitlines()
+                   if line.startswith("{")]
+            return {"verdicts": [{"claim_id": i, "supported": True, "reason": "ok"}
+                                 for i in ids]}
+        return {"ok": True}
+
+    async def generate(profile, ledger, job, requirements, breakdown, page_limit):
+        # The tailoring call goes through the real engine path.
+        answer = await llm.structured("tailor " + job["job_id"],
+                                      codex_engine.PROBE_SCHEMA, task="tailor")
+        return llm.Structured(_cited_tailored()[0], answer.context)
+
+    monkeypatch.setattr(codex_engine, "ensure_verified", ensure_verified)
+    monkeypatch.setattr(codex_engine, "_call_once", call_once)
+    monkeypatch.setattr(tailor_resume, "generate_tailored", generate)
+
+    llm.select("codex", locked_out)
+    await routes._package_batch_worker()
+    row = db.get_package(pkg)
+    assert row["status"] == "queued" and "ModelUnavailable" in row["error"]
+    assert sent == []  # nothing reached a model
+    assert llm.engine_status()["status"] == "unavailable"
+    assert db.get_state("engine.codex.status") is None  # Codex itself is fine
+    assert routes._read_stall(routes._PACKAGE_STALL_KEY) is not None
+
+    body = await routes.put_engine_selection({"provider": "codex", "model": verified})
+    assert (body["ok"], body["verified"], body["model"]) == (True, True, verified)
+    assert routes._read_stall(routes._PACKAGE_STALL_KEY) is None
+    worker = routes._package_worker_task
+    assert worker is not None  # the choice itself resumed the batch
+    await asyncio.wait_for(worker, timeout=5)
+    row = db.get_package(pkg)
+    assert row["status"] == "done"
+    assert rechecks == []
+    assert set(sent) == {verified}
+    calls = row["provenance"]["llm_calls"]
+    assert calls and {(c["provider"], c["model"]) for c in calls} == {("codex", verified)}
+    stall_task = routes._package_stall_task
+    if stall_task is not None:
+        stall_task.cancel()
+        await asyncio.gather(stall_task, return_exceptions=True)
+
+
 # --- Review round 2: supersede on input change, captcha, snapshots -----------
 
 async def test_posting_change_mid_generation_supersedes_package(

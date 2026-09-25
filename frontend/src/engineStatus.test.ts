@@ -41,6 +41,9 @@ test('the badge names the engine in use', () => {
   assert.equal(engineBadge({ provider: 'claude', status: 'auth_required' }).label,
     'Sign in to Claude required')
   assert.equal(engineBadge({ provider: 'claude', status: 'not_entitled' }).tone, 'danger')
+  // A model that cannot meet the lockdown is never shown as usable.
+  assert.deepEqual(engineBadge({ provider: 'codex', status: 'unavailable' }),
+    { label: 'Model unavailable', tone: 'danger' })
   assert.equal(engineBadge({ provider: 'codex', status: 'waiting_usage_exhausted' }).tone, 'warn')
   // An unknown status still renders, under its own name.
   assert.deepEqual(engineBadge({ provider: 'codex', status: 'rebooting' }),

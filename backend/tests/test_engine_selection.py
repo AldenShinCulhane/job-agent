@@ -35,6 +35,10 @@ ANSWER = {"x": "y"}
 CLAUDE_A = "claude-opus-5"
 CLAUDE_B = "claude-sonnet-5"
 CODEX = "gpt-test-codex"
+CODEX_LOCKED_OUT = "gpt-test-code-mode"
+LOCKDOWN_FAILURE = llm.ModelUnavailable(
+    "Codex lockdown check failed for gpt-test-code-mode: input is not the user "
+    "message alone")
 
 
 # --- stand-ins ---------------------------------------------------------------
@@ -66,6 +70,8 @@ class Calls:
         self.sent: list[llm.CallContext] = []
         self.outcomes: list = []
         self.verified: list[str] = []
+        # model -> the error its lockdown check ends in
+        self.unverifiable: dict[str, Exception] = {}
 
         async def claude_call(ctx, prompt, schema, system_prompt):
             return await self._next(ctx), None
@@ -74,10 +80,14 @@ class Calls:
             return await self._next(ctx), None
 
         async def codex_probe(ctx):
+            # As the real probe: the lockdown first, then one answer.
+            await codex_engine.ensure_verified(ctx.model)
             await self._next(ctx)
 
         async def ensure_verified(model):
             self.verified.append(model)
+            if model in self.unverifiable:
+                raise self.unverifiable[model]
             return "fp-" + model
 
         monkeypatch.setattr(llm, "_claude_call", claude_call)
@@ -332,7 +342,8 @@ async def test_an_explicit_codex_model_never_falls_back(engine):
         await llm.structured("p", SCHEMA, task="extract")
 
     assert [(c.provider, c.model) for c in engine.calls.sent] == [("codex", CODEX)]
-    assert engine.calls.verified == []  # never got as far as a real call
+    # Only the probe's own lockdown check: no real call followed it.
+    assert engine.calls.verified == [CODEX]
     assert llm.selection() == {"provider": "codex", "model": CODEX}
     assert llm.provider_status("claude", None)["status"] == "unprobed"
 
@@ -510,6 +521,97 @@ async def test_a_sign_in_problem_during_a_limit_clears_back_to_waiting(engine):
     llm._record_problem(None, "claude", "auth_required", "401 Unauthorized")
     llm.reset_probe()
     assert llm.engine_status()["status"] == "waiting_usage_exhausted"
+
+
+# --- a model that fails the lockdown -------------------------------------------
+
+async def test_a_model_that_fails_the_lockdown_is_unavailable_on_its_own(engine):
+    """Its lockdown check fails for what Codex would send for that model:
+    the model is unavailable, nothing is sent, and Codex and its other
+    models stay usable."""
+    engine.calls.unverifiable[CODEX_LOCKED_OUT] = LOCKDOWN_FAILURE
+    llm.select("codex", CODEX_LOCKED_OUT)
+    with pytest.raises(llm.ModelUnavailable):
+        await llm.structured("p", SCHEMA, task="extract")
+    assert engine.calls.sent == []
+
+    status = llm.engine_status()
+    assert (status["status"], status["model"]) == ("unavailable", CODEX_LOCKED_OUT)
+    assert "input is not the user message alone" in status["last_error"]
+    assert engine_fakes.engine_value("status", "codex") is None  # the provider is fine
+    view = llm.engines_view()["providers"]["codex"]
+    assert view["models"][CODEX_LOCKED_OUT]["status"] == "unavailable"
+
+    # Known now: the next call says so without checking again.
+    with pytest.raises(llm.ModelUnavailable):
+        await llm.structured("p", SCHEMA, task="extract")
+    assert engine.calls.verified == [CODEX_LOCKED_OUT]
+
+    # Another Codex model runs at once.
+    llm.select("codex", CODEX)
+    engine.calls.outcomes.extend(["ok", ANSWER])
+    assert await llm.structured("p", SCHEMA, task="extract") == ANSWER
+    assert llm.engine_status()["status"] == "ok"
+
+
+async def test_a_codex_that_will_not_run_is_the_providers_problem(engine):
+    engine.calls.unverifiable[CODEX] = llm.ConfigError(
+        "Codex lockdown check: Codex sent no request")
+    llm.select("codex", CODEX)
+    known_ok("codex", CODEX)
+    with pytest.raises(llm.ConfigError) as caught:
+        await llm.structured("p", SCHEMA, task="extract")
+    assert not isinstance(caught.value, llm.ModelUnavailable)
+    assert engine_fakes.engine_value("status", "codex") == "config_error"
+    assert llm.engine_status()["status"] == "config_error"
+
+
+async def test_rechecking_an_unavailable_model_checks_its_lockdown_again(engine):
+    engine.calls.unverifiable[CODEX_LOCKED_OUT] = LOCKDOWN_FAILURE
+    llm.select("codex", CODEX_LOCKED_OUT)
+    with pytest.raises(llm.ModelUnavailable):
+        await llm.probe()
+
+    # A Codex update fixed it.
+    del engine.calls.unverifiable[CODEX_LOCKED_OUT]
+    llm.reset_probe()
+    engine.calls.outcomes.append("ok")
+    assert await llm.probe() == CODEX_LOCKED_OUT
+    assert llm.engine_status()["status"] == "ok"
+    assert engine.calls.verified == [CODEX_LOCKED_OUT, CODEX_LOCKED_OUT]
+
+
+LISTED = [{"id": m, "label": m, "description": "", "efforts": ["low"]}
+          for m in ("gpt-test-a", CODEX_LOCKED_OUT, "gpt-test-b")]
+
+
+async def test_refreshing_the_list_checks_every_listed_model(engine, monkeypatch):
+    """The picker shows a model that cannot meet the lockdown as
+    unavailable before anyone chooses it; a later pass clears it."""
+    monkeypatch.setattr(codex_engine.codex_cli, "models", lambda: LISTED)
+    engine.calls.unverifiable[CODEX_LOCKED_OUT] = LOCKDOWN_FAILURE
+
+    await llm.refresh_catalog("codex")
+    assert engine.calls.verified == [m["id"] for m in LISTED]
+    models = llm.engines_view()["providers"]["codex"]["models"]
+    assert models == {CODEX_LOCKED_OUT: {
+        "status": "unavailable", "last_error": str(LOCKDOWN_FAILURE), "verified_at": None}}
+    assert engine_fakes.engine_value("status", "codex") is None
+    assert engine.calls.sent == []  # local checks only; nothing sent
+
+    del engine.calls.unverifiable[CODEX_LOCKED_OUT]
+    await llm.refresh_catalog("codex")
+    assert llm.engines_view()["providers"]["codex"]["models"] == {}
+
+
+async def test_a_codex_that_will_not_run_stops_the_list_check(engine, monkeypatch):
+    monkeypatch.setattr(codex_engine.codex_cli, "models", lambda: LISTED)
+    engine.calls.unverifiable["gpt-test-a"] = llm.ConfigError(
+        "Codex lockdown check: Codex sent no request")
+    await llm.refresh_catalog("codex")
+    assert engine.calls.verified == ["gpt-test-a"]
+    assert engine_fakes.engine_value("status", "codex") == "config_error"
+    assert llm.engines_view()["providers"]["codex"]["models"] == {}
 
 
 # --- reported reset vs retry estimate ----------------------------------------
@@ -945,6 +1047,25 @@ def test_put_selection_keeps_the_choice_when_the_model_fails(client):
     # The app never switches engines by itself.
     assert llm.selection() == {"provider": "codex", "model": CODEX}
     assert client.recovered == []
+
+
+def test_put_selection_moves_off_an_unavailable_model_without_a_recheck(client):
+    """R1-4: one model that cannot meet the lockdown must not block the move
+    to one that can. Choosing the verified model proves it and resumes the
+    parked work; nobody presses Re-check."""
+    client.calls.unverifiable[CODEX_LOCKED_OUT] = LOCKDOWN_FAILURE
+    body = client.http.put("/api/engine/selection",
+                           json={"provider": "codex", "model": CODEX_LOCKED_OUT}).json()
+    assert (body["ok"], body["error"]) == (False, "ModelUnavailable")
+    assert llm.selection() == {"provider": "codex", "model": CODEX_LOCKED_OUT}
+    assert client.recovered == [] and client.calls.sent == []
+
+    client.calls.outcomes.append("ok")
+    body = client.http.put("/api/engine/selection",
+                           json={"provider": "codex", "model": CODEX}).json()
+    assert (body["ok"], body["verified"], body["model"]) == (True, True, CODEX)
+    assert client.recovered == [1]
+    assert [(c.provider, c.model) for c in client.calls.sent] == [("codex", CODEX)]
 
 
 def test_put_selection_on_a_waiting_provider_spends_nothing(client):

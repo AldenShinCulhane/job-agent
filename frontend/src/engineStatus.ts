@@ -48,6 +48,7 @@ export function engineBadge(engine: Pick<EngineStatus, 'status' | 'provider'>): 
       ok: { label: `${name} ready`, tone: 'ok' },
       unprobed: { label: `${name} not checked yet`, tone: 'neutral' },
       not_entitled: { label: 'Model not on your plan', tone: 'danger' },
+      unavailable: { label: 'Model unavailable', tone: 'danger' },
       waiting_usage_exhausted: { label: `${name} usage limit reached`, tone: 'warn' },
       auth_required: { label: `Sign in to ${name} required`, tone: 'danger' },
       config_error: { label: `${name} setup problem`, tone: 'danger' },

@@ -118,11 +118,16 @@ any model ID. The app never switches engines or models by itself.
 - The model is locked down for this app: no file, shell, or web tools, and
   no open-ended agent loop — every call is a single prompt that must answer
   in JSON. For Codex, which is an agent with tools of its own, every
-  tool-bearing feature is switched off, and before a model is first used
+  tool-bearing feature is switched off (including the code and multi-agent
+  modes newer Codex models ship with), and before a model is first used
   (and again whenever Codex or its model entry changes) the app checks the
-  exact request Codex would send against a local stand-in: no tool beyond
-  an inert question prompt, and a model that tries to call a tool is
-  stopped at its first attempt. Nothing is sent upstream by that check.
+  exact request Codex would send against a local stand-in: the chosen
+  model, the app's instructions and your one prompt, nothing carried over
+  from earlier, no tool beyond an inert question prompt, and a model that
+  tries to call a tool is stopped at its first attempt. Nothing is sent
+  upstream by that check. Every listed Codex model is checked when the
+  model list loads; one that fails is shown as unavailable and can't be
+  chosen, while the others stay usable.
 - Each engine keeps its own sign-in inside the app — `.data/claude/` and
   `.data/codex/` — separate from any Claude Code or Codex install you may
   have, so the login commands above are needed once even if you already
@@ -232,8 +237,8 @@ docker run --rm -v "$PWD":/src:ro -v "$PWD/scripts/ci":/scratch:ro \
 ```
 
 The Codex engine tests (`backend/tests/test_codex_engine.py`) run the real
-Codex CLI, but only against localhost stand-ins — nothing is sent upstream
-and no subscription is spent. They skip when Codex is not installed; set
+Codex CLI against every model it lists, but only against localhost
+stand-ins — nothing is sent upstream and no subscription is spent. They skip when Codex is not installed; set
 `CODEX_TESTS_REQUIRED=1` to make that a failure instead.
 
 The browser tests (`backend/tests/test_ui_*.py`) drive the built frontend

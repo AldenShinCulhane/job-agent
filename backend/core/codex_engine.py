@@ -8,8 +8,9 @@ boundary for the Codex engine:
 - One launch builder produces every invocation, production and
   verification alike. It disables every tool-bearing feature and web
   search, reads the model from a catalog entry the app rewrites (no patch
-  tool, no skills list, the app's own instructions instead of Codex's),
-  and leaves the environment context out of the prompt.
+  tool, no skills list, no code or multi-agent mode, the app's own
+  instructions instead of any of Codex's), and leaves the environment
+  context out of the prompt.
 - Before a configuration is used, `verify` runs that builder against a
   localhost-only stand-in for the Responses API and asserts the exact
   request Codex would send: the chosen model, the app's instructions, the
@@ -20,7 +21,9 @@ boundary for the Codex engine:
   that insists on calling a tool is stopped at its first refusal. A pass
   is bound to a fingerprint of the executable (path and content hash), the
   launch arguments, the catalog entry and the environment allowlist; any
-  change needs a new pass. Nothing is sent upstream by either check.
+  change needs a new pass. Nothing is sent upstream by either check. A
+  model whose request fails the check is unavailable on its own; a Codex
+  that will not run at all is a problem for the whole provider.
 - At run time the process gets an empty working directory, a read-only
   sandbox, an ephemeral session, closed stdin, an allowlisted environment
   and a wall-clock limit that kills its process group. Lifecycle,
@@ -177,9 +180,19 @@ async def _catalog_entry(exe: Path, model: str) -> dict:
     raise llm.ModelNotEntitled(f"{model} is not in Codex's model catalog")
 
 
+# Catalog fields that switch a model into a mode with tools or agents of
+# its own. "code_mode_only" declares a JavaScript `exec` tool (nested tools
+# on a global object) inside the request input instead of `tools`; the
+# multi-agent fields add sub-agent roles; the "lite" request shape moves
+# the instructions into developer messages. Newer models ship with them
+# set (codex-cli 0.156.0: gpt-6-astra, gpt-5.6-*). `verify` proves what
+# is left.
+_AGENT_MODE_FIELDS = ("tool_mode", "multi_agent_version", "multi_agent_reasoning_effort")
+
+
 def locked_entry(entry: dict) -> dict:
     """The model's catalog entry with every tool-bearing field switched off
-    and Codex's own system prompt replaced by the app's."""
+    and Codex's own prompt text replaced by the app's instructions alone."""
     locked = json.loads(json.dumps(entry))
     locked["apply_patch_tool_type"] = None
     locked["input_modalities"] = ["text"]
@@ -188,10 +201,13 @@ def locked_entry(entry: dict) -> dict:
                  "include_plugin_usage_instructions",
                  "include_apps_usage_instructions"):
         locked[flag] = False
+    for field in _AGENT_MODE_FIELDS:
+        locked.pop(field, None)
+    locked["use_responses_lite"] = False
     locked["base_instructions"] = BASE_INSTRUCTIONS
-    messages = dict(locked.get("model_messages") or {})
-    messages["instructions_template"] = BASE_INSTRUCTIONS
-    locked["model_messages"] = messages
+    # Every other message Codex would add for the model (persistent mode,
+    # approvals, permissions, multi-agent roles, ...) is left out.
+    locked["model_messages"] = {"instructions_template": BASE_INSTRUCTIONS}
     return locked
 
 
@@ -653,6 +669,12 @@ async def _check_launch(exe: Path, model: str, locked: dict, mode: str) -> Local
         shutil.rmtree(work, ignore_errors=True)
 
 
+def _stderr_note(server: "LocalResponses") -> str:
+    state = getattr(server, "state", None)
+    tail = list(state.stderr_tail or [])[-3:] if state is not None else []
+    return (": " + " | ".join(tail)[:500]) if tail else ""
+
+
 async def verify(model: str) -> str:
     """Prove the locked launch for `model`; returns its fingerprint."""
     exe = _binary()
@@ -663,22 +685,35 @@ async def verify(model: str) -> str:
     if record and record.get("fingerprint") == fp:
         return fp
 
+    # A launch that sends nothing means Codex itself would not run: a
+    # problem for every model, so the provider's. Anything wrong with the
+    # request it sends, or with how it handles a forced tool call, follows
+    # from this model's entry: the model is unavailable, the rest stay
+    # usable.
     captured = await _check_launch(exe, model, locked, "capture")
+    if not captured.requests:
+        raise llm.ConfigError("Codex lockdown check: Codex sent no request"
+                              + _stderr_note(captured))
     if len(captured.requests) != 1:
-        raise llm.ConfigError(f"Codex lockdown check: expected one request, "
-                              f"saw {len(captured.requests)}")
+        raise llm.ModelUnavailable(f"Codex lockdown check for {model}: expected one "
+                                   f"request, saw {len(captured.requests)}")
     problems = check_request(captured.requests[0], model)
     if problems:
-        raise llm.ConfigError("Codex lockdown check failed: " + "; ".join(problems))
+        raise llm.ModelUnavailable(f"Codex lockdown check failed for {model}: "
+                                   + "; ".join(problems))
 
     guarded = await _check_launch(exe, model, locked, "tool_call")
     state = guarded.state  # type: ignore[attr-defined]
+    if not guarded.requests:
+        raise llm.ConfigError("Codex lockdown check: Codex sent no request"
+                              + _stderr_note(guarded))
     if state.refusal is None:
-        raise llm.ConfigError("Codex lockdown check: a forced tool call was not "
-                              "detected, so a tool loop could not be stopped")
+        raise llm.ModelUnavailable(f"Codex lockdown check for {model}: a forced tool "
+                                   "call was not detected, so a tool loop could not "
+                                   "be stopped")
     if len(guarded.requests) > LOOP_GUARD_MAX_REQUESTS:
-        raise llm.ConfigError(f"Codex lockdown check: the loop guard let "
-                              f"{len(guarded.requests)} requests through")
+        raise llm.ModelUnavailable(f"Codex lockdown check for {model}: the loop guard "
+                                   f"let {len(guarded.requests)} requests through")
 
     _store_verified(model, {"fingerprint": fp,
                             "verified_at": datetime.now(timezone.utc).isoformat(),

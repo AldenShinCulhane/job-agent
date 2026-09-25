@@ -47,7 +47,14 @@ function groupNote(view: ProviderView): string {
 
 function optionText(view: ProviderView, model: ModelOption): string {
   const state = view.models[model.id]?.status
-  return state === 'not_entitled' ? `${model.label} — not on your plan` : model.label
+  if (state === 'not_entitled') return `${model.label} — not on your plan`
+  if (state === 'unavailable') return `${model.label} — unavailable`
+  return model.label
+}
+
+/** A model that failed the app's lockdown check: listed, never usable. */
+function unavailable(view: ProviderView, id: string): boolean {
+  return view.models[id]?.status === 'unavailable'
 }
 
 interface Note {
@@ -189,6 +196,11 @@ export default function EnginePicker({
     return catalog
   }
   const autoModel = engines.providers.claude.auto_model ?? null
+  // Listed models that failed the lockdown, other than the selection (its
+  // own notice above says so).
+  const lockedOut = offered('codex').filter(
+    (m) => unavailable(engines.providers.codex, m.id) && keyOf('codex', m.id) !== current,
+  )
   const listErrors = PROVIDERS.filter((p) => engines.providers[p].catalog_error)
 
   return (
@@ -216,6 +228,16 @@ export default function EnginePicker({
             your {name} plan.
           </p>
           <p className="mt-1">Choose another model below. Scoring and packages wait until you do.</p>
+        </div>
+      )}
+      {engine.status === 'unavailable' && (
+        <div className={`mt-4 rounded-md border p-4 text-sm ${banner.danger}`}>
+          <p className="font-medium">
+            {modelLabel(engines, engine.provider, engine.model) ?? 'This model'} can't run under
+            the app's safety lockdown on this version of {name}.
+          </p>
+          <p className="mt-1">Choose another model below. Scoring and packages wait until you do.</p>
+          {engine.last_error && <p className="mt-1 break-words text-xs">{engine.last_error}</p>}
         </div>
       )}
 
@@ -255,7 +277,13 @@ export default function EnginePicker({
                   </option>
                 )}
                 {offered(p).map((m) => (
-                  <option key={m.id} value={keyOf(p, m.id)}>
+                  <option
+                    key={m.id}
+                    value={keyOf(p, m.id)}
+                    disabled={
+                      unavailable(engines.providers[p], m.id) && keyOf(p, m.id) !== current
+                    }
+                  >
                     {optionText(engines.providers[p], m)}
                   </option>
                 ))}
@@ -315,6 +343,13 @@ export default function EnginePicker({
           Every task uses {selectionText(engines)} on {name}.{' '}
           {verified ? `Last answered ${verified}.` : 'Not checked yet on this plan.'}
         </p>
+        {lockedOut.length > 0 && (
+          <p className="mt-1 text-sm text-ink-3">
+            {lockedOut.map((m) => m.label).join(', ')} can't run under the app's safety
+            lockdown on this version of Codex. Refresh model lists checks again after a Codex
+            update.
+          </p>
+        )}
         {listErrors.map((p) => (
           <p key={p} className={`mt-1 text-sm ${note.warn}`}>
             Couldn't list {PROVIDER_NAME[p]} models ({engines.providers[p].catalog_error}); you can
