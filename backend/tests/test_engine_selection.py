@@ -581,6 +581,23 @@ async def test_rechecking_an_unavailable_model_checks_its_lockdown_again(engine)
     assert engine.calls.verified == [CODEX_LOCKED_OUT, CODEX_LOCKED_OUT]
 
 
+def test_a_model_known_to_fail_the_lockdown_cannot_be_chosen(engine, published):
+    """Not through the list and not as a typed-in id: choosing it is
+    refused and the selection stays as it was."""
+    llm._record_unavailable("codex", CODEX_LOCKED_OUT, str(LOCKDOWN_FAILURE))
+    llm.select("codex", CODEX)
+    published.clear()
+    with pytest.raises(llm.ModelUnavailable, match="Refresh model lists"):
+        llm.select("codex", CODEX_LOCKED_OUT)
+    assert llm.selection() == {"provider": "codex", "model": CODEX}
+    assert published == []
+
+    # A later check that passes (a Codex update) makes it choosable again.
+    llm._set_model_state("codex", CODEX_LOCKED_OUT, None)
+    assert llm.select("codex", CODEX_LOCKED_OUT) == {
+        "provider": "codex", "model": CODEX_LOCKED_OUT}
+
+
 LISTED = [{"id": m, "label": m, "description": "", "efforts": ["low"]}
           for m in ("gpt-test-a", CODEX_LOCKED_OUT, "gpt-test-b")]
 
@@ -1066,6 +1083,17 @@ def test_put_selection_moves_off_an_unavailable_model_without_a_recheck(client):
     assert (body["ok"], body["verified"], body["model"]) == (True, True, CODEX)
     assert client.recovered == [1]
     assert [(c.provider, c.model) for c in client.calls.sent] == [("codex", CODEX)]
+
+
+def test_put_selection_refuses_a_model_known_to_fail_the_lockdown(client):
+    llm._record_unavailable("codex", CODEX_LOCKED_OUT, str(LOCKDOWN_FAILURE))
+    res = client.http.put("/api/engine/selection",
+                          json={"provider": "codex", "model": CODEX_LOCKED_OUT})
+    assert res.status_code == 422
+    assert "safety lockdown" in res.json()["detail"]
+    assert llm.selection() == {"provider": "claude", "model": None}
+    assert client.calls.sent == [] and client.calls.verified == []
+    assert client.recovered == []
 
 
 def test_put_selection_on_a_waiting_provider_spends_nothing(client):

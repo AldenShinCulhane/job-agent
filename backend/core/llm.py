@@ -315,13 +315,20 @@ def selection() -> dict:
 
 def select(provider: str, model: str | None) -> dict:
     """Record the user's choice. Validation only; the next call (or the
-    caller's re-check) probes it."""
+    caller's re-check) probes it. A model already known to fail the
+    lockdown is refused and the selection stays as it was, however the
+    choice was made (from the list or as a typed-in id)."""
     if provider not in PROVIDERS:
         raise ConfigError(f"unknown engine {provider!r}")
     if model is not None and not valid_model_id(model):
         raise ConfigError(f"not a valid model id: {model!r}")
     if provider == "codex" and model is None:
         raise ConfigError("choose a Codex model")
+    if _model_state(provider, model).get("status") == "unavailable":
+        raise ModelUnavailable(
+            f"{model} failed the app's safety lockdown check on the installed "
+            f"{'Codex' if provider == 'codex' else 'Claude'}, so it can't be chosen; "
+            "Refresh model lists checks it again after an update")
     previous = _signature()
     db.set_state(_SELECTION_KEY, json.dumps({"provider": provider, "model": model}))
     _announce(previous)

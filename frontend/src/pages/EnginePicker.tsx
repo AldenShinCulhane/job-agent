@@ -117,9 +117,13 @@ export default function EnginePicker({
   const current = keyOf(engines.selection.provider, engines.selection.model)
   const choice = draft ?? current
   const picked = choice === CUSTOM ? null : parseKey(choice)
+  // A typed-in id the list already marks unavailable is refused here as
+  // the list refuses it (and the server refuses it too).
+  const customLocked =
+    choice === CUSTOM && unavailable(engines.providers[customProvider], customId.trim())
   const target =
     choice === CUSTOM
-      ? validModelId(customId.trim())
+      ? validModelId(customId.trim()) && !customLocked
         ? { provider: customProvider, model: customId.trim() }
         : null
       : picked
@@ -335,6 +339,12 @@ export default function EnginePicker({
             {customId.trim() !== '' && !validModelId(customId.trim()) && (
               <p className={`w-full text-sm ${note.danger}`}>
                 Letters, digits and . _ : / - [ ] only, starting with a letter or digit.
+              </p>
+            )}
+            {customLocked && (
+              <p className={`w-full text-sm ${note.danger}`}>
+                That model failed the app's safety check on this version of{' '}
+                {PROVIDER_NAME[customProvider]}, so it can't be chosen.
               </p>
             )}
           </div>

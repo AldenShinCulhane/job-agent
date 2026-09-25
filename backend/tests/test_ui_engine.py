@@ -212,6 +212,30 @@ def test_a_model_that_fails_the_lockdown_is_listed_but_never_offered(browser, di
     context.close()
 
 
+def test_a_typed_in_id_of_an_unavailable_model_is_not_sent(browser, dist_url):
+    """The list does not offer it, and "Another model ID…" does not either."""
+    context, page, table, errors = _open(browser, dist_url, READY)
+    table["/api/engines"] = engines_view(claude={**READY, "episode": None},
+                                         codex={"models": LOCKED_OUT})
+    bodies: list = []
+    page.route("**/api/engine/selection", lambda route, *_: (
+        bodies.append(route.request.post_data), route.abort()))
+    page.reload()
+    page.get_by_role("button", name="Settings", exact=True).click()
+    page.get_by_label("Model for every task").select_option("custom")
+    page.get_by_label("Engine", exact=True).select_option("codex")
+    page.get_by_label("Model ID").fill("gpt-mini")
+    page.wait_for_selector("text=That model failed the app's safety check on this "
+                           "version of Codex, so it can't be chosen.")
+    use = page.get_by_role("button", name="Use this model")
+    assert use.is_disabled()
+    # Another id is fine.
+    page.get_by_label("Model ID").fill("gpt-9-preview")
+    assert use.is_enabled()
+    assert bodies == [] and errors == []
+    context.close()
+
+
 def test_the_move_off_an_unavailable_model_is_one_choice(browser, dist_url):
     context, page, table, errors = _open(browser, dist_url, READY)
     table["/api/engines"] = engines_view(
