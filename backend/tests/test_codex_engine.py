@@ -220,7 +220,7 @@ def test_the_locked_request_shape_passes():
     ({"prompt": {"id": "pmpt_stored"}}, "prompt"),
     # Kept by the service, so a later request could build on it.
     ({"store": True}, "store"),
-    ({"store": DROP}, "store"),  # the service keeps responses by default
+    ({"store": DROP}, "store"),  # unset: the default stores the response
     # Not the model the user chose.
     ({"model": "gpt-other"}, "model"),
     ({"model": DROP}, "model"),

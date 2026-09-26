@@ -158,21 +158,31 @@ differs, or is tightened for both, follows:
   `request_user_input`, which has no file, process or network access and
   which exec mode rejects. Every tool-bearing feature is disabled, web
   search is disabled, and the model runs from a custom catalog entry that
-  drops the patch tool, the skills list and Codex's own system prompt in
-  favour of the app's. The prompt carries no environment context.
+  drops the patch tool, the skills list, the code and multi-agent modes
+  newer models ship with, and every message of Codex's own in favour of
+  the app's instructions. The prompt carries no environment context.
   - *Prevention is the verified tool surface; detection is only a
     backstop.* A tool item seen in the event stream may already have run,
     so the run-time check never stands in for the pre-use verification.
   - *Pre-use verification.* One launch builder produces every Codex
     invocation, production and verification alike. Before a Codex
     configuration is used, the app runs that builder against a
-    localhost-only capture endpoint and asserts the exact request it
-    would send: the app's instructions, the user message only, and
-    exactly the one allowed tool. A pass is bound to a fingerprint of the
+    localhost-only capture endpoint and checks the exact request it
+    would send. The check asserts the chosen model, the app's
+    instructions, the user message only with no earlier response or
+    stored conversation, an explicit `store: false`, no unknown top-level
+    request fields, and no tool beyond `request_user_input`. A pass is
+    bound to a fingerprint of the
     resolved executable (path and content hash), the effective launch
     arguments, the catalog entry and model metadata, and the environment
     allowlist. Any change to any of them requires a new pass. Anything
-    unexpected fails closed as `config_error`, and Claude stays usable.
+    unexpected fails closed. A request that breaks the locked shape for
+    one model, or a forced tool call that model's launch does not stop,
+    makes that model `unavailable`: listed, never selectable, while
+    Codex's other models stay usable. A Codex that will not run at all is
+    a `config_error` for the provider. Claude stays usable either way.
+    Every listed model is checked when the model list loads, and the
+    real-CLI capture and forced-tool tests cover every listed model.
   - *Defence in depth at run time.* Read-only sandbox without network, an
     empty isolated working directory per call, ephemeral sessions, stdin
     closed, and a bounded wall-clock timeout that kills the process tree.
@@ -387,7 +397,7 @@ Each slice is reviewed on its own before the next starts.
 | LinkedIn ToS / account restriction | **Accepted limitation, not a mitigated problem.** Automated access violates the User Agreement; pacing/caps reduce load and detection surface only. Stop cleanly on captcha/restriction, never bypass, document plainly. `JobSource` interface keeps the provider swappable. |
 | LinkedIn DOM changes | Central selectors with fallbacks; fixture-based parser tests; per-job graceful skip. |
 | Fable not on user's plan | Automatic opus-5 fallback via probe; visible in settings. |
-| Codex CLI update changes its tools or flags (rev 6) | The pre-use request capture in §4.1a fails closed on any new tool, instruction or message, and the Codex engine reports `config_error` until the lockdown is re-verified. Claude stays available. |
+| Codex CLI update changes its tools or flags (rev 6) | The pre-use request capture in §4.1a fails closed on any new tool, instruction, message or request field: each affected model reports `unavailable` (the engine `config_error` if Codex will not run at all) until the lockdown is re-verified. Claude stays available. |
 | Claude not authenticated / allowance exhausted | Setup card / durable waiting state with auto-retry. Never blocks on a user decision. |
 | LaTeX install friction | Tectonic single-binary default; pdflatex autodetect; engine recorded per artifact (pagination differs between engines); compile errors surfaced with log tail. |
 | Page-limit edge cases | Geometry-aware loop with readability floors + relevance-aware trimming + hard assertions; a package that can't meet N pages fails rather than ships oversized. |

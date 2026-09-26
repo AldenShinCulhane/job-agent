@@ -14,10 +14,10 @@ boundary for the Codex engine:
 - Before a configuration is used, `verify` runs that builder against a
   localhost-only stand-in for the Responses API and asserts the exact
   request Codex would send: the chosen model, the app's instructions, the
-  user message only with no earlier response or stored conversation, a
-  response the service does not keep, no request field the check does not
-  know, and no tool beyond `request_user_input` (no file, process or
-  network access; exec mode rejects it). It then proves the loop guard: a model
+  user message only with no earlier response or stored conversation, an
+  explicit `store: false`, no unknown top-level request fields, and no tool
+  beyond `request_user_input` (no file, process or network access; exec
+  mode rejects it). It then proves the loop guard: a model
   that insists on calling a tool is stopped at its first refusal. A pass
   is bound to a fingerprint of the executable (path and content hash), the
   launch arguments, the catalog entry and the environment allowlist; any
@@ -604,7 +604,7 @@ def check_request(body: dict, model: str) -> list[str]:
     """What is wrong with a captured request for `model`, empty when it is
     exactly the locked shape: the chosen model, the app's instructions, the
     prompt alone with nothing carried over, no tool beyond the allowlist,
-    nothing kept by the service, and the app's JSON schema as the answer
+    an explicit `store: false`, and the app's JSON schema as the answer
     format."""
     problems = []
     carried = [name for name in CONTEXT_FIELDS if name in body]
@@ -616,8 +616,10 @@ def check_request(body: dict, model: str) -> list[str]:
     if body.get("model") != model:
         problems.append(f"asks for model {body.get('model')!r}, not the chosen {model!r}")
     if body.get("store") is not False:
-        # Unset means kept: the service stores responses by default.
-        problems.append("store is not false: the service would keep the response")
+        # Unset means the default, which stores the response for later
+        # retrieval. False asks the service not to; a captured request
+        # shows only that, not what else the service retains.
+        problems.append("store is not explicitly false")
     if body.get("instructions") != BASE_INSTRUCTIONS:
         problems.append("instructions are not the app's")
     tools = sorted(str(t.get("name") or t.get("type")) for t in body.get("tools") or [])
