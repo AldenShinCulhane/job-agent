@@ -66,6 +66,27 @@ def _go_to_tab(page, tab: str, ready: str):
     page.wait_for_selector(ready)
 
 
+def _profile_becomes(page, table, method: str, path: str, profile) -> list[bytes]:
+    """Answer `method path` with `profile`, and make it what every later
+    profile read sees only when that request arrives. Set any earlier, a
+    read before the key press — every reconnect of the fixture's closed
+    event stream refetches — shows the result before the control that
+    makes it is pressed, and the control is gone. Returns the bodies the
+    request arrived with."""
+    bodies: list[bytes] = []
+
+    def handler(route, *_):
+        if route.request.method != method:
+            route.fallback()
+            return
+        bodies.append(route.request.post_data_buffer or b"")
+        table["/api/profile"] = profile
+        route.fulfill(status=200, content_type="application/json",
+                      body=json.dumps(profile))
+    page.route(f"**{path}", handler)
+    return bodies
+
+
 def test_search_and_the_gate_by_keyboard_only(browser, dist_url):
     context, page, table = _open(browser, dist_url)
     bodies: list = []
@@ -140,9 +161,8 @@ def test_upload_save_and_confirm_by_keyboard_only(browser, dist_url):
     _go_to_tab(page, "Profile", "text=Upload your resume")
 
     # The button opens the browser's chooser; the file arrives through it.
-    uploaded = profile_payload(6, live=4, name="Uploaded Person")
-    table["/api/profile"] = uploaded  # what every later refetch must see
-    table[("POST", "/api/profile/upload")] = uploaded
+    uploads = _profile_becomes(page, table, "POST", "/api/profile/upload",
+                               profile_payload(6, live=4, name="Uploaded Person"))
     _assert_stop(_tab_to(page, "Choose file"))
     with page.expect_file_chooser() as chooser:
         page.keyboard.press("Enter")
@@ -152,12 +172,12 @@ def test_upload_save_and_confirm_by_keyboard_only(browser, dist_url):
     page.wait_for_function("() => document.activeElement.tagName === 'H2'")
     _assert_stop(_focused(page), "Your profile")
     assert page.get_by_label("Name", exact=True).input_value() == "Uploaded Person"
+    assert len(uploads) == 1 and b"%PDF-1.4" in uploads[0]
 
     # Edit, save: the button that had focus is disabled by the save, so
     # focus moves to the heading instead of vanishing.
-    saved = profile_payload(6, live=4, name="Uploaded Person B")
-    table[("PUT", "/api/profile")] = saved
-    table["/api/profile"] = saved
+    saves = _profile_becomes(page, table, "PUT", "/api/profile",
+                             profile_payload(6, live=4, name="Uploaded Person B"))
     _assert_stop(_tab_to(page, "Name"))
     # Tab selected the whole name; the arrow collapses that to the end so
     # the typing appends. Not End: on macOS that key never reaches a text
@@ -171,30 +191,33 @@ def test_upload_save_and_confirm_by_keyboard_only(browser, dist_url):
     page.wait_for_function("() => !document.body.innerText.includes('Unsaved edits')")
     page.wait_for_function("() => document.activeElement.tagName === 'H2'")
     _assert_stop(_focused(page), "Your profile")
+    assert [json.loads(b)["name"] for b in saves] == ["Uploaded Person B"]
 
     # Confirm: the buttons become a chip.
-    confirmed = profile_payload(6, confirmed=True, live=6, name="Uploaded Person B")
-    table[("POST", "/api/profile/confirm")] = confirmed
-    table["/api/profile"] = confirmed
+    confirms = _profile_becomes(
+        page, table, "POST", "/api/profile/confirm",
+        profile_payload(6, confirmed=True, live=6, name="Uploaded Person B"))
     _assert_stop(_tab_to(page, "Looks right"))
     page.keyboard.press("Enter")
     page.wait_for_selector("text=Confirmed")
     page.wait_for_function("() => document.activeElement.tagName === 'H2'")
     _assert_stop(_focused(page), "Your profile")
+    assert [json.loads(b) for b in confirms] == [{"version": 6}]
+    assert (len(uploads), len(saves)) == (1, 1)
     context.close()
 
 
 def test_discard_by_keyboard_only(browser, dist_url):
     context, page, table = _open(browser, dist_url)
     _go_to_tab(page, "Profile", "text=Draft v5")
-    live = profile_payload(4, confirmed=True, live=4)
-    table[("POST", "/api/profile/discard")] = live
-    table["/api/profile"] = live
+    discards = _profile_becomes(page, table, "POST", "/api/profile/discard",
+                                profile_payload(4, confirmed=True, live=4))
     _assert_stop(_tab_to(page, "Discard draft"))
     page.keyboard.press("Enter")
     page.wait_for_selector("text=Live v4")
     page.wait_for_function("() => document.activeElement.tagName === 'H2'")
     _assert_stop(_focused(page), "Your profile")
+    assert len(discards) == 1
     context.close()
 
 
