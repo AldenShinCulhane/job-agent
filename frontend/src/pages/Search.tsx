@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
-import { api, packageFileUrl } from '../api'
+import { api, packageFileUrl, RetryUnconfirmed } from '../api'
 import type { Explanation, Job, LinkedInStatus, Package, SearchRun } from '../api'
 import { useEpochEffect } from '../useEventStream'
 import type { Epochs } from '../useEventStream'
 import { useLatestOnly } from '../useLatestOnly'
 import { badgeFor, btnPrimary, btnSecondary, chip, inputCls, labelCls } from '../styles'
 import { useFocusLanding } from '../focus'
+import { attemptLabel, newestPerJob, requestKey, retryAction } from '../packageAttempts'
 import type { Badge } from '../styles'
 import type { ReadOptions } from '../useLatestOnly'
 
@@ -126,6 +127,10 @@ export default function Search({
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [packages, setPackages] = useState<Package[]>([])
   const [busyGenerate, setBusyGenerate] = useState(false)
+  // Try again / Regenerate clicks still out, and what each last said
+  // when it failed, by the package it was pressed on.
+  const [retrying, setRetrying] = useState<Set<number>>(new Set())
+  const [retryErrors, setRetryErrors] = useState<Record<number, string>>({})
   const [sortBy, setSortBy] = useState<'score' | 'date'>('score')
   const [hideExceeds, setHideExceeds] = useState(false)
   const [easyOnly, setEasyOnly] = useState(false)
@@ -146,7 +151,8 @@ export default function Search({
   const [editing, setEditing] = useState(false)
   // Typed search fields, or an answer of theirs still on its way.
   const held =
-    editing || busyGenerate || busyRerank || busyExplain !== null || busyDetail !== null
+    editing || busyGenerate || busyRerank || busyExplain !== null || busyDetail !== null ||
+    retrying.size > 0
   useEffect(() => onHold(held), [held, onHold])
   useEffect(() => () => onHold(false), [onHold])
   // Bumped by every edit. Start captures it and folds the fields on
@@ -504,6 +510,87 @@ export default function Search({
     }
   }
 
+  // The retry button that holds the focus, if one does. The list can
+  // drop it at any time — a click whose answer was lost did land, a
+  // refusal says another tab got there first, another tab's click shows
+  // up — and the focus would fall to the top of the page; it goes to the
+  // Packages heading instead. One slot is right however many clicks are
+  // out, because only one element holds the focus. A refusal that leaves
+  // the button leaves the focus on it.
+  const focusedRetry = useRef<HTMLElement | null>(null)
+  useEffect(() => {
+    const onFocusIn = (e: FocusEvent) => {
+      const el = e.target
+      focusedRetry.current = el instanceof HTMLElement && 'retry' in el.dataset ? el : null
+    }
+    // Leaving on purpose — a click on nothing, another window — lets it
+    // go; being removed from the page does not. Which of the two it was
+    // is known once the removal, if that is what it was, is done.
+    const onFocusOut = (e: FocusEvent) => {
+      const el = e.target
+      if (e.relatedTarget !== null || el !== focusedRetry.current) return
+      queueMicrotask(() => {
+        if (focusedRetry.current === el && el instanceof Node && el.isConnected) {
+          focusedRetry.current = null
+        }
+      })
+    }
+    document.addEventListener('focusin', onFocusIn)
+    document.addEventListener('focusout', onFocusOut)
+    return () => {
+      document.removeEventListener('focusin', onFocusIn)
+      document.removeEventListener('focusout', onFocusOut)
+    }
+  }, [])
+  // Still in the slot but gone from the page: the focus went with it.
+  useEffect(() => {
+    const el = focusedRetry.current
+    if (el === null || el.isConnected) return
+    focusedRetry.current = null
+    land(packagesHeadingRef)
+  }, [packages, land])
+
+  // Try again on a failed package, Regenerate on a done one: a fresh
+  // package row, only ever on this click. The key names the click, so the
+  // server answers a resend of it with the package it already got. The
+  // ref, not the state, is the guard: a second click can land before the
+  // button re-renders, and the button stays focusable while the click is
+  // out.
+  const retryInFlight = useRef<Set<number>>(new Set())
+  const retry = async (pkg: Package) => {
+    if (retryInFlight.current.has(pkg.id)) return
+    retryInFlight.current.add(pkg.id)
+    const key = requestKey()
+    setRetrying((prev) => new Set(prev).add(pkg.id))
+    setRetryErrors((prev) => {
+      const next = { ...prev }
+      delete next[pkg.id]
+      return next
+    })
+    try {
+      await api.packageRetry(pkg.id, key)
+      // The new row becomes the job's newest and this button goes with
+      // it; focus goes to the list rather than to the top of the page —
+      // also from a click that never focused the button, as in Safari.
+      land(packagesHeadingRef)
+      await refreshPackages()
+    } catch (e) {
+      const message = e instanceof RetryUnconfirmed ? e.message : String(e)
+      setRetryErrors((prev) => ({ ...prev, [pkg.id]: message }))
+      // A lost answer may still have made the row, or a refusal may say
+      // the list is behind: either way, read it again. Another click
+      // cannot double it — this row is no longer the job's newest.
+      void refreshPackages()
+    } finally {
+      retryInFlight.current.delete(pkg.id)
+      setRetrying((prev) => {
+        const next = new Set(prev)
+        next.delete(pkg.id)
+        return next
+      })
+    }
+  }
+
   const toggleSelected = (jobId: string) =>
     setSelected((prev) => {
       const next = new Set(prev)
@@ -640,14 +727,18 @@ export default function Search({
     .map(([n, label]) => `${n} ${label}`)
     .join(' · ')
 
+  const newest = newestPerJob(packages)
   const packageRow = (pkg: Package) => {
     const state = badgeFor(PACKAGE_STATES, pkg.status)
+    const label = attemptLabel(pkg)
+    const action = retryAction(pkg, newest)
     return (
       <li key={pkg.id} className="py-3">
         <p className="font-medium text-ink">
           {pkg.title}{' '}
           <span className="font-normal text-ink-3">— {pkg.company}</span>
         </p>
+        {label && <p className="mt-0.5 text-xs text-ink-2">{label}</p>}
         {pkg.error && pkg.status !== 'done' && (
           <p className="mt-0.5 text-xs text-danger-fg">{pkg.error}</p>
         )}
@@ -691,7 +782,26 @@ export default function Search({
           >
             LinkedIn
           </a>
+          {action && (
+            // aria-disabled, not disabled, while the click is out: a
+            // disabled button drops the focus it has, and a refused retry
+            // would leave the keyboard at the top of the page. The ref in
+            // retry() is what stops a second request.
+            <button
+              className={`rounded-md px-2 py-0.5 text-xs ${btnSecondary} aria-disabled:opacity-40`}
+              aria-disabled={retrying.has(pkg.id)}
+              data-retry=""
+              // Every row has one; the title says which package it is for.
+              aria-label={`${retrying.has(pkg.id) ? 'Starting…' : action} ${pkg.title}`}
+              onClick={() => void retry(pkg)}
+            >
+              {retrying.has(pkg.id) ? 'Starting…' : action}
+            </button>
+          )}
         </div>
+        {retryErrors[pkg.id] && (
+          <p className="mt-1 text-xs text-danger-fg">{retryErrors[pkg.id]}</p>
+        )}
       </li>
     )
   }

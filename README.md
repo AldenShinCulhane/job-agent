@@ -194,6 +194,15 @@ are rejected and repaired (up to two bounded repair rounds). A package
 that can't pass validation or meet your page limit **fails** rather than
 shipping something oversized or untrue.
 
+**Try again** on a failed package, or **Regenerate** on a finished one,
+builds it afresh: a new attempt with its own two repair rounds, on the
+model you have selected now. The earlier attempt and its PDFs stay exactly
+as they were, and the app never retries a package by itself. Only each
+job's newest package offers the button. If your profile, the posting, the
+page limit or the document templates changed since, the result is a
+package for the current inputs, and the list says so; if that package is
+still being built, the click shows it rather than starting another.
+
 ## When something stops
 
 Every stop state is autonomous-by-default and visible: a banner explains

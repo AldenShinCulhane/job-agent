@@ -180,6 +180,15 @@ export interface Package {
   profile_version: number
   jd_hash: string
   page_limit: number
+  /** Which build of these inputs this is: 1 unless Try again or
+   * Regenerate made another. */
+  attempt: number
+  /** The package a Try again or Regenerate was pressed on, if one was. */
+  retry_of: number | null
+  /** What the user would call each input that differs from `retry_of`'s
+   * ("profile", "posting", "page limit", "templates"); empty for another
+   * attempt of the same inputs. */
+  inputs_changed: string[]
   status: string
   error: string | null
   retry_count: number
@@ -340,6 +349,38 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ job_ids: jobIds, run_id: runId }),
     }).then(toJson<{ package_ids: number[]; created: number }>),
+  /** Try again (failed) or Regenerate (done). `requestKey` is one per
+   * click: sending it again returns the package that click already got.
+   * Rejects with `RetryUnconfirmed` when no answer says what happened. */
+  packageRetry: (packageId: number, requestKey: string) =>
+    fetch(`/api/packages/${packageId}/retry`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ request_key: requestKey }),
+    }).then(
+      (res) => {
+        if (res.status >= 500) throw new RetryUnconfirmed()
+        return toJson<{
+          package_id: number
+          created: boolean
+          attempt: number
+          new_inputs: boolean
+        }>(res)
+      },
+      () => {
+        throw new RetryUnconfirmed()
+      },
+    ),
+}
+
+/** A retry whose answer never arrived, or came back as a server error.
+ * Neither says the click failed — it may have made the package — so the
+ * page says it could not confirm, and reads the list to find out. */
+export class RetryUnconfirmed extends Error {
+  constructor() {
+    super("Couldn't confirm the retry response; checking package status")
+    this.name = 'RetryUnconfirmed'
+  }
 }
 
 export const packageFileUrl = (packageId: number, name: string, inline = false) =>

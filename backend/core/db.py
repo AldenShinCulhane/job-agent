@@ -24,16 +24,18 @@ CREATE TABLE IF NOT EXISTS packages (
     page_limit            INTEGER NOT NULL DEFAULT 1,
     template_version      INTEGER NOT NULL DEFAULT 1,
     cover_template_version INTEGER NOT NULL DEFAULT 1,
+    attempt               INTEGER NOT NULL DEFAULT 1,
     status                TEXT NOT NULL DEFAULT 'queued',
     stage_json            TEXT,
     error                 TEXT,
     retry_count           INTEGER NOT NULL DEFAULT 0,
     provenance_json       TEXT,
     output_dir            TEXT,
+    retry_of              INTEGER,
     created_at            TEXT NOT NULL,
     updated_at            TEXT NOT NULL,
     UNIQUE (job_id, profile_version, jd_hash, page_limit,
-            template_version, cover_template_version)
+            template_version, cover_template_version, attempt)
 );
 """
 
@@ -108,6 +110,12 @@ CREATE TABLE IF NOT EXISTS job_scores (
     explanation_json    TEXT,
     scored_at           TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS package_requests (
+    request_key TEXT PRIMARY KEY,
+    source_id   INTEGER NOT NULL,
+    package_id  INTEGER NOT NULL,
+    created_at  TEXT NOT NULL
+);
 """ + _PACKAGES_TABLE
 
 # One-shot schema fixes for databases created by earlier revisions of
@@ -136,45 +144,86 @@ _COPY_PACKAGES_SQL = (
 )
 
 
-def _widen_package_identity(conn) -> None:
-    """Add the template versions to package identity, keeping every row.
+# The attempt number joined package identity after packages had been
+# published (PLAN.md §4.5a). Every existing row is attempt 1 of its
+# inputs; the row a retry came from is new, so it starts empty. Named
+# for the same reason as the copy above.
+_COPY_PACKAGES_PRE_ATTEMPT_SQL = (
+    "INSERT INTO packages (id, job_id, profile_version, jd_hash, "
+    "page_limit, template_version, cover_template_version, attempt, "
+    "status, stage_json, error, retry_count, provenance_json, output_dir, "
+    "created_at, updated_at) "
+    "SELECT id, job_id, profile_version, jd_hash, page_limit, "
+    "template_version, cover_template_version, 1, status, stage_json, "
+    "error, retry_count, provenance_json, output_dir, created_at, "
+    "updated_at FROM packages_pre_attempt"
+)
 
-    SQLite cannot widen a UNIQUE constraint in place, and unlike the
-    page-limit change this table now holds real packages — their PDFs are
-    on disk and must stay exactly as published. So: rename, recreate,
-    copy across. Existing rows are pinned to the versions their own
-    provenance records, or to 1 when they predate that record; either
-    way they keep the identity they were built under, and a selection
-    made under newer templates becomes a new package instead of silently
-    returning the old documents.
 
-    All four steps run inside one transaction, and the copy is counted
+def _rebuild_packages(conn, old_name: str, copy_sql: str) -> None:
+    """Rebuild `packages` in the current shape, keeping every row.
+
+    SQLite cannot widen a UNIQUE constraint in place, and this table
+    holds real packages — their PDFs are on disk under paths named by
+    the row id, so every id must survive as it was. So: rename, recreate,
+    copy across, all inside one transaction, and the copy is counted
     before the old table goes. Half a migration is worse than none: if
     the rename and the CREATE landed but the copy did not, the next
-    startup would find `template_version` on an empty `packages`, skip
-    this function forever, and every published row — PDFs still on disk
-    — would be gone from the app with no way back. That is why
+    startup would find the new column on an empty `packages`, skip the
+    migration forever, and every published row — PDFs still on disk —
+    would be gone from the app with no way back. That is why
     `executescript()` cannot appear here: it COMMITs whatever is open
     before it runs, which is precisely the split that leaves that state
-    behind. A crash mid-way now rolls back to the old table, and the
-    next startup simply migrates again.
+    behind. A crash mid-way rolls back to the old table, and the next
+    startup simply migrates again.
+
+    The id counter moves across too. Ids name output directories, so one
+    handed out before must never be handed out again, and a copy alone
+    only carries the highest id still present.
     """
     conn.commit()  # nothing of ours rides along inside this transaction
     conn.execute("BEGIN IMMEDIATE")
     try:
         before = conn.execute("SELECT count(*) FROM packages").fetchone()[0]
-        conn.execute("ALTER TABLE packages RENAME TO packages_pre_tpl_version")
+        conn.execute(f"ALTER TABLE packages RENAME TO {old_name}")
         conn.execute(_PACKAGES_TABLE)
-        conn.execute(_COPY_PACKAGES_SQL)
+        conn.execute(copy_sql)
         after = conn.execute("SELECT count(*) FROM packages").fetchone()[0]
         if after != before:
             raise sqlite3.IntegrityError(
                 f"package migration copied {after} of {before} rows")
-        conn.execute("DROP TABLE packages_pre_tpl_version")
+        seq = conn.execute("SELECT seq FROM sqlite_sequence WHERE name = ?",
+                           (old_name,)).fetchone()
+        if seq is not None:
+            conn.execute(
+                "UPDATE sqlite_sequence SET seq = max(seq, ?) WHERE name = 'packages'",
+                (seq[0],))
+        conn.execute(f"DROP TABLE {old_name}")
     except BaseException:
         conn.rollback()
         raise
     conn.commit()
+
+
+def _widen_package_identity(conn) -> None:
+    """Add the template versions to package identity, keeping every row
+    (one transaction, counted; see `_rebuild_packages`).
+
+    Existing rows are pinned to the versions their own provenance
+    records, or to 1 when they predate that record; either way they keep
+    the identity they were built under, and a selection made under newer
+    templates becomes a new package instead of silently returning the old
+    documents. The table it builds is the current one, so these rows land
+    as attempt 1 in the same step.
+    """
+    _rebuild_packages(conn, "packages_pre_tpl_version", _COPY_PACKAGES_SQL)
+
+
+def _add_package_attempts(conn) -> None:
+    """Add the attempt number to package identity (PLAN.md §4.5a): every
+    existing row becomes attempt 1 of its inputs, with its id, status,
+    stage and output directory — and so its downloads — unchanged."""
+    _rebuild_packages(conn, "packages_pre_attempt", _COPY_PACKAGES_PRE_ATTEMPT_SQL)
 
 
 def init() -> None:
@@ -193,6 +242,8 @@ def init() -> None:
         conn.executescript(_SCHEMA)
         if cols and "template_version" not in cols:
             _widen_package_identity(conn)
+        elif cols and "attempt" not in cols:
+            _add_package_attempts(conn)
         for statement in _MIGRATIONS:
             try:
                 conn.execute(statement)
@@ -905,12 +956,29 @@ def get_action_count(day: str) -> int:
 # fitted documents) so a restart resumes at the stage boundary instead
 # of re-spending LLM calls; `provenance_json` records what actually
 # built the artifacts (PLAN.md §4.6).
+#
+# The inputs identify a package; `attempt` numbers the builds of it
+# (PLAN.md §4.5a). Selection makes attempt 1 and afterwards returns the
+# latest attempt. Only the user's Try again or Regenerate makes another
+# — a fresh row with its own stage state, validation cache and repair
+# ledger — and never by itself; earlier attempts and their files stay
+# exactly as they were.
 
+PACKAGE_IDENTITY = (
+    "job_id", "profile_version", "jd_hash", "page_limit",
+    "template_version", "cover_template_version",
+)
+_IDENTITY_MATCH = " AND ".join(f"{column} = ?" for column in PACKAGE_IDENTITY)
 _PACKAGE_COLUMNS = (
-    "id", "job_id", "profile_version", "jd_hash", "page_limit",
-    "template_version", "cover_template_version", "status",
+    "id", *PACKAGE_IDENTITY, "attempt", "retry_of", "status",
     "stage_json", "error", "retry_count", "provenance_json", "output_dir",
     "created_at", "updated_at",
+)
+# What a user calls each input when a retry found it changed.
+_INPUT_NAMES = (
+    ("profile_version", "profile"), ("jd_hash", "posting"),
+    ("page_limit", "page limit"), ("template_version", "templates"),
+    ("cover_template_version", "templates"),
 )
 
 
@@ -926,8 +994,9 @@ def _package_row_to_dict(row) -> dict:
 def create_package(job_id: str, profile_version: int, jd_hash: str,
                    page_limit: int = 1, *, template_version: int,
                    cover_template_version: int) -> tuple[int, bool]:
-    """(package id, created). Idempotent per identity: an existing
-    package — whatever its status — is returned, not duplicated.
+    """(package id, created). Idempotent per identity: a package that
+    exists for these inputs — whatever its status — is returned as its
+    latest attempt, not duplicated.
 
     The template versions have no default on purpose. They are the
     running code's, and a caller that forgets them would pin a package to
@@ -938,21 +1007,125 @@ def create_package(job_id: str, profile_version: int, jd_hash: str,
                 template_version, cover_template_version)
     with _connect() as conn:
         cursor = conn.execute(
-            "INSERT INTO packages (job_id, profile_version, jd_hash, "
-            "page_limit, template_version, cover_template_version, "
+            f"INSERT INTO packages ({', '.join(PACKAGE_IDENTITY)}, "
             "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(job_id, profile_version, jd_hash, page_limit, "
-            "template_version, cover_template_version) DO NOTHING",
+            f"ON CONFLICT({', '.join(PACKAGE_IDENTITY)}, attempt) DO NOTHING",
             (*identity, now, now),
         )
         if cursor.rowcount > 0:
             return cursor.lastrowid, True
         row = conn.execute(
-            "SELECT id FROM packages WHERE job_id = ? AND profile_version = ? "
-            "AND jd_hash = ? AND page_limit = ? AND template_version = ? "
-            "AND cover_template_version = ?", identity,
+            f"SELECT id FROM packages WHERE {_IDENTITY_MATCH} "
+            "ORDER BY attempt DESC LIMIT 1", identity,
         ).fetchone()
         return row[0], False
+
+
+class RetryRefused(Exception):
+    """A retry the package's current state does not allow. `reason` is
+    one of not_found, not_finished, not_latest, key_reused."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+_FINISHED = ("done", "failed")
+
+
+def _answered_retry(conn, source_id: int, request_key: str) -> int | None:
+    made = conn.execute(
+        "SELECT source_id, package_id FROM package_requests WHERE request_key = ?",
+        (request_key,),
+    ).fetchone()
+    if made is None:
+        return None
+    if made[0] != source_id:
+        raise RetryRefused("key_reused", "that request key was used for another package")
+    return made[1]
+
+
+def answered_retry(source_id: int, request_key: str) -> int | None:
+    """The package an earlier submission of this click got, or None if
+    the click is new. Raises RetryRefused(key_reused) for a key that
+    belongs to a click on another package."""
+    with _connect() as conn:
+        return _answered_retry(conn, source_id, request_key)
+
+
+def retry_package(source_id: int, request_key: str, *, profile_version: int,
+                  jd_hash: str, page_limit: int, template_version: int,
+                  cover_template_version: int) -> tuple[int, bool]:
+    """Try again on a failed package or Regenerate a done one. Returns
+    (package id, created). The source row is never written.
+
+    Only the job's newest package can be retried — the one row the list
+    offers the button on. The inputs given are the current ones, and
+    the answer is the package for them: the next attempt of the
+    source's identity when nothing changed, otherwise a package for the
+    current inputs, never another attempt of the old identity. When the
+    current inputs' latest attempt is still being built, that one is the
+    answer and nothing new is made. When it is finished, done or failed,
+    the click is asking for a build and gets its next attempt, so a
+    retry always does something.
+
+    `request_key` is the client's key for one click, stored unique with
+    the package that click got, whether it made that row or found it: a
+    repeated or concurrent submission of the click gets the same package.
+    The whole check-and-insert is one BEGIN IMMEDIATE transaction, so two
+    different clicks on one package cannot both find it the newest: the
+    second is refused rather than making another.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        made = _answered_retry(conn, source_id, request_key)
+        if made is not None:
+            conn.rollback()
+            return made, False
+        source = conn.execute(
+            "SELECT job_id, status FROM packages WHERE id = ?", (source_id,),
+        ).fetchone()
+        if source is None:
+            raise RetryRefused("not_found", f"no package {source_id}")
+        job_id, status = source
+        if status not in _FINISHED:
+            raise RetryRefused("not_finished", "this package is still being built")
+        newest = conn.execute(
+            "SELECT max(id) FROM packages WHERE job_id = ?", (job_id,),
+        ).fetchone()[0]
+        if newest != source_id:
+            raise RetryRefused("not_latest",
+                               "a newer package for this job already exists")
+        identity = (job_id, profile_version, jd_hash, page_limit,
+                    template_version, cover_template_version)
+        latest = conn.execute(
+            f"SELECT id, attempt, status FROM packages WHERE {_IDENTITY_MATCH} "
+            "ORDER BY attempt DESC LIMIT 1", identity,
+        ).fetchone()
+        if latest is not None and latest[2] not in _FINISHED:
+            package_id, created = latest[0], False
+        else:
+            cursor = conn.execute(
+                f"INSERT INTO packages ({', '.join(PACKAGE_IDENTITY)}, attempt, "
+                "retry_of, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (*identity, latest[1] + 1 if latest else 1, source_id, now, now),
+            )
+            package_id, created = cursor.lastrowid, True
+        conn.execute(
+            "INSERT INTO package_requests (request_key, source_id, package_id, "
+            "created_at) VALUES (?, ?, ?, ?)",
+            (request_key, source_id, package_id, now),
+        )
+        conn.commit()
+        return package_id, created
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def supersede_outdated_template_packages(template_version: int,
@@ -1036,18 +1209,34 @@ def update_package(
 
 
 def list_packages() -> list[dict]:
-    """Every package, newest first, with its job's display fields."""
+    """Every package, newest first, with its job's display fields.
+
+    A row a retry made carries `inputs_changed`: what the user would call
+    each input that differs from the package they retried ("profile",
+    "posting", "page limit", "templates"). Empty for another attempt of
+    the same inputs, and for a row that was selected rather than retried.
+    """
+    n = len(_PACKAGE_COLUMNS)
     with _connect() as conn:
         rows = conn.execute(
             f"SELECT {', '.join('packages.' + c for c in _PACKAGE_COLUMNS)}, "
-            "jobs.title, jobs.company, jobs.url FROM packages "
-            "JOIN jobs ON jobs.job_id = packages.job_id "
+            "jobs.title, jobs.company, jobs.url, "
+            f"{', '.join('source.' + c for c, _ in _INPUT_NAMES)} "
+            "FROM packages JOIN jobs ON jobs.job_id = packages.job_id "
+            "LEFT JOIN packages AS source ON source.id = packages.retry_of "
             "ORDER BY packages.id DESC"
         ).fetchall()
     packages = []
     for row in rows:
-        package = _package_row_to_dict(row[: len(_PACKAGE_COLUMNS)])
-        package["title"], package["company"], package["url"] = row[len(_PACKAGE_COLUMNS):]
+        package = _package_row_to_dict(row[:n])
+        package["title"], package["company"], package["url"] = row[n:n + 3]
+        source = row[n + 3:]
+        changed = []
+        if package["retry_of"] is not None and source[0] is not None:
+            for (column, name), was in zip(_INPUT_NAMES, source):
+                if package[column] != was and name not in changed:
+                    changed.append(name)
+        package["inputs_changed"] = changed
         packages.append(package)
     return packages
 

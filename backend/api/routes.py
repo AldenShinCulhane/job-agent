@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import random
+import re
 import shutil
 import tempfile
 import time
@@ -1286,6 +1287,73 @@ async def packages_generate(body: dict):
         broker.publish("packages", {"event": "created", "ids": created_ids})
     _maybe_resume_packages()
     return {"package_ids": package_ids, "created": created}
+
+
+# The client's key for one Try again / Regenerate click: a random id,
+# kept short and plain because it is stored and compared, never shown.
+_REQUEST_KEY = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
+_RETRY_REFUSED_STATUS = {"not_found": 404, "not_finished": 409,
+                         "not_latest": 409, "key_reused": 409}
+
+
+@router.post("/packages/{package_id}/retry")
+async def packages_retry(package_id: int, body: dict):
+    """Try again on a failed package, or Regenerate a done one (PLAN.md
+    §4.5a). An explicit user action, never automatic, and not a gate:
+    the new row runs unattended like any selection, on the model
+    selected now. Retrying the same click — a double submit, a resend
+    after a dropped response — gets the package that click got."""
+    key = body.get("request_key")
+    if not isinstance(key, str) or not _REQUEST_KEY.fullmatch(key):
+        raise HTTPException(status_code=422,
+                            detail="request_key must be 8-64 letters, digits, - or _")
+    # A click already answered keeps its answer, whatever has changed
+    # since: a new draft profile or an expired posting would refuse the
+    # checks below, and a changed page limit would name another package.
+    try:
+        answered = db.answered_retry(package_id, key)
+    except db.RetryRefused as exc:
+        raise HTTPException(status_code=_RETRY_REFUSED_STATUS[exc.reason],
+                            detail=str(exc)) from exc
+    if answered is not None:
+        _maybe_resume_packages()
+        return _retry_answer(package_id, answered, created=False)
+    source = db.get_package(package_id)
+    if source is None:
+        raise HTTPException(status_code=404, detail=f"Unknown package {package_id}")
+    # Built on the current inputs, the same ones Generate would use now.
+    # When any differ from the package's own, the answer is a package
+    # for the current inputs rather than another attempt of the old one.
+    try:
+        version, _ = scoring_pipeline.confirmed_profile()
+    except scoring_pipeline.NoConfirmedProfile as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    job = db.get_job(source["job_id"])
+    if job is None or not job.get("description_hash"):
+        raise HTTPException(status_code=409,
+                            detail="The posting for this package is no longer cached — "
+                                   "search again to fetch it.")
+    resume_tpl, cover_tpl = tailor_pipeline.template_versions()
+    try:
+        new_id, created = db.retry_package(
+            package_id, key, profile_version=version,
+            jd_hash=job["description_hash"],
+            page_limit=tailor_pipeline.resume_page_limit(),
+            template_version=resume_tpl, cover_template_version=cover_tpl)
+    except db.RetryRefused as exc:
+        raise HTTPException(status_code=_RETRY_REFUSED_STATUS[exc.reason],
+                            detail=str(exc)) from exc
+    if created:
+        broker.publish("packages", {"event": "created", "ids": [new_id]})
+    _maybe_resume_packages()
+    return _retry_answer(package_id, new_id, created=created)
+
+
+def _retry_answer(source_id: int, package_id: int, *, created: bool) -> dict:
+    source, package = db.get_package(source_id), db.get_package(package_id)
+    return {"package_id": package_id, "created": created,
+            "attempt": package["attempt"],
+            "new_inputs": any(package[c] != source[c] for c in db.PACKAGE_IDENTITY)}
 
 
 @router.get("/packages")

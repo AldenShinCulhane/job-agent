@@ -63,14 +63,18 @@ def _job(job_id: str, score: float | None, rerank: float | None = None,
     }
 
 
-def _package(pid: int, status: str, error: str | None = None) -> dict:
+def _package(pid: int, status: str, error: str | None = None, *,
+             job: str | None = None, attempt: int = 1, retry_of: int | None = None,
+             inputs_changed: tuple[str, ...] = (), title: str | None = None) -> dict:
     return {
-        "id": pid, "job_id": f"j{pid}", "profile_version": 4, "jd_hash": "h",
-        "page_limit": 1, "status": status, "error": error, "retry_count": 0,
+        "id": pid, "job_id": job or f"j{pid}", "profile_version": 4, "jd_hash": "h",
+        "page_limit": 1, "attempt": attempt, "retry_of": retry_of,
+        "inputs_changed": list(inputs_changed),
+        "status": status, "error": error, "retry_count": 0,
         "output_dir": None if status != "done" else "/out",
         "created_at": "2026-09-15T12:00:00Z", "updated_at": "2026-09-15T12:00:00Z",
-        "title": f"Role {pid}", "company": "Example Co",
-        "url": f"https://example.invalid/jobs/j{pid}", "provenance": {},
+        "title": title or f"Role {pid}", "company": "Example Co",
+        "url": f"https://example.invalid/jobs/{job or f'j{pid}'}", "provenance": {},
     }
 
 

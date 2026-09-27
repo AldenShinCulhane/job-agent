@@ -104,6 +104,26 @@ _QUEUED = {"/api/packages": {"page_limit": 1,
                              "packages": [_package(i, "queued") for i in range(1, 31)]},
            "/api/jobs": dict(API_FIXTURES["/api/jobs"], jobs=[])}
 
+# Retried packages: another attempt of the same inputs (with the one it
+# replaced below it, now history), and a new package because the
+# profile changed. Only each job's newest row offers Try again or
+# Regenerate.
+ATTEMPTS = {"/api/packages": {"page_limit": 1, "packages": [
+    _package(12, "failed", "compile failed", job="jx", attempt=2, retry_of=11,
+             title="Role X"),
+    _package(11, "failed", "compile failed", job="jx", title="Role X"),
+    _package(10, "done", job="jy", retry_of=8, inputs_changed=("profile",),
+             title="Role Y"),
+    _package(9, "generating"),
+    _package(8, "done", job="jy", title="Role Y"),
+]}}
+
+
+def _retry_refused(page):
+    page.get_by_role("button", name="Try again Role X").click()
+    page.wait_for_selector("text=a newer package for this job already exists")
+
+
 STATES: list[State] = [
     State("profile-upload-prompt", fixtures={"/api/profile": {"version": None}},
           ready=("text=Upload your resume",)),
@@ -141,6 +161,13 @@ STATES: list[State] = [
           ready=("text=Earlier packages (25)", "text=30 in progress")),
     State("packages-history-open", tab="Search", fixtures=_QUEUED,
           ready=("text=Earlier packages (25)",), setup=_history_open),
+    State("packages-attempts", tab="Search", fixtures=ATTEMPTS,
+          ready=("text=Attempt 2", "text=New package: the profile changed")),
+    State("packages-retry-refused", tab="Search",
+          fixtures={**ATTEMPTS, ("POST", "/api/packages/12/retry"):
+                    Response(409, {"detail": "a newer package for this job already exists"})},
+          ready=("text=Attempt 2",), setup=_retry_refused,
+          allow_failed_requests=("/api/packages/12/retry",)),
     State("banner-config-error", tab="Search",
           fixtures=_engine(status="config_error", last_error="bad model pin"),
           ready=("text=Claude engine configuration error", *SEARCH_READY)),
