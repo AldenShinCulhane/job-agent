@@ -1,4 +1,4 @@
-import type { Package } from './api'
+import type { Package, UnsupportedClaim } from './api'
 
 /** The ids of each job's newest package, from a newest-first list. Only
  * those offer Try again or Regenerate: an older row is history, and a
@@ -12,6 +12,34 @@ export function newestPerJob(packages: Package[]): Set<number> {
     newest.add(pkg.id)
   }
   return newest
+}
+
+/** Each job's newest package, from a newest-first list. */
+export function newestByJob(packages: Package[]): Map<string, Package> {
+  const newest = new Map<string, Package>()
+  for (const pkg of packages) if (!newest.has(pkg.job_id)) newest.set(pkg.job_id, pkg)
+  return newest
+}
+
+/** The list as it is shown: newest first, except that a failed package
+ * still waiting on the user — its job's newest, so Try again is on it —
+ * comes before everything else. A failure a later attempt answered is
+ * history and keeps its place. */
+export function failedFirst(packages: Package[], newest: Set<number>): Package[] {
+  const open = (pkg: Package) => pkg.status === 'failed' && newest.has(pkg.id)
+  return [...packages.filter(open), ...packages.filter((pkg) => !open(pkg))]
+}
+
+/** What stopped a package at the truth check, counted. Only claims the
+ * profile doesn't support are called that; a structure failure, alone or
+ * among them, makes the count neutral. */
+export function truthCheckSummary(failures: UnsupportedClaim[]): string {
+  const n = failures.length
+  if (failures.every((f) => f.kind === 'claim')) {
+    return n === 1 ? 'a claim your profile doesn’t support'
+      : `${n} claims your profile doesn’t support`
+  }
+  return n === 1 ? 'a validation issue' : `${n} validation issues`
 }
 
 /** The button a package offers, if any. */

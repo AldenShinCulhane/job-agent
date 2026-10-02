@@ -23,7 +23,7 @@ def _open(browser, dist_url, *, width=1280, height=900):
 def _goto_search(page, dist_url, ready="text=Backend Engineer a"):
     page.goto(dist_url)
     page.wait_for_selector("text=Claude sign-in required")
-    page.get_by_role("button", name="Search", exact=True).click()
+    page.get_by_role("link", name="Search", exact=True).click()
     page.wait_for_selector(ready)
 
 

@@ -70,3 +70,8 @@ export const inputCls =
   'w-full rounded-md border border-line-strong bg-surface px-2 py-1 text-sm text-ink'
 
 export const labelCls = 'block text-xs font-medium uppercase tracking-wide text-ink-3'
+
+/** The page's one column. The header, the notices, the tabs and the page
+ * each span the window with their own background and put their content
+ * in this, so every left edge lines up. */
+export const column = 'mx-auto w-full max-w-7xl px-4 sm:px-8'

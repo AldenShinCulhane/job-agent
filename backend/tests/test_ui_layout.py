@@ -56,7 +56,7 @@ def _fulfill(body: dict):
 
 
 def _search_tab(page, ready="text=Backend Engineer a"):
-    page.get_by_role("button", name="Search", exact=True).click()
+    page.get_by_role("link", name="Search", exact=True).click()
     page.wait_for_selector(ready)
 
 
@@ -86,7 +86,7 @@ OVERFLOW_JS = """() => {
 def test_nothing_is_wider_than_the_page(browser, dist_url, width, height):
     context, page, errors = _open(browser, dist_url, width=width, height=height)
     for tab, ready in TAB_READY.items():
-        page.get_by_role("button", name=tab, exact=True).click()
+        page.get_by_role("link", name=tab, exact=True).click()
         for selector in ready:
             page.wait_for_selector(selector)
         if tab == "Search":

@@ -119,6 +119,55 @@ ATTEMPTS = {"/api/packages": {"page_limit": 1, "packages": [
 ]}}
 
 
+# A posting laid out as the backend keeps it, and the checklist its score
+# was built from: every group, and each of met, missing and unknown.
+POSTING = ("Example Widgets Inc. is hiring a backend engineer.\n\n"
+           "Build APIs with Python.\nOwn services end to end.\n\n"
+           "We ship every week.")
+CHECKLIST = [
+    {"kind": "required", "label": "Python", "met": True},
+    {"kind": "required", "label": "Go", "met": False},
+    {"kind": "preferred", "label": "Kubernetes", "met": False},
+    {"kind": "preferred", "label": "Docker", "met": True},
+    {"kind": "experience", "label": "3+ years of experience", "met": None},
+    {"kind": "education", "label": "Bachelor's degree", "met": True},
+]
+CLAIM = ("I bring hands-on evaluation experience from shipping model-graded "
+         "checks across every release, and I would carry that rigor into "
+         "your platform team from the first week, pairing on reviews and "
+         "owning the release checklist end to end.")
+REASON = ("The claim asserts hands-on evaluation experience, but no cited "
+          "fact mentions evaluating models.")
+DETAILS = {
+    "/api/jobs": dict(API_FIXTURES["/api/jobs"], jobs=[
+        _job("a", 80, description=POSTING, requirements=CHECKLIST),
+        _job("b", 60, description="Build APIs.", requirements=[]),
+        _job("c", 30)]),
+    "/api/packages": {"page_limit": 1, "packages": [
+        _package(9, "done", job="a", title="Backend Engineer a"),
+        _package(8, "generating", job="c", title="Backend Engineer c"),
+        _package(7, "failed", "truth validation failed after 2 repair round(s): "
+                              "cover:p1: " + REASON,
+                 job="b", title="Backend Engineer b",
+                 unsupported=[{"kind": "claim", "document": "cover letter",
+                               "claim": CLAIM, "reason": REASON},
+                              {"kind": "structure", "document": "resume",
+                               "claim": None,
+                               "reason": "not a permutation of the sections"}]),
+    ]},
+}
+
+
+def _details_open(page):
+    page.get_by_role("button", name="Details").first.click()
+    page.wait_for_selector("text=Own services end to end.")
+
+
+def _why_open(page):
+    page.get_by_text("Why", exact=True).first.click()
+    page.wait_for_selector(f"text={REASON}")
+
+
 def _retry_refused(page):
     page.get_by_role("button", name="Try again Role X").click()
     page.wait_for_selector("text=a newer package for this job already exists")
@@ -168,6 +217,12 @@ STATES: list[State] = [
                     Response(409, {"detail": "a newer package for this job already exists"})},
           ready=("text=Attempt 2",), setup=_retry_refused,
           allow_failed_requests=("/api/packages/12/retry",)),
+    State("search-job-details", tab="Search", fixtures=DETAILS,
+          ready=("text=Backend Engineer a", "text=Package ready"), setup=_details_open),
+    State("packages-truth-check", tab="Search", fixtures=DETAILS,
+          ready=("text=Stopped at the truth check",)),
+    State("packages-truth-check-why", tab="Search", fixtures=DETAILS,
+          ready=("text=Stopped at the truth check",), setup=_why_open),
     State("banner-config-error", tab="Search",
           fixtures=_engine(status="config_error", last_error="bad model pin"),
           ready=("text=Claude engine configuration error", *SEARCH_READY)),
@@ -262,7 +317,7 @@ def open_state(browser, dist_url, state: State, *, width=1280, height=900,
     page.goto(dist_url)
     page.wait_for_selector("text=Claude sign-in required") if "/api/engines" not in state.fixtures \
         else None
-    page.get_by_role("button", name=state.tab, exact=True).click()
+    page.get_by_role("link", name=state.tab, exact=True).click()
     for selector in state.ready:
         page.wait_for_selector(selector)
     if state.setup:

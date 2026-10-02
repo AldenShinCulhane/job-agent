@@ -61,7 +61,7 @@ def test_a_usage_limit_opens_the_picker_once_per_limit(browser, dist_url):
 
     # Leaving it is the user's call, and the same limit does not reopen it:
     # not on a refetch, not after a reload of the tab.
-    page.get_by_role("button", name="Profile", exact=True).click()
+    page.get_by_role("link", name="Profile", exact=True).click()
     page.wait_for_selector("text=Your profile")
     _limit_starts(page, table, "ep-1")
     assert not _on_settings(page)
@@ -120,7 +120,7 @@ def test_the_picker_never_opens_over_an_upload_in_flight(browser, dist_url):
 
 def test_the_picker_never_folds_a_search_being_edited(browser, dist_url):
     context, page, table, errors = _open(browser, dist_url, READY)
-    page.get_by_role("button", name="Search", exact=True).click()
+    page.get_by_role("link", name="Search", exact=True).click()
     page.get_by_role("button", name="Edit search").click()
     field = page.get_by_placeholder("software engineer")
     field.fill("platform engineer")
@@ -147,7 +147,7 @@ def test_choosing_a_codex_model_sets_it_for_every_task(browser, dist_url):
             "ok": True, "verified": True, "model": "gpt-sample"}))
     page.route("**/api/engine/selection", select)
 
-    page.get_by_role("button", name="Settings", exact=True).click()
+    page.get_by_role("link", name="Settings", exact=True).click()
     use = page.get_by_role("button", name="Use this model")
     assert use.is_disabled()  # nothing picked yet
     page.get_by_label("Model for every task").select_option(label="GPT Sample")
@@ -178,7 +178,7 @@ def test_a_model_that_cannot_run_stays_chosen_and_says_why(browser, dist_url):
             "detail": "model not_found"}))
     page.route("**/api/engine/selection", select)
 
-    page.get_by_role("button", name="Settings", exact=True).click()
+    page.get_by_role("link", name="Settings", exact=True).click()
     page.get_by_label("Model for every task").select_option(label="Claude Small")
     page.get_by_role("button", name="Use this model").click()
     page.wait_for_selector("text=Claude Small is selected but can't run yet: model not_found")
@@ -200,7 +200,7 @@ def test_a_model_that_fails_the_lockdown_is_listed_but_never_offered(browser, di
     table["/api/engines"] = engines_view(claude={**READY, "episode": None},
                                          codex={"models": LOCKED_OUT})
     page.reload()
-    page.get_by_role("button", name="Settings", exact=True).click()
+    page.get_by_role("link", name="Settings", exact=True).click()
     page.wait_for_selector("text=GPT Mini can't run under the app's safety lockdown")
     locked = page.locator("#engine-model option", has_text="GPT Mini")
     assert locked.inner_text() == "GPT Mini — unavailable"
@@ -221,7 +221,7 @@ def test_a_typed_in_id_of_an_unavailable_model_is_not_sent(browser, dist_url):
     page.route("**/api/engine/selection", lambda route, *_: (
         bodies.append(route.request.post_data), route.abort()))
     page.reload()
-    page.get_by_role("button", name="Settings", exact=True).click()
+    page.get_by_role("link", name="Settings", exact=True).click()
     page.get_by_label("Model for every task").select_option("custom")
     page.get_by_label("Engine", exact=True).select_option("codex")
     page.get_by_label("Model ID").fill("gpt-mini")
@@ -283,7 +283,7 @@ def test_a_custom_model_id_is_checked_before_it_is_sent(browser, dist_url):
         route.fulfill(status=200, content_type="application/json", body=json.dumps({
             "selection": {"provider": "codex", "model": "gpt-9-preview"},
             "ok": True, "verified": True, "model": "gpt-9-preview"}))))
-    page.get_by_role("button", name="Settings", exact=True).click()
+    page.get_by_role("link", name="Settings", exact=True).click()
     page.get_by_label("Model for every task").select_option("custom")
     page.get_by_label("Engine", exact=True).select_option("codex")
     page.get_by_label("Model ID").fill("--config evil")

@@ -17,7 +17,11 @@ with strict page-limit enforcement and no fabricated claims.
 2. **Search LinkedIn** by keywords + location. You sign in once in a real
    browser window; the session persists locally.
 3. **Browse scored jobs** in the UI — match score, experience filter,
-   strengths/gaps — before anything is generated.
+   strengths/gaps — before anything is generated. A job's details show the
+   posting with its paragraphs and lines, as text only, and a checklist of
+   what it asks for (skills, years, degree), each marked as in your profile,
+   missing, or unknown by the same rules the score uses. A job you have
+   generated for shows its newest package's state on its row.
 4. **Select the jobs you want.** For each one, the app autonomously writes a
    tailored resume and cover letter, validates every claim against facts
    extracted from *your* resume, enforces your page limit (default 1 page —
@@ -192,7 +196,12 @@ claim — after generation *and* after every page-fitting rewrite. New
 employers, degrees, dates, skills, or metrics that aren't in your resume
 are rejected and repaired (up to two bounded repair rounds). A package
 that can't pass validation or meet your page limit **fails** rather than
-shipping something oversized or untrue.
+shipping something oversized or untrue. A package that failed the truth
+check quotes each claim that stopped it, says whether it was in the resume
+or the cover letter, and gives the checker's reason; a problem with the
+resume's structure, such as its section order, is counted as a validation
+issue rather than a claim. Failed packages you can still retry are listed
+first.
 
 **Try again** on a failed package, or **Regenerate** on a finished one,
 builds it afresh: a new attempt with its own two repair rounds, on the

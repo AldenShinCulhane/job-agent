@@ -65,7 +65,7 @@ def test_rendered_text_meets_aa_on_every_surface(browser, dist_url, scheme):
     failures: list[dict] = []
     placeholders_checked = 0
     for tab, ready in TAB_READY.items():
-        page.get_by_role("button", name=tab, exact=True).click()
+        page.get_by_role("link", name=tab, exact=True).click()
         for selector in ready:
             page.wait_for_selector(selector)
         # The search fields fold behind the last run's summary; open them
@@ -134,7 +134,7 @@ def test_disabled_controls_render_dimmed(browser, dist_url):
     route_fixtures(page)
     page.goto(dist_url)
     page.wait_for_selector("text=Claude sign-in required")
-    page.get_by_role("button", name="Settings", exact=True).click()
+    page.get_by_role("link", name="Settings", exact=True).click()
     for selector in TAB_READY["Settings"]:
         page.wait_for_selector(selector)
     save = page.get_by_role("button", name="Save", exact=True)
@@ -167,7 +167,7 @@ def test_unknown_statuses_get_the_neutral_chip(browser, dist_url):
 
     page.goto(dist_url)
     page.wait_for_selector("text=rebooting")  # header chip, engine map
-    page.get_by_role("button", name="Search", exact=True).click()
+    page.get_by_role("link", name="Search", exact=True).click()
     page.wait_for_selector("text=rate_limited")  # LinkedIn map
     # The unknown package is older than the recent few, so it is folded.
     page.get_by_text("Earlier packages (1)").click()

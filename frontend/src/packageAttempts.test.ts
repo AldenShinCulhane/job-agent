@@ -1,7 +1,10 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { attemptLabel, newestPerJob, requestKey, retryAction } from './packageAttempts.ts'
-import type { Package } from './api.ts'
+import {
+  attemptLabel, failedFirst, newestByJob, newestPerJob, requestKey, retryAction,
+  truthCheckSummary,
+} from './packageAttempts.ts'
+import type { Package, UnsupportedClaim } from './api.ts'
 
 function pkg(over: Partial<Package>): Package {
   return {
@@ -40,4 +43,36 @@ test('each click gets its own plain key', () => {
   const b = requestKey()
   assert.notEqual(a, b)
   for (const key of [a, b]) assert.match(key, /^[A-Za-z0-9_-]{8,64}$/)
+})
+
+test('a failure still waiting on the user comes first; an answered one keeps its place', () => {
+  const list = [
+    pkg({ id: 9, job_id: 'a', status: 'done' }),
+    pkg({ id: 8, job_id: 'b', status: 'failed' }),
+    pkg({ id: 7, job_id: 'a', status: 'failed' }),
+    pkg({ id: 6, job_id: 'c', status: 'generating' }),
+    pkg({ id: 5, job_id: 'd', status: 'failed' }),
+  ]
+  assert.deepEqual(failedFirst(list, newestPerJob(list)).map((p) => p.id), [8, 5, 9, 7, 6])
+})
+
+test("each job's newest package", () => {
+  const list = [
+    pkg({ id: 9, job_id: 'a', status: 'queued' }),
+    pkg({ id: 8, job_id: 'b', status: 'done' }),
+    pkg({ id: 7, job_id: 'a', status: 'failed' }),
+  ]
+  const newest = newestByJob(list)
+  assert.deepEqual([...newest.entries()].map(([job, p]) => [job, p.id]), [['a', 9], ['b', 8]])
+})
+
+test('only claims the profile does not support are counted as such', () => {
+  const claim: UnsupportedClaim = {
+    kind: 'claim', document: 'resume', claim: 'Led a team.', reason: 'no fact' }
+  const structure: UnsupportedClaim = {
+    kind: 'structure', document: 'resume', claim: null, reason: 'not a permutation' }
+  assert.equal(truthCheckSummary([claim]), 'a claim your profile doesn’t support')
+  assert.equal(truthCheckSummary([claim, claim]), '2 claims your profile doesn’t support')
+  assert.equal(truthCheckSummary([structure]), 'a validation issue')
+  assert.equal(truthCheckSummary([claim, structure]), '2 validation issues')
 })

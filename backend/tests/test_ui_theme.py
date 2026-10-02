@@ -58,7 +58,7 @@ def _stored(page):
 
 
 def _open_appearance(page) -> None:
-    page.get_by_role("button", name="Settings", exact=True).click()
+    page.get_by_role("link", name="Settings", exact=True).click()
     page.wait_for_selector("text=Appearance")
 
 
@@ -187,7 +187,7 @@ def test_a_tab_that_never_opened_settings_still_follows(browser, dist_url):
         "document.documentElement.dataset.theme === 'dark'")
     assert _is_dark(receiver)
 
-    receiver.get_by_role("button", name="Search", exact=True).click()
+    receiver.get_by_role("link", name="Search", exact=True).click()
     receiver.wait_for_selector("text=Daily cap reached")
     _choose(sender, "System")
     receiver.wait_for_function(
@@ -215,7 +215,7 @@ def test_blocked_storage_keeps_the_tab_usable(browser, dist_url):
 
     # The choice outlives the Settings page: it is held in memory by the
     # document, not re-read from the storage that refused it.
-    page.get_by_role("button", name="Profile", exact=True).click()
+    page.get_by_role("link", name="Profile", exact=True).click()
     page.wait_for_selector("text=Your profile")
     assert _is_dark(page)
     _open_appearance(page)

@@ -1,13 +1,22 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { api, packageFileUrl, RetryUnconfirmed } from '../api'
-import type { Explanation, Job, LinkedInStatus, Package, SearchRun } from '../api'
+import type { Explanation, Job, LinkedInStatus, Package, Requirement, SearchRun } from '../api'
+import { paragraphs } from '../description'
 import { useEpochEffect } from '../useEventStream'
 import type { Epochs } from '../useEventStream'
 import { useLatestOnly } from '../useLatestOnly'
 import { badgeFor, btnPrimary, btnSecondary, chip, inputCls, labelCls } from '../styles'
 import { useFocusLanding } from '../focus'
-import { attemptLabel, newestPerJob, requestKey, retryAction } from '../packageAttempts'
+import {
+  attemptLabel,
+  failedFirst,
+  newestByJob,
+  newestPerJob,
+  requestKey,
+  retryAction,
+  truthCheckSummary,
+} from '../packageAttempts'
 import type { Badge } from '../styles'
 import type { ReadOptions } from '../useLatestOnly'
 
@@ -60,6 +69,24 @@ const PACKAGE_STATES: Record<string, Badge> = {
 const PACKAGE_ACTIVE = new Set([
   'queued', 'generating', 'validating', 'fitting', 'asserting', 'publishing',
 ])
+
+// What a job row says about its newest package: the state in a word,
+// the stages folded into one — the rail beside the list has the detail.
+const JOB_PACKAGE_STATES: Record<string, Badge> = {
+  ...Object.fromEntries(
+    [...PACKAGE_ACTIVE].map((s) => [s, { label: 'Package in progress', tone: 'info' }]),
+  ),
+  done: { label: 'Package ready', tone: 'ok' },
+  failed: { label: 'Package failed', tone: 'danger' },
+  waiting_usage: { label: 'Package waiting', tone: 'warn' },
+}
+
+// The checklist's groups, in the order a posting usually states them.
+const REQUIREMENT_GROUPS: [string, (r: Requirement) => boolean][] = [
+  ['Required', (r) => r.kind === 'required'],
+  ['Nice to have', (r) => r.kind === 'preferred'],
+  ['Experience and education', (r) => r.kind === 'experience' || r.kind === 'education'],
+]
 
 const WORKPLACE_OPTIONS = ['remote', 'hybrid', 'onsite'] as const
 
@@ -709,12 +736,16 @@ export default function Search({
       ].filter((x): x is string => x !== null)
     : []
 
-  // Newest first from the server. The preview is a fixed few whatever
-  // their state — a bulk generation would otherwise put every queued
-  // package on screen above the list — and the counts line says what the
-  // fold is hiding.
-  const recentPackages = packages.slice(0, RECENT_PACKAGES)
-  const earlierPackages = packages.slice(RECENT_PACKAGES)
+  // Newest first from the server, with a failure still waiting on the
+  // user moved to the top. The preview is a fixed few whatever their
+  // state — a bulk generation would otherwise put every queued package on
+  // screen above the list — and the counts line says what the fold is
+  // hiding.
+  const newest = newestPerJob(packages)
+  const shown = failedFirst(packages, newest)
+  const recentPackages = shown.slice(0, RECENT_PACKAGES)
+  const earlierPackages = shown.slice(RECENT_PACKAGES)
+  const jobPackage = newestByJob(packages)
   const counts = (
     [
       [packages.filter((p) => PACKAGE_ACTIVE.has(p.status)).length, 'in progress'],
@@ -727,7 +758,6 @@ export default function Search({
     .map(([n, label]) => `${n} ${label}`)
     .join(' · ')
 
-  const newest = newestPerJob(packages)
   const packageRow = (pkg: Package) => {
     const state = badgeFor(PACKAGE_STATES, pkg.status)
     const label = attemptLabel(pkg)
@@ -739,8 +769,34 @@ export default function Search({
           <span className="font-normal text-ink-3">— {pkg.company}</span>
         </p>
         {label && <p className="mt-0.5 text-xs text-ink-2">{label}</p>}
-        {pkg.error && pkg.status !== 'done' && (
-          <p className="mt-0.5 text-xs text-danger-fg">{pkg.error}</p>
+        {pkg.unsupported && pkg.unsupported.length > 0 ? (
+          // A truth-check failure, in the words that failed: the claim,
+          // where it was, and why. The claim folds to three lines until
+          // the reason is opened.
+          <div className="mt-1 space-y-1.5 text-xs">
+            <p className="text-danger-fg">
+              Stopped at the truth check: {truthCheckSummary(pkg.unsupported)}
+            </p>
+            {pkg.unsupported.map((u, i) => (
+              <figure key={i} className="group">
+                <figcaption className="text-ink-3">
+                  {u.document === 'cover letter' ? 'Cover letter' : 'Resume'}
+                </figcaption>
+                {u.claim && (
+                  <blockquote className="mt-0.5 line-clamp-3 border-l-2 border-line-strong pl-2 text-ink-2 group-has-[details[open]]:line-clamp-none">
+                    “{u.claim}”
+                  </blockquote>
+                )}
+                <details className="mt-0.5">
+                  <summary className="cursor-pointer text-ink-3">Why</summary>
+                  <p className="mt-0.5 text-ink-2">{u.reason}</p>
+                </details>
+              </figure>
+            ))}
+          </div>
+        ) : (
+          pkg.error &&
+          pkg.status !== 'done' && <p className="mt-0.5 text-xs text-danger-fg">{pkg.error}</p>
         )}
         <div className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
           <span className={`rounded-full px-3 py-1 text-xs font-medium ${chip[state.tone]}`}>
@@ -1142,6 +1198,10 @@ export default function Search({
               const meta = [job.company, job.location, job.posted_text]
                 .filter(Boolean)
                 .join(' · ')
+              const newestPackage = jobPackage.get(job.job_id)
+              const packageBadge = newestPackage
+                ? badgeFor(JOB_PACKAGE_STATES, newestPackage.status)
+                : null
               return (
                 // Four columns from md: tick, score, title, actions — so
                 // the eye runs down aligned scores and titles. Below md
@@ -1200,6 +1260,13 @@ export default function Search({
                     {job.easy_apply && (
                       <span className={`rounded-full px-2 py-0.5 text-xs font-medium ${chip.info}`}>
                         Easy Apply
+                      </span>
+                    )}
+                    {packageBadge && (
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-xs font-medium ${chip[packageBadge.tone]}`}
+                      >
+                        {packageBadge.label}
                       </span>
                     )}
                     <button
@@ -1271,10 +1338,20 @@ export default function Search({
                           )}
                         </div>
                       )}
+                      {job.requirements && job.requirements.length > 0 && (
+                        <RequirementChecklist items={job.requirements} />
+                      )}
                       {job.description && (
-                        <p className="whitespace-pre-wrap rounded-lg bg-surface-2 p-3 text-sm text-ink-2">
-                          {job.description}
-                        </p>
+                        // Text, never markup: the posting is someone
+                        // else's words, and only its paragraph and line
+                        // breaks are kept.
+                        <div className="space-y-2 rounded-lg bg-surface-2 p-3 text-sm text-ink-2">
+                          {paragraphs(job.description).map((lines, i) => (
+                            <p key={i} className="whitespace-pre-line">
+                              {lines.join('\n')}
+                            </p>
+                          ))}
+                        </div>
                       )}
                     </div>
                   )}
@@ -1323,6 +1400,47 @@ export default function Search({
           </div>
         )}
       </section>
+    </div>
+  )
+}
+
+/** What the posting asks for, a line each, and whether the profile has
+ * it — by the rules the score used, so the two never disagree. */
+function RequirementChecklist({ items }: { items: Requirement[] }) {
+  return (
+    <div className="rounded-lg bg-surface-2 p-3 text-sm">
+      <h3 className="text-xs uppercase tracking-wide text-ink-3">Requirements</h3>
+      {REQUIREMENT_GROUPS.map(([heading, belongs]) => {
+        const group = items.filter(belongs)
+        if (group.length === 0) return null
+        return (
+          <div key={heading} className="mt-2">
+            <h4 className="text-xs font-medium text-ink-2">{heading}</h4>
+            <ul className="mt-0.5 grid gap-x-4 sm:grid-cols-2">
+              {group.map((item) => (
+                <li
+                  key={item.label}
+                  className={
+                    item.met === true
+                      ? 'text-ok-fg'
+                      : item.met === false && item.kind !== 'preferred'
+                        ? 'text-warn-fg'
+                        : 'text-ink-2'
+                  }
+                >
+                  <span aria-hidden="true">
+                    {item.met === true ? '✓' : item.met === false ? '✗' : '?'}
+                  </span>{' '}
+                  <span className="sr-only">
+                    {item.met === true ? 'Has:' : item.met === false ? 'Missing:' : 'Unknown:'}
+                  </span>{' '}
+                  {item.label}
+                </li>
+              ))}
+            </ul>
+          </div>
+        )
+      })}
     </div>
   )
 }

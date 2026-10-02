@@ -309,12 +309,8 @@ async def run_package(package_id: int) -> str:
                                                    record=record_entailment)
             stage["entail_cache"] = cache
             if failures:
-                rounds = _repair_rounds(stage)
-                detail = "; ".join(
-                    f"{f['claim_id']}: {f['reason']}" for f in failures[:5])
                 _transition(package_id, "failed", stage=stage,
-                            error=f"truth validation failed after {rounds} "
-                                  f"repair round(s): {detail}")
+                            error=_validation_error(_repair_rounds(stage), failures))
                 return "failed"
             stage["validated_sha"] = _content_sha(stage["tailored"])
             _transition(package_id, "fitting", stage=stage)
@@ -474,6 +470,60 @@ async def run_package(package_id: int) -> str:
             return "superseded"
         return "failed"
 
+
+
+# A package that failed truth validation says which claims failed and why
+# in its error; `unsupported_claims` reads them back, so both live here.
+_VALIDATION_FAILED = "truth validation failed after {rounds} repair round(s): "
+_VALIDATION_PREFIX = re.compile(r"truth validation failed after \d+ repair round\(s\): ")
+# A claim id names a sentence (validate.collect_claims); the others name
+# the resume's structure: section order, skill categories, entry indexes.
+_CLAIM_ID = re.compile(r"headline|(?:exp|proj)\d+:b\d+|cover:p\d+")
+_STRUCTURE_ID = re.compile(r"section_order|skills_order|(?:experiences|projects):\d+")
+_FAILED_CLAIM = re.compile(
+    rf"(?:^|; )({_CLAIM_ID.pattern}|{_STRUCTURE_ID.pattern}): ")
+
+
+def _validation_error(rounds: int, failures: list[dict]) -> str:
+    detail = "; ".join(f"{f['claim_id']}: {f['reason']}" for f in failures[:5])
+    return _VALIDATION_FAILED.format(rounds=rounds) + detail
+
+
+def unsupported_claims(package: dict) -> list[dict]:
+    """What stopped a package at truth validation, one entry per failure:
+    whether it was a claim (a sentence) or the resume's structure, the
+    document it was in, the claim's text as the package last had it, and
+    the checker's reason. Empty for any other package or failure.
+
+    Read from the package's error and its last tailored documents, so a
+    package that failed before this was written reads the same way.
+    `claim` is None for a structure failure (section order, an unknown
+    skill category), and for a claim whose documents are gone.
+    """
+    error = package.get("error") or ""
+    prefix = _VALIDATION_PREFIX.match(error)
+    if package.get("status") != "failed" or prefix is None:
+        return []
+    detail = error[prefix.end():]
+    try:
+        texts = {c["claim_id"]: c["text"] for c in
+                 validate.collect_claims(package["stage"]["tailored"])}
+    except (KeyError, TypeError):
+        texts = {}
+    found = list(_FAILED_CLAIM.finditer(detail))
+    if not found or found[0].start() != 0:
+        return []
+    claims = []
+    for i, match in enumerate(found):
+        end = found[i + 1].start() if i + 1 < len(found) else len(detail)
+        claim_id = match.group(1)
+        claims.append({
+            "kind": "claim" if _CLAIM_ID.fullmatch(claim_id) else "structure",
+            "document": "cover letter" if claim_id.startswith("cover") else "resume",
+            "claim": texts.get(claim_id),
+            "reason": detail[match.end():end],
+        })
+    return claims
 
 async def run_batch() -> str:
     """Process every resumable package in batch order. Returns why the

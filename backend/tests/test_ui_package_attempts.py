@@ -31,7 +31,7 @@ def _open(browser, dist_url, claude=None, *, live_events=False):
     if claude is not None:
         table["/api/engines"] = engines_view(claude=claude)
     page.goto(dist_url)
-    page.get_by_role("button", name="Search", exact=True).click()
+    page.get_by_role("link", name="Search", exact=True).click()
     page.wait_for_selector("text=Attempt 2")
     return context, page, table, errors
 

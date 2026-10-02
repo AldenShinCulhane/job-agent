@@ -10,7 +10,7 @@ import hashlib
 import logging
 from datetime import datetime, timedelta, timezone
 
-from bs4 import Comment
+from bs4 import Comment, NavigableString
 
 from backend.core import db
 from backend.core.events import broker
@@ -34,15 +34,86 @@ def is_stale(job: dict, now: datetime | None = None) -> bool:
     return now - fetched > DETAIL_TTL
 
 
+def canonical_text(description: str) -> str:
+    """The description with every run of whitespace collapsed to one
+    space — the form a posting is identified by."""
+    return " ".join(description.split())
+
+
 def description_hash(description: str) -> str:
-    return hashlib.sha256(description.strip().encode()).hexdigest()[:16]
+    """Hash of the canonical text, so line breaks never move it. Earlier
+    revisions stored the canonical text itself and hashed that, so every
+    hash already stored is what this gives for the same posting."""
+    return hashlib.sha256(canonical_text(description).encode()).hexdigest()[:16]
+
+
+# Where a posting's markup starts a new paragraph or a new line. Anything
+# else — a span, a link, bold text — joins its words to the line it is on.
+_PARAGRAPH_TAGS = frozenset({
+    "address", "article", "aside", "blockquote", "dd", "div", "dl", "dt",
+    "figure", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header",
+    "hr", "main", "nav", "ol", "p", "pre", "section", "table", "ul",
+})
+_LINE_TAGS = frozenset({"br", "li", "tr"})
+_SPACE, _LINE, _PARAGRAPH = 0, 1, 2
+_SEPARATORS = {_SPACE: " ", _LINE: "\n", _PARAGRAPH: "\n\n"}
+
+
+def readable_text(node) -> str | None:
+    """The description with its paragraphs and lines kept.
+
+    Built from exactly the strings `selectors.text_of` joins, in the same
+    order: only the whitespace between two words changes, a line or
+    paragraph break where the markup puts one. Its canonical text is
+    therefore always the text earlier revisions stored, so a posting's
+    hash holds across this change and across any markup-only edit.
+    """
+    if node is None:
+        return None
+    wanted = node.interesting_string_types or node.MAIN_CONTENT_STRING_TYPES
+    if isinstance(wanted, type):
+        wanted = {wanted}
+    words: list[str] = []
+    pending = _SPACE
+
+    def walk(tag) -> None:
+        nonlocal pending
+        for child in tag.children:
+            if isinstance(child, NavigableString):
+                # The same strings get_text keeps: no comments, no script.
+                if type(child) not in wanted:
+                    continue
+                for word in child.split():
+                    if words:
+                        words.append(_SEPARATORS[pending])
+                    words.append(word)
+                    pending = _SPACE
+                continue
+            name = child.name
+            brk = (_PARAGRAPH if name in _PARAGRAPH_TAGS
+                   else _LINE if name in _LINE_TAGS else _SPACE)
+            pending = max(pending, brk)
+            walk(child)
+            pending = max(pending, brk)
+
+    walk(node)
+    text = "".join(words)
+    if not text:
+        return None
+    # True by construction, and checked anyway because every stored hash
+    # rests on it: should it ever fail, the posting keeps its identity and
+    # loses only its line breaks.
+    if canonical_text(text) != selectors.text_of(node):
+        return selectors.text_of(node)
+    return text
 
 
 def parse_detail(html: str) -> str:
-    """Detail-page HTML -> plain description text."""
+    """Detail-page HTML -> description text with its paragraph and line
+    breaks (see `readable_text`)."""
     soup = selectors.parse_html(html)
     node = selectors.select_first(soup, "detail_description")
-    text = selectors.text_of(node)
+    text = readable_text(node)
     if text:
         return text
     # Selector-free fallback: LinkedIn's classes are obfuscated and churn,
@@ -57,7 +128,7 @@ def parse_detail(html: str) -> str:
         while el is not None and el.name not in ("body", "html", "[document]"):
             text = selectors.text_of(el)
             if text and len(text) > 200:
-                return text
+                return readable_text(el)
             el = el.parent
     raise DetailParseError("no job description found on the page")
 

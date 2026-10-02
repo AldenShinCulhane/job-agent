@@ -36,7 +36,8 @@ DIST = REPO / "frontend" / "dist"
 
 def _job(job_id: str, score: float | None, rerank: float | None = None,
          easy: bool = False, title: str | None = None,
-         description: str | None = None) -> dict:
+         description: str | None = None,
+         requirements: list[dict] | None = None) -> dict:
     return {
         "job_id": job_id,
         "title": title or f"Backend Engineer {job_id}",
@@ -60,12 +61,14 @@ def _job(job_id: str, score: float | None, rerank: float | None = None,
             "match_reasons": ["python"], "gap_reasons": ["no go"],
             "exceeds_experience": False, "user_years": 1,
         },
+        "requirements": requirements,
     }
 
 
 def _package(pid: int, status: str, error: str | None = None, *,
              job: str | None = None, attempt: int = 1, retry_of: int | None = None,
-             inputs_changed: tuple[str, ...] = (), title: str | None = None) -> dict:
+             inputs_changed: tuple[str, ...] = (), title: str | None = None,
+             unsupported: list[dict] | None = None) -> dict:
     return {
         "id": pid, "job_id": job or f"j{pid}", "profile_version": 4, "jd_hash": "h",
         "page_limit": 1, "attempt": attempt, "retry_of": retry_of,
@@ -75,6 +78,7 @@ def _package(pid: int, status: str, error: str | None = None, *,
         "created_at": "2026-09-15T12:00:00Z", "updated_at": "2026-09-15T12:00:00Z",
         "title": title or f"Role {pid}", "company": "Example Co",
         "url": f"https://example.invalid/jobs/{job or f'j{pid}'}", "provenance": {},
+        "unsupported": unsupported or [],
     }
 
 

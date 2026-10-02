@@ -103,6 +103,14 @@ def cache_key(jd_hash: str) -> str:
     return f"v{SCHEMA_VERSION}:{jd_hash}"
 
 
+def cached_for(jd_hashes) -> dict[str, dict]:
+    """The cached requirements of each description hash that has them,
+    by hash — looked up under the same key normalize_job saved them."""
+    keys = {jd_hash: cache_key(jd_hash) for jd_hash in jd_hashes if jd_hash}
+    found = db.requirements_for(keys.values())
+    return {jd_hash: found[key] for jd_hash, key in keys.items() if key in found}
+
+
 async def normalize_job(job_id: str) -> dict:
     """Return the normalized requirements for a job's description. The
     cache is content-addressed by (schema version, JD hash) — two

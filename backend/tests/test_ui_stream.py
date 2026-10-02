@@ -77,7 +77,7 @@ class Page:
         self.page.goto(dist_url)
         self.page.wait_for_selector(status_ready)
         if tab != "Profile":
-            self.page.get_by_role("button", name=tab, exact=True).click()
+            self.page.get_by_role("link", name=tab, exact=True).click()
         for selector in ready:
             self.page.wait_for_selector(selector)
         events.wait_for_connections(1, page=self.page)

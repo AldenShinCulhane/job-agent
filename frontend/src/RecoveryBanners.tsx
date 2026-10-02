@@ -7,7 +7,7 @@ import {
   retryText,
   selectedEngine,
 } from './engineStatus'
-import { banner } from './styles'
+import { banner, column } from './styles'
 import type { Tone } from './styles'
 
 interface Props {
@@ -117,19 +117,18 @@ export default function RecoveryBanners({
     // screen-reader user navigating by landmark never reaches.
     <section aria-label="Recovery notices">
       {banners.map((b) => (
-        <div
-          key={b.key}
-          className={`flex items-center justify-between border-b px-4 py-2 text-sm sm:px-8 ${banner[b.tone]}`}
-        >
-          <span>{b.text}</span>
-          {b.action && (
-            <button
-              className="ml-4 shrink-0 rounded border border-current px-2 py-0.5 text-xs font-medium"
-              onClick={b.action.run}
-            >
-              {b.action.label}
-            </button>
-          )}
+        <div key={b.key} className={`border-b text-sm ${banner[b.tone]}`}>
+          <div className={`${column} flex items-center justify-between py-2`}>
+            <span>{b.text}</span>
+            {b.action && (
+              <button
+                className="ml-4 shrink-0 rounded border border-current px-2 py-0.5 text-xs font-medium"
+                onClick={b.action.run}
+              >
+                {b.action.label}
+              </button>
+            )}
+          </div>
         </div>
       ))}
     </section>

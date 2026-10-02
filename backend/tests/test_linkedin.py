@@ -102,6 +102,78 @@ def test_parse_detail_anchor_fallback_without_any_known_selector():
     )
     text = job_detail.parse_detail(html)
     assert "Python and FastAPI" in text
+    # The climb keeps the breaks too.
+    assert text.startswith("About the job\n\nExample Widgets Inc.")
+
+
+def test_a_layout_that_would_change_the_words_is_dropped(monkeypatch):
+    """Should the layout ever stop being whitespace alone, the posting keeps
+    its identity and loses only its line breaks."""
+    monkeypatch.setitem(job_detail._SEPARATORS, job_detail._LINE, " • ")
+    text = job_detail.parse_detail(DETAIL_HTML)
+    assert "•" not in text and "\n" not in text
+    assert job_detail.description_hash(text) == DETAIL_HASH_BEFORE_LINE_BREAKS
+
+
+def test_parse_detail_keeps_paragraphs_and_lines():
+    """A blank line between paragraphs and a line per list item, so the
+    posting reads as it was written rather than as one run of text."""
+    assert job_detail.parse_detail(DETAIL_HTML) == (
+        "Example Widgets Inc. is hiring a Backend Engineer.\n\n"
+        "Build APIs with Python and FastAPI.\n"
+        "3+ years of experience with SQL databases.\n\n"
+        "We value curiosity and ownership."
+    )
+
+
+# The hash every earlier revision stored for DETAIL_HTML: the SHA-256 of
+# the whitespace-collapsed text, which was then the description itself.
+DETAIL_HASH_BEFORE_LINE_BREAKS = "234e624d3d73aaa5"
+
+
+def test_line_breaks_keep_the_hash_already_stored():
+    """Packages, requirements and scores are keyed by this hash. Keeping
+    the line breaks must not move it, or every stored posting would read
+    as edited on its next fetch."""
+    text = job_detail.parse_detail(DETAIL_HTML)
+    assert "\n" in text
+    assert job_detail.description_hash(text) == DETAIL_HASH_BEFORE_LINE_BREAKS
+    # What the earlier revision stored for this page hashes the same.
+    collapsed = " ".join(text.split())
+    assert job_detail.description_hash(collapsed) == DETAIL_HASH_BEFORE_LINE_BREAKS
+
+
+def test_a_markup_only_edit_keeps_the_hash():
+    """The same words under different markup — wrappers, a line break for
+    a list, re-indentation, new classes, a comment, a script — lay out
+    differently and stay the same posting."""
+    html = (FIXTURES / "linkedin_job_detail_reformatted.html").read_text()
+    text = job_detail.parse_detail(html)
+    # Laid out by its own markup — neither the comment nor the script is
+    # posting text — and the same posting.
+    assert text == (
+        "Example Widgets Inc. is hiring a Backend Engineer. "
+        "Build APIs with Python and FastAPI.\n"
+        "3+ years of experience with SQL databases.\n\n"
+        "We value curiosity and ownership."
+    )
+    assert job_detail.description_hash(text) == DETAIL_HASH_BEFORE_LINE_BREAKS
+
+
+def test_a_word_edit_moves_the_hash():
+    html = DETAIL_HTML.replace("curiosity", "rigor")
+    assert (job_detail.description_hash(job_detail.parse_detail(html))
+            != DETAIL_HASH_BEFORE_LINE_BREAKS)
+
+
+def test_line_breaks_come_from_the_markup_only():
+    """Line breaks and indentation inside the source are formatting; only
+    elements that start a paragraph or a line start one."""
+    html = ('<div class="jobs-description__content"><p>One\n   two\t three'
+            '<br><br>four</p><ul><li>five</li><li><span>six</span> seven</li>'
+            '</ul><h3>Eight</h3>nine <b>ten</b></div>')
+    assert job_detail.parse_detail(html) == (
+        "One two three\nfour\n\nfive\nsix seven\n\nEight\n\nnine ten")
 
 
 def test_parse_detail_raises_on_empty_page():
@@ -299,6 +371,26 @@ async def test_fetch_detail_refetches_stale_and_detects_hash_change(
     result2 = await job_detail.fetch_detail(fake2, job_id, force=True)
     assert result2["refetched"] is True
     assert result2["changed"] is False
+
+
+async def test_a_refetch_that_adds_line_breaks_is_not_an_edit(test_db, monkeypatch):
+    """A posting stored by an earlier revision — one run of text — gains
+    its line breaks on the next fetch without reading as edited: nothing
+    derived from it is dropped and no package pinned to it is superseded."""
+    job_id = _seed_job()
+    collapsed = " ".join(job_detail.parse_detail(DETAIL_HTML).split())
+    db.save_job_detail(job_id, collapsed, DETAIL_HASH_BEFORE_LINE_BREAKS)
+    package_id, _ = db.create_package(job_id, 1, DETAIL_HASH_BEFORE_LINE_BREAKS,
+                                      template_version=1, cover_template_version=1)
+    dropped = []
+    monkeypatch.setattr(db, "invalidate_derived", dropped.append)
+    result = await job_detail.fetch_detail(FakeSupervisor([DETAIL_HTML]), job_id,
+                                           force=True)
+    assert result["changed"] is False
+    assert result["description_hash"] == DETAIL_HASH_BEFORE_LINE_BREAKS
+    assert "\n\n" in result["description"]
+    assert dropped == []
+    assert db.get_package(package_id)["status"] == "queued"
 
 
 async def test_fetch_detail_unknown_job(test_db):

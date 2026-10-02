@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
+import type { MouseEvent } from 'react'
 import { api } from './api'
 import type { EnginesView, LinkedInStatus } from './api'
 import { engineBadge, modelLabel, selectedEngine } from './engineStatus'
 import { useFocusLanding } from './focus'
 import { episodeShown, markEpisodeShown } from './shownEpisodes'
-import { chip } from './styles'
+import { chip, column } from './styles'
+import { TABS, tabFrom, tabHref } from './tabs'
+import type { TabId } from './tabs'
 import { usePreference } from './theme'
 import { useEpochEffect, useEventStream } from './useEventStream'
 import { useLatestOnly } from './useLatestOnly'
@@ -14,14 +17,6 @@ import Onboarding from './pages/Onboarding'
 import Search from './pages/Search'
 import Settings from './pages/Settings'
 
-const TABS = [
-  { id: 'profile', label: 'Profile' },
-  { id: 'search', label: 'Search' },
-  { id: 'settings', label: 'Settings' },
-] as const
-
-type TabId = (typeof TABS)[number]['id']
-
 const STATUS_POLL_MS = 20_000
 
 export default function App() {
@@ -30,7 +25,22 @@ export default function App() {
   const [engines, setEngines] = useState<EnginesView | null>(null)
   const engine = engines ? selectedEngine(engines) : null
   const [linkedin, setLinkedin] = useState<LinkedInStatus | null>(null)
-  const [tab, setTab] = useState<TabId>('profile')
+  // The address owns the tab: a link to one opens it, and Back and
+  // Forward move between them. This state only follows it — every change
+  // goes through `setTab`, which writes the address first, or arrives as
+  // a history step.
+  const [tab, setTabShown] = useState<TabId>(() => tabFrom(window.location.search))
+  const setTab = useCallback((id: TabId) => {
+    if (tabFrom(window.location.search) !== id) {
+      window.history.pushState(null, '', tabHref(window.location.href, id))
+    }
+    setTabShown(id)
+  }, [])
+  useEffect(() => {
+    const follow = () => setTabShown(tabFrom(window.location.search))
+    window.addEventListener('popstate', follow)
+    return () => window.removeEventListener('popstate', follow)
+  }, [])
   // Whether the page on screen has work the user would lose if it went
   // away: unsaved edits, or an action of theirs still in flight. Reported
   // by the pages themselves.
@@ -100,7 +110,7 @@ export default function App() {
   const openEngine = useCallback(() => {
     setTab('settings')
     land(engineHeadingRef)
-  }, [land])
+  }, [land, setTab])
   const episode = engine?.status === 'waiting_usage_exhausted' ? engine.episode : null
   useEffect(() => {
     if (!episode || episodeShown(episode)) return
@@ -111,24 +121,36 @@ export default function App() {
   const badge = engine ? engineBadge(engine) : null
   const model = engine ? modelLabel(engines, engine.provider, engine.model) : null
 
+  // A plain click switches in place; one that asks for a new tab or
+  // window, or a middle click, is the browser's to follow.
+  const follow = (id: TabId) => (e: MouseEvent<HTMLAnchorElement>) => {
+    if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+    e.preventDefault()
+    setTab(id)
+  }
+
   return (
     <div className="min-h-screen bg-bg text-ink">
-      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-line bg-surface px-4 py-4 sm:px-8">
-        <div>
-          <h1 className="text-xl font-semibold">Job Agent</h1>
-          <p className="text-sm text-ink-3">
-            LinkedIn job search with tailored resume + cover letter packages
-          </p>
+      {/* One column: the header, the notices, the tabs and the page all
+          start at the same left edge, whatever the window width. */}
+      <header className="border-b border-line bg-surface">
+        <div className={`${column} flex flex-wrap items-center justify-between gap-3 py-4`}>
+          <div>
+            <h1 className="text-xl font-semibold">Job Agent</h1>
+            <p className="text-sm text-ink-3">
+              LinkedIn job search with tailored resume + cover letter packages
+            </p>
+          </div>
+          {badge && (
+            <span
+              className={`rounded-full px-3 py-1 text-sm font-medium ${chip[badge.tone]}`}
+              title={engine?.last_error ?? undefined}
+            >
+              {badge.label}
+              {model ? ` · ${model}` : ''}
+            </span>
+          )}
         </div>
-        {badge && (
-          <span
-            className={`rounded-full px-3 py-1 text-sm font-medium ${chip[badge.tone]}`}
-            title={engine?.last_error ?? undefined}
-          >
-            {badge.label}
-            {model ? ` · ${model}` : ''}
-          </span>
-        )}
       </header>
       <RecoveryBanners
         engines={engines}
@@ -136,24 +158,26 @@ export default function App() {
         onOpenEngine={openEngine}
         onOpenSearch={() => setTab('search')}
       />
-      <nav className="border-b border-line bg-surface px-4 sm:px-8">
-        <div className="mx-auto flex max-w-7xl gap-6">
+      <nav aria-label="Pages" className="border-b border-line bg-surface">
+        <div className={`${column} flex gap-6`}>
           {TABS.map((t) => (
-            <button
+            <a
               key={t.id}
+              href={tabHref(window.location.href, t.id)}
+              aria-current={tab === t.id ? 'page' : undefined}
               className={`border-b-2 py-3 text-sm font-medium ${
                 tab === t.id
                   ? 'border-accent text-ink'
                   : 'border-transparent text-ink-3 hover:text-ink'
               }`}
-              onClick={() => setTab(t.id)}
+              onClick={follow(t.id)}
             >
               {t.label}
-            </button>
+            </a>
           ))}
         </div>
       </nav>
-      <main className="mx-auto max-w-7xl p-4 sm:p-8">
+      <main className={`${column} py-4 sm:py-8`}>
         {tab === 'profile' ? (
           <Onboarding
             profileEpoch={epochs.profile}

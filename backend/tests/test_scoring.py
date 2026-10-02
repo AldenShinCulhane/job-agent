@@ -3,6 +3,7 @@ false substring matches, YoE boundaries, missing requirements, education
 matching — with expected ordering and filter behavior. All data fake."""
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -1269,3 +1270,132 @@ async def test_rerank_rejects_bad_id_set(test_db, monkeypatch):
     with pytest.raises(ValueError):
         await llm_layer.rerank_close_matches(run_id)
     assert db.get_score("r1")["llm_rerank"] is None  # nothing written
+
+
+# --- the requirement checklist -----------------------------------------------
+
+def _checklist(requirements, user_years=2.0):
+    return scoring.requirement_checklist(requirements, PROFILE, user_years)
+
+
+def test_the_checklist_agrees_with_the_score():
+    """Every skill the score counts as matched is met on the list, every
+    one it counts as missing is not, and the preferred ones follow the
+    same rule — the list is the score's reasons, one line each."""
+    for requirements in (*LABELED_JOBS.values(),
+                         req(required_skills=["JS", "Golang", "Postgres"],
+                             preferred_skills=["reactjs", "Kubernetes"])):
+        breakdown = score_job(requirements, PROFILE, user_years=2.0)["breakdown"]
+        items = _checklist(requirements)
+        met = {scoring.canonical_skill(i["label"]) for i in items
+               if i["kind"] in ("required", "preferred") and i["met"]}
+        unmet_required = [scoring.canonical_skill(i["label"]) for i in items
+                          if i["kind"] == "required" and not i["met"]]
+        assert met == set(breakdown["matched_skills"])
+        assert unmet_required == breakdown["missing_skills"]
+
+
+def test_the_checklist_uses_the_postings_words():
+    items = _checklist(req(required_skills=["C++", "Python", " python "],
+                           preferred_skills=["Node", "C#"]))
+    assert [(i["kind"], i["label"], i["met"]) for i in items] == [
+        ("required", "C++", False),
+        ("required", "Python", True),     # the repeat is one requirement
+        ("preferred", "Node", True),      # an alias of the profile's Node.js
+        ("preferred", "C#", False),
+    ]
+
+
+def test_the_checklist_reads_experience_and_education():
+    items = _checklist(req(min_years_experience=3, education_requirement="bachelor"))
+    assert items == [
+        {"kind": "experience", "label": "3+ years of experience", "met": False},
+        {"kind": "education", "label": "Bachelor's degree", "met": True},
+    ]
+    # Exactly the years asked for is enough.
+    assert _checklist(req(min_years_experience=2))[0]["met"] is True
+    one = _checklist(req(min_years_experience=1, education_requirement="master"))
+    assert one == [
+        {"kind": "experience", "label": "1+ year of experience", "met": True},
+        {"kind": "education", "label": "Master's degree", "met": False},
+    ]
+
+
+def test_the_checklist_does_not_guess_what_the_score_cannot_read():
+    """Unreadable profile dates or an unknown degree level leave the score
+    neutral; the list says unknown rather than pass or fail."""
+    items = _checklist(req(min_years_experience=2,
+                           education_requirement="Diploma"), user_years=None)
+    assert items == [
+        {"kind": "experience", "label": "2+ years of experience", "met": None},
+        {"kind": "education", "label": "Diploma", "met": None},
+    ]
+    assert _checklist(req()) == []
+
+
+async def test_scored_jobs_list_their_requirements(test_db):
+    """The list rides on the score: a scored job carries its checklist,
+    built with the years its score was computed with; a job not scored
+    for the current profile carries none."""
+    from backend.api import routes
+    from backend.normalize.requirements import cache_key
+
+    version = _confirm_profile()
+    run_id = _seed_run(["s1", "s2"])
+    for job_id in ("s1", "s2"):
+        db.save_job_detail(job_id, f"Posting {job_id}", f"hash-{job_id}")
+    db.save_requirements(cache_key("hash-s1"), req(required_skills=["Python", "Rust"],
+                                                   min_years_experience=5))
+    db.save_requirements(cache_key("hash-s2"), req(required_skills=["Python"]))
+    # Under the bare hash is not where normalization keeps anything.
+    db.save_requirements("hash-s1", req(required_skills=["COBOL"]))
+    scored = score_job(db.get_requirements(cache_key("hash-s1")), PROFILE, user_years=2.0)
+    # The score's own years, not a fresh count from the profile's dates.
+    scored["breakdown"]["user_years"] = 6.0
+    db.save_score("s1", "hash-s1", version, scored["deterministic_score"],
+                  scored["breakdown"])
+    jobs = {j["job_id"]: j for j in (await routes.jobs_list(run_id))["jobs"]}
+    assert jobs["s1"]["requirements"] == [
+        {"kind": "required", "label": "Python", "met": True},
+        {"kind": "required", "label": "Rust", "met": False},
+        {"kind": "experience", "label": "5+ years of experience", "met": True},
+    ]
+    assert jobs["s2"]["requirements"] is None
+
+
+async def test_a_job_the_pipeline_scored_lists_its_requirements(
+    test_db, monkeypatch, fake_normalize_llm
+):
+    """The way a posting goes in production — fetched and parsed,
+    normalized, scored, then listed — with only the browser and the
+    model stood in for. The list finds the requirements where
+    normalization saved them."""
+    from backend import sources
+    from backend.api import routes
+    from backend.normalize.requirements import cache_key
+    from backend.scoring import pipeline
+
+    class FixtureBrowser:
+        async def fetch_page(self, url, *, mode="results"):
+            return (Path(__file__).parent / "fixtures"
+                    / "linkedin_job_detail.html").read_text()
+
+    async def instant():
+        pass
+
+    monkeypatch.setattr(sources.source, "_supervisor", FixtureBrowser())
+    monkeypatch.setattr(sources, "page_delay", instant)
+    _confirm_profile()
+    run_id = _seed_run(["e1"])
+    assert (await pipeline.run_pipeline(run_id))["scored"] == 1
+    assert fake_normalize_llm == ["normalize"]
+    jd_hash = db.get_job("e1")["description_hash"]
+    assert db.get_requirements(cache_key(jd_hash)) is not None
+
+    (job,) = (await routes.jobs_list(run_id))["jobs"]
+    assert job["deterministic_score"] > 0
+    assert job["requirements"] == [
+        {"kind": "required", "label": "Python", "met": True},
+        {"kind": "experience", "label": "2+ years of experience", "met": True},
+        {"kind": "education", "label": "Bachelor's degree", "met": True},
+    ]

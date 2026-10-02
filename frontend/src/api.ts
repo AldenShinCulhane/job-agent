@@ -161,6 +161,18 @@ export interface Job {
   llm_rerank: number | null
   llm_rank: number | null
   score_breakdown: ScoreBreakdown | null
+  /** What the posting asks for and whether the profile has it, by the
+   * rules the score used. Null while the job has no current score. */
+  requirements?: Requirement[] | null
+}
+
+export interface Requirement {
+  kind: 'required' | 'preferred' | 'experience' | 'education'
+  /** In the posting's own words. */
+  label: string
+  /** Null where the score stays neutral: profile dates or a degree level
+   * it cannot read. */
+  met: boolean | null
 }
 
 export interface Explanation {
@@ -199,6 +211,20 @@ export interface Package {
   company: string
   url: string
   provenance: Record<string, unknown>
+  /** What stopped a package at the truth check, one entry per claim;
+   * empty for anything else. */
+  unsupported?: UnsupportedClaim[]
+}
+
+export interface UnsupportedClaim {
+  /** A sentence the profile doesn't support, or the resume's structure
+   * (section order, skill categories, entry indexes). */
+  kind: 'claim' | 'structure'
+  document: 'resume' | 'cover letter'
+  /** The claim as the package last worded it; null for a structure
+   * failure, or when the package's documents are gone. */
+  claim: string | null
+  reason: string
 }
 
 export interface SearchConfig {

@@ -275,3 +275,50 @@ def score_job(
             "user_years": user_years,
         },
     }
+
+
+# --- the requirement checklist ------------------------------------------------
+
+_DEGREE_NAMES = {1: "Associate degree", 2: "Bachelor's degree",
+                 3: "Master's degree", 4: "Doctorate"}
+
+
+def requirement_checklist(requirements: dict, profile: dict,
+                          user_years: float | None) -> list[dict]:
+    """Each requirement the posting states, in the posting's own words,
+    and whether the profile meets it — by the rules `score_job` scores
+    with, so the list and the score never disagree.
+
+    `kind` is required, preferred, experience or education. `met` is None
+    where the scorer stays neutral: profile dates it cannot read, or a
+    degree level it does not know. Pass the `user_years` the score was
+    computed with (its breakdown keeps them), not a fresh count.
+    """
+    user_skills = flatten_profile_skills(profile)
+    items: list[dict] = []
+    for kind, key in (("required", "required_skills"),
+                      ("preferred", "preferred_skills")):
+        seen: set[str] = set()
+        for skill in requirements.get(key, []):
+            canonical = canonical_skill(skill)
+            if not canonical or canonical in seen:
+                continue
+            seen.add(canonical)
+            items.append({"kind": kind, "label": skill.strip(),
+                          "met": _skill_matches(canonical, user_skills)})
+    years = requirements.get("min_years_experience")
+    if years is not None:
+        items.append({
+            "kind": "experience",
+            "label": f"{years}+ year{'' if years == 1 else 's'} of experience",
+            "met": None if user_years is None else user_years >= years,
+        })
+    degree = requirements.get("education_requirement")
+    level = EDUCATION_LEVELS.get((degree or "").lower(), 0)
+    if degree:
+        items.append({
+            "kind": "education",
+            "label": _DEGREE_NAMES.get(level, degree),
+            "met": None if level == 0 else _profile_education_level(profile) >= level,
+        })
+    return items

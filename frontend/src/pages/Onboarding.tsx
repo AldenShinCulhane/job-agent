@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { api } from '../api'
 import type {
   Education,
@@ -65,6 +65,49 @@ function Field({
   )
 }
 
+/** A textarea as tall as its text, so a long bullet is never cut off
+ * behind a scrollbar. It refits when the text changes and when its width
+ * does, since a narrower box wraps to more lines. */
+function GrowingTextarea({
+  value,
+  onChange,
+  label,
+}: {
+  value: string
+  onChange: (v: string) => void
+  label: string
+}) {
+  const ref = useRef<HTMLTextAreaElement | null>(null)
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const fit = () => {
+      el.style.height = 'auto'
+      // scrollHeight leaves out the border; the height here includes it.
+      el.style.height = `${el.scrollHeight + el.offsetHeight - el.clientHeight}px`
+    }
+    fit()
+    let width = el.clientWidth
+    const observer = new ResizeObserver(() => {
+      if (el.clientWidth === width) return
+      width = el.clientWidth
+      fit()
+    })
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [value])
+  return (
+    <textarea
+      ref={ref}
+      rows={2}
+      className={`${inputCls} resize-none overflow-hidden`}
+      aria-label={label}
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+    />
+  )
+}
+
 function BulletsEditor({
   bullets,
   onChange,
@@ -78,11 +121,10 @@ function BulletsEditor({
     <div className="space-y-1">
       {bullets.map((bullet, i) => (
         <div key={i} className="flex gap-1">
-          <textarea
-            className={`${inputCls} min-h-[3.5rem]`}
-            aria-label={`${addLabel} ${i + 1}`}
+          <GrowingTextarea
+            label={`${addLabel} ${i + 1}`}
             value={bullet}
-            onChange={(e) => onChange(bullets.map((b, j) => (j === i ? e.target.value : b)))}
+            onChange={(v) => onChange(bullets.map((b, j) => (j === i ? v : b)))}
           />
           <button
             className="self-start text-ink-3 hover:text-danger-fg"
@@ -103,10 +145,32 @@ function BulletsEditor({
   )
 }
 
-function SectionHeader({ title, onAdd, addLabel }: { title: string; onAdd: () => void; addLabel: string }) {
+// The long parts of the form, in order, and where each one's links go.
+const PROFILE_SECTIONS = [
+  { id: 'profile-experience', title: 'Experience' },
+  { id: 'profile-projects', title: 'Projects' },
+  { id: 'profile-education', title: 'Education' },
+  { id: 'profile-skills', title: 'Skills' },
+] as const
+
+function SectionHeader({
+  id,
+  title,
+  onAdd,
+  addLabel,
+}: {
+  id: string
+  title: string
+  onAdd: () => void
+  addLabel: string
+}) {
   return (
     <div className="mb-2 flex items-center justify-between">
-      <h3 className="font-medium">{title}</h3>
+      {/* A link's target: focusable so the keyboard follows the link, and
+          clear of the sticky section links above it. */}
+      <h3 id={id} tabIndex={-1} className="scroll-mt-14 font-medium">
+        {title}
+      </h3>
       <button className="text-sm text-ink-3 hover:text-ink" onClick={onAdd}>
         + {addLabel}
       </button>
@@ -406,7 +470,7 @@ export default function Onboarding({
   const previewUrl = `/api/profile/preview.pdf?version=${payload.version}&inline=1`
 
   return (
-    <div className="grid grid-cols-1 gap-6 xl:grid-cols-2">
+    <div className="grid grid-cols-1 gap-6 xl:grid-cols-2 xl:items-start">
       <section className="space-y-6 rounded-xl border border-line bg-surface p-6 shadow-card">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h2 ref={headingRef} tabIndex={-1} className="text-lg font-semibold">
@@ -489,6 +553,18 @@ export default function Onboarding({
             flight — which is the only window in which a response could
             arrive describing a profile the editor has already moved
             past. Preflight resets the fieldset's own border/padding. */}
+        {/* Kept in reach while the form scrolls past: the form is long, and
+            these are the way from any part of it to another. */}
+        <nav
+          aria-label="Profile sections"
+          className="sticky top-0 z-10 -mx-6 flex flex-wrap gap-x-4 gap-y-1 border-b border-line bg-surface px-6 py-2 text-sm"
+        >
+          {PROFILE_SECTIONS.map((section) => (
+            <a key={section.id} href={`#${section.id}`} className="text-ink-2 underline hover:text-ink">
+              {section.title}
+            </a>
+          ))}
+        </nav>
         <fieldset disabled={busy !== null} className="min-w-0 space-y-6">
           <Field label="Name" value={draft.name} onChange={(v) => edit((p) => (p.name = v))} />
           <Field
@@ -512,6 +588,7 @@ export default function Onboarding({
 
           <div>
             <SectionHeader
+              id="profile-experience"
               title="Experience"
               addLabel="experience"
               onAdd={() => edit((p) => p.experiences.push(structuredClone(EMPTY_EXPERIENCE)))}
@@ -535,6 +612,7 @@ export default function Onboarding({
 
           <div>
             <SectionHeader
+              id="profile-projects"
               title="Projects"
               addLabel="project"
               onAdd={() => edit((p) => p.projects.push(structuredClone(EMPTY_PROJECT)))}
@@ -561,6 +639,7 @@ export default function Onboarding({
 
           <div>
             <SectionHeader
+              id="profile-education"
               title="Education"
               addLabel="education"
               onAdd={() => edit((p) => p.education.push(structuredClone(EMPTY_EDUCATION)))}
@@ -588,6 +667,7 @@ export default function Onboarding({
 
           <div>
             <SectionHeader
+              id="profile-skills"
               title="Skills"
               addLabel="skill group"
               onAdd={() => edit((p) => p.skills.push(structuredClone(EMPTY_SKILL_GROUP)))}
@@ -619,12 +699,14 @@ export default function Onboarding({
         </fieldset>
       </section>
 
-      <section className="rounded-xl border border-line bg-surface p-2 shadow-card">
+      {/* From xl the preview sits beside the form and stays in view while
+          the form scrolls, one screen tall. */}
+      <section className="rounded-xl border border-line bg-surface p-2 shadow-card xl:sticky xl:top-4">
         <iframe
           key={payload.version}
           title="Resume preview"
           src={previewUrl}
-          className="h-[85vh] w-full rounded-lg"
+          className="h-[85vh] w-full rounded-lg xl:h-[calc(100vh-6rem)]"
         />
         {/* The pane needs the browser's own PDF viewer; where that is
             off or the frame fails, this is the same file by another

@@ -1515,6 +1515,93 @@ async def test_validation_failure_after_repair_fails_package(
     assert "fabricated metric" in row["error"]
 
 
+
+async def test_a_validation_failure_names_each_unsupported_claim(
+    test_db, tmp_path, monkeypatch
+):
+    """The list shows what stopped the package: the claim as the package
+    last worded it, which document it was in, and why it failed."""
+    from backend.tailor import pipeline as tailor_pipeline
+    from backend.tailor import validate as validate_mod
+
+    version = _confirm_profile()
+    _seed_job("p1")
+    _seed_derived("p1", version)
+    pkg, _ = _create_package("p1", version, "hash-a")
+    _tailor_env(monkeypatch, tmp_path)
+
+    async def failing(tailored, profile, ledger, cache, record=None):
+        return [{"claim_id": "cover:p1", "reason": "no fact shows this; note: nor that"},
+                {"claim_id": "exp0:b0", "reason": "fabricated metric"}]
+
+    async def reword(tailored, failures, profile, ledger):
+        repaired = json.loads(json.dumps(tailored))
+        repaired["cover_letter"]["paragraphs"][1]["text"] = "Reworded paragraph."
+        return repaired
+
+    monkeypatch.setattr(validate_mod, "validate", failing)
+    monkeypatch.setattr(validate_mod, "repair", engine_fakes.answering("repair", reword))
+    assert await tailor_pipeline.run_package(pkg) == "failed"
+    row = db.get_package(pkg)
+    bullet = row["stage"]["tailored"]["experiences"][0]["bullets"][0]["text"]
+    expected = [
+        {"kind": "claim", "document": "cover letter", "claim": "Reworded paragraph.",
+         "reason": "no fact shows this; note: nor that"},
+        {"kind": "claim", "document": "resume", "claim": bullet,
+         "reason": "fabricated metric"},
+    ]
+    assert tailor_pipeline.unsupported_claims(row) == expected
+    # And the package list carries them.
+    from backend.api import routes
+    listed = (await routes.packages_list())["packages"]
+    assert [p["unsupported"] for p in listed if p["id"] == pkg] == [expected]
+
+
+def test_unsupported_claims_read_a_package_failed_before_they_existed():
+    """A package that failed under the earlier message reads the same, and
+    nothing else a package can fail with reads as a claim."""
+    from backend.tailor import pipeline as tailor_pipeline
+
+    tailored = {"headline": {"text": "Backend engineer", "source_ids": []},
+                "experiences": [], "projects": [],
+                "cover_letter": {"paragraphs": [
+                    {"text": "Dear team,", "source_ids": []},
+                    {"text": "I bring hands-on evaluation experience.",
+                     "source_ids": []}]}}
+    failed = {"status": "failed", "stage": {"tailored": tailored},
+              "error": "truth validation failed after 2 repair round(s): "
+                       "cover:p1: The claim asserts hands-on evaluation "
+                       "experience, which no cited fact shows; "
+                       "section_order: not a permutation of ['a', 'b']"}
+    assert tailor_pipeline.unsupported_claims(failed) == [
+        {"kind": "claim", "document": "cover letter",
+         "claim": "I bring hands-on evaluation experience.",
+         "reason": "The claim asserts hands-on evaluation experience, "
+                   "which no cited fact shows"},
+        {"kind": "structure", "document": "resume", "claim": None,
+         "reason": "not a permutation of ['a', 'b']"},
+    ]
+    # Without its documents the reasons still read.
+    assert tailor_pipeline.unsupported_claims(dict(failed, stage={}))[0]["claim"] is None
+    # A sentence is a claim; the resume's shape is not.
+    ids = {"headline": "claim", "exp0:b1": "claim", "proj2:b0": "claim",
+           "cover:p3": "claim", "section_order": "structure",
+           "skills_order": "structure", "experiences:4": "structure",
+           "projects:0": "structure"}
+    error = ("truth validation failed after 2 repair round(s): "
+             + "; ".join(f"{claim_id}: why" for claim_id in ids))
+    kinds = [c["kind"] for c in tailor_pipeline.unsupported_claims(
+        {"status": "failed", "stage": {}, "error": error})]
+    assert kinds == list(ids.values())
+    # A message this code did not write is shown as it is, not half read.
+    odd = ("truth validation failed after 2 repair round(s): the checker "
+           "timed out; exp0:b0: fabricated metric")
+    for other in ({"status": "failed", "stage": {}, "error": "CompileError: boom"},
+                  {"status": "failed", "stage": {}, "error": None},
+                  dict(failed, error=odd),
+                  dict(failed, status="queued")):
+        assert tailor_pipeline.unsupported_claims(other) == []
+
 async def test_package_fails_when_posting_changed_before_generation(
     test_db, tmp_path, monkeypatch
 ):

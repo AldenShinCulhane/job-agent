@@ -702,6 +702,24 @@ def get_requirements(jd_hash: str | None) -> dict | None:
     return json.loads(row[0]) if row else None
 
 
+
+def requirements_for(keys) -> dict[str, dict]:
+    """The cached requirements under each of these cache keys that has
+    them, by key. The keys are normalization's (`cache_key`), not bare
+    description hashes."""
+    import json
+
+    wanted = sorted({k for k in keys if k})
+    if not wanted:
+        return {}
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT jd_hash, requirements_json FROM requirements_cache "
+            f"WHERE jd_hash IN ({', '.join('?' * len(wanted))})", wanted,
+        ).fetchall()
+    return {key: json.loads(raw) for key, raw in rows}
+
+
 def save_score(
     job_id: str,
     jd_hash: str,

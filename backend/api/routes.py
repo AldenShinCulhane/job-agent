@@ -16,9 +16,10 @@ from jsonschema import Draft202012Validator
 from backend import sources
 from backend.core import db, llm
 from backend.core.events import broker
+from backend.normalize import requirements as normalize_requirements
 from backend.resume import facts, ingest, template
 from backend.resume.schema import PROFILE_SCHEMA
-from backend.scoring import llm_layer
+from backend.scoring import llm_layer, score
 from backend.scoring import pipeline as scoring_pipeline
 from backend.tailor import compile as latex
 from backend.tailor import pipeline as tailor_pipeline
@@ -1151,9 +1152,22 @@ async def jobs_list(run_id: int | None = None):
                     "scoring_stall": None}
         run_id = latest["id"]
     try:
-        profile_version = scoring_pipeline.confirmed_profile()[0]
+        profile_version, profile = scoring_pipeline.confirmed_profile()
     except scoring_pipeline.NoConfirmedProfile:
-        profile_version = None
+        profile_version, profile = None, None
+    # Scores join only against the current profile version + JD hash
+    # — mid-rescore the UI sees "unscored", never stale numbers.
+    jobs = db.list_jobs(run_id, profile_version=profile_version)
+    # A scored job's checklist is built from what its score was: the same
+    # requirements, the same profile version, the same years.
+    requirements = normalize_requirements.cached_for(
+        j["description_hash"] for j in jobs if j["score_breakdown"])
+    for job in jobs:
+        found = requirements.get(job["description_hash"])
+        job["requirements"] = (
+            None if found is None or not job["score_breakdown"]
+            else score.requirement_checklist(
+                found, profile, job["score_breakdown"].get("user_years")))
     # A stall only describes THIS run under the CURRENT profile —
     # anything else is stale ownership and must not label new results.
     stall = _get_scoring_stall()
@@ -1163,9 +1177,7 @@ async def jobs_list(run_id: int | None = None):
     ):
         stall = None
     return {
-        # Scores join only against the current profile version + JD hash
-        # — mid-rescore the UI sees "unscored", never stale numbers.
-        "jobs": db.list_jobs(run_id, profile_version=profile_version),
+        "jobs": jobs,
         "run_id": run_id,
         # Remaining pipeline work — the UI shows "Scoring…" while > 0.
         "scoring_pending": scoring_pipeline.pending_count(run_id),
@@ -1358,7 +1370,10 @@ def _retry_answer(source_id: int, package_id: int, *, created: bool) -> dict:
 
 @router.get("/packages")
 async def packages_list():
-    return {"packages": db.list_packages(),
+    packages = db.list_packages()
+    for package in packages:
+        package["unsupported"] = tailor_pipeline.unsupported_claims(package)
+    return {"packages": packages,
             "page_limit": tailor_pipeline.resume_page_limit()}
 
 
