@@ -7,8 +7,12 @@ scores, and the package state machine on the same database.
 
 import os
 import sqlite3
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
+
+from backend.core import duplicates
 
 DATA_DIR = Path(__file__).resolve().parent.parent.parent / ".data"
 DB_PATH = DATA_DIR / "job_agent.sqlite3"
@@ -110,6 +114,19 @@ CREATE TABLE IF NOT EXISTS job_scores (
     explanation_json    TEXT,
     scored_at           TEXT NOT NULL
 );
+-- Which postings repeat one role (PLAN.md P8a): derived from the jobs
+-- table, one row per posting that can be grouped. match_key is the
+-- bucket it was grouped in, so a change of company, title or location
+-- knows which old bucket to recompute; group_id is the group's first
+-- member, never referenced from anywhere else.
+CREATE TABLE IF NOT EXISTS posting_groups (
+    job_id       TEXT PRIMARY KEY,
+    match_key    TEXT NOT NULL,
+    group_id     TEXT NOT NULL,
+    rule_version INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS posting_groups_by_key ON posting_groups (match_key);
+CREATE INDEX IF NOT EXISTS posting_groups_by_group ON posting_groups (group_id);
 CREATE TABLE IF NOT EXISTS package_requests (
     request_key TEXT PRIMARY KEY,
     source_id   INTEGER NOT NULL,
@@ -226,6 +243,39 @@ def _add_package_attempts(conn) -> None:
     _rebuild_packages(conn, "packages_pre_attempt", _COPY_PACKAGES_PRE_ATTEMPT_SQL)
 
 
+# The rule a database's groups were built with. Groups are derived, so a
+# rule change simply rebuilds them all.
+_GROUPS_RULE_KEY = "posting_groups_rule"
+
+
+def _rebuild_groups(conn) -> None:
+    """Rebuild every posting group under the current rule, in one
+    transaction: a crash or an error part-way leaves the groups exactly
+    as they were, and the next start rebuilds again. Nothing else
+    references a group, so a rebuild changes no other table."""
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("DELETE FROM posting_groups")
+        buckets: dict[str, list[dict]] = defaultdict(list)
+        for posting in _grouping_rows(conn, None):
+            key = duplicates.match_key(posting)
+            if key is not None:
+                buckets[key].append(posting)
+        for key in sorted(buckets):
+            _write_groups(conn, key, duplicates.group(buckets[key]))
+        conn.execute(
+            "INSERT INTO engine_state (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            (_GROUPS_RULE_KEY, str(duplicates.RULE_VERSION),
+             datetime.now(timezone.utc).isoformat()))
+    except BaseException:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
 def init() -> None:
     DATA_DIR.mkdir(mode=0o700, exist_ok=True)
     os.chmod(DATA_DIR, 0o700)  # mkdir mode is subject to umask; enforce
@@ -249,6 +299,10 @@ def init() -> None:
                 conn.execute(statement)
             except sqlite3.OperationalError:
                 pass  # already applied (e.g. duplicate column)
+        rule = conn.execute("SELECT value FROM engine_state WHERE key = ?",
+                            (_GROUPS_RULE_KEY,)).fetchone()
+        if rule is None or rule[0] != str(duplicates.RULE_VERSION):
+            _rebuild_groups(conn)
     os.chmod(DB_PATH, 0o600)
 
 
@@ -489,6 +543,119 @@ def _job_row_to_dict(row) -> dict:
     return job
 
 
+# --- Posting groups (PLAN.md P8a) -------------------------------------------
+# Kept current by every write that changes what grouping reads — company,
+# title, location (search cards) and description (detail saves) — in
+# the same transaction as that write, so there is never a window where a
+# posting has moved and its group has not.
+
+_GROUPING_COLUMNS = ("job_id", "company", "title", "location", "description",
+                     "description_hash", "first_seen_at")
+
+
+def _grouping_rows(conn, job_ids) -> list[dict]:
+    """What grouping reads, for these postings — or, with None, for every
+    posting that has a description."""
+    columns = ", ".join(_GROUPING_COLUMNS)
+    if job_ids is None:
+        rows = conn.execute(
+            f"SELECT {columns} FROM jobs WHERE description IS NOT NULL").fetchall()
+    else:
+        wanted = sorted(set(job_ids))
+        rows = []
+        for i in range(0, len(wanted), 500):
+            chunk = wanted[i:i + 500]
+            rows += conn.execute(
+                f"SELECT {columns} FROM jobs "
+                f"WHERE job_id IN ({', '.join('?' * len(chunk))})", chunk).fetchall()
+    return [dict(zip(_GROUPING_COLUMNS, row)) for row in rows]
+
+
+def _write_groups(conn, key: str, groups: dict[str, str]) -> None:
+    conn.executemany(
+        "INSERT INTO posting_groups (job_id, match_key, group_id, rule_version) "
+        "VALUES (?, ?, ?, ?)",
+        [(job_id, key, group_id, duplicates.RULE_VERSION)
+         for job_id, group_id in sorted(groups.items())])
+
+
+def _shared(groups: dict[str, str]) -> set[frozenset[str]]:
+    """The groups of two or more, as sets of postings: what a reader
+    sees. A posting alone is not grouped, whatever its row says."""
+    members: dict[str, set[str]] = defaultdict(set)
+    for job_id, group_id in groups.items():
+        members[group_id].add(job_id)
+    return {frozenset(m) for m in members.values() if len(m) > 1}
+
+
+def _regroup(conn, job_ids=(), *, described=()) -> bool:
+    """Recompute the groups these postings were in and are in now, inside
+    the caller's transaction. `job_ids` are postings whose card fields
+    may have changed: only those whose bucket moved are regrouped.
+    `described` are postings whose description was just saved: their
+    bucket is always regrouped, since the text itself is compared.
+    Returns whether any group of two or more changed."""
+    ids = set(job_ids) | set(described)
+    if not ids:
+        return False
+    stored = dict(conn.execute(
+        "SELECT job_id, match_key FROM posting_groups "
+        f"WHERE job_id IN ({', '.join('?' * len(ids))})", sorted(ids)).fetchall())
+    current = {p["job_id"]: duplicates.match_key(p) for p in _grouping_rows(conn, ids)}
+    moved = {j for j in ids if stored.get(j) != current.get(j)} | set(described)
+    if not moved:
+        return False
+    keys = sorted(({stored.get(j) for j in moved} | {current.get(j) for j in moved})
+                  - {None})
+    before = {key: dict(conn.execute(
+        "SELECT job_id, group_id FROM posting_groups WHERE match_key = ?",
+        (key,)).fetchall()) for key in keys}
+    conn.execute(f"DELETE FROM posting_groups WHERE job_id IN ({', '.join('?' * len(moved))})",
+                 sorted(moved))
+    changed = False
+    for key in keys:
+        arriving = {j for j in moved if current.get(j) == key}
+        members = [p for p in _grouping_rows(conn, set(before[key]) | arriving)
+                   if duplicates.match_key(p) == key]
+        after = duplicates.group(members)
+        conn.execute("DELETE FROM posting_groups WHERE match_key = ?", (key,))
+        _write_groups(conn, key, after)
+        changed |= _shared(before[key]) != _shared(after)
+    return changed
+
+
+def posting_groups(job_ids, run_id: int | None = None) -> dict[str, dict]:
+    """For each of these postings that shares a group with another: the
+    group's id and every member, oldest first, each with its link, when
+    it was first seen and whether it is in `run_id`'s results."""
+    wanted = sorted(set(job_ids))
+    if not wanted:
+        return {}
+    with _connect() as conn:
+        group_of = dict(conn.execute(
+            "SELECT job_id, group_id FROM posting_groups "
+            f"WHERE job_id IN ({', '.join('?' * len(wanted))})", wanted).fetchall())
+        group_ids = sorted(set(group_of.values()))
+        if not group_ids:
+            return {}
+        rows = conn.execute(
+            "SELECT posting_groups.group_id, jobs.job_id, jobs.url, "
+            "jobs.first_seen_at, EXISTS (SELECT 1 FROM search_run_jobs "
+            "WHERE search_run_jobs.run_id IS ? "
+            "AND search_run_jobs.job_id = jobs.job_id) "
+            "FROM posting_groups JOIN jobs ON jobs.job_id = posting_groups.job_id "
+            f"WHERE posting_groups.group_id IN ({', '.join('?' * len(group_ids))}) "
+            "ORDER BY jobs.first_seen_at, jobs.job_id",
+            (run_id, *group_ids)).fetchall()
+    members: dict[str, list[dict]] = defaultdict(list)
+    for group_id, job_id, url, first_seen_at, in_run in rows:
+        members[group_id].append({"job_id": job_id, "url": url,
+                                  "first_seen_at": first_seen_at,
+                                  "in_run": bool(in_run)})
+    return {job_id: {"id": group_id, "members": members[group_id]}
+            for job_id, group_id in group_of.items() if len(members[group_id]) > 1}
+
+
 def upsert_job(card: dict) -> bool:
     """Insert a search-result card, or refresh its card fields if the job
     is already known. Returns True when the job was new (for dedupe/cap
@@ -514,6 +681,7 @@ def upsert_job(card: dict) -> bool:
                 card["url"], now, now,
             ),
         )
+        _regroup(conn, [card["job_id"]])
     return not existed
 
 
@@ -598,6 +766,7 @@ def record_search_page(run_id: int, cards: list[dict], next_start: int, cap: int
     desync the accounting. Idempotent: re-recording the same page after
     a crash changes nothing. Returns the run's collected total."""
     now = datetime.now(timezone.utc).isoformat()
+    recorded = []
     with _connect() as conn:
         for card in cards:
             collected = conn.execute(
@@ -625,6 +794,11 @@ def record_search_page(run_id: int, cards: list[dict], next_start: int, cap: int
                 "INSERT OR IGNORE INTO search_run_jobs (run_id, job_id) VALUES (?, ?)",
                 (run_id, card["job_id"]),
             )
+            recorded.append(card["job_id"])
+        # A card can rename a known posting, or move it: its group follows
+        # in this same transaction. The caller's "search" event re-reads
+        # the job list, groups included.
+        _regroup(conn, recorded)
         collected = conn.execute(
             "SELECT COUNT(*) FROM search_run_jobs WHERE run_id = ?", (run_id,)
         ).fetchone()[0]
@@ -636,10 +810,15 @@ def record_search_page(run_id: int, cards: list[dict], next_start: int, cap: int
     return collected
 
 
+class DetailSaved(NamedTuple):
+    superseded: list[int]  # the package ids this posting edit superseded
+    regrouped: bool        # whether any posting group changed
+
+
 def save_job_detail(job_id: str, description: str,
-                    description_hash: str) -> list[int]:
-    """Returns the package ids this posting edit superseded, so the caller
-    can announce them — this layer never touches the event broker."""
+                    description_hash: str) -> DetailSaved:
+    """Save a posting's description. Says what that changed so the caller
+    can announce it — this layer never touches the event broker."""
     now = datetime.now(timezone.utc).isoformat()
     with _connect() as conn:
         conn.execute(
@@ -664,7 +843,8 @@ def save_job_detail(job_id: str, description: str,
              "re-select the job to build a new package", now, job_id,
              description_hash),
         )
-    return superseded
+        regrouped = _regroup(conn, described=[job_id])
+    return DetailSaved(superseded, regrouped)
 
 
 # --- Normalized requirements + scores (PLAN.md §4.4) ------------------------

@@ -21,7 +21,13 @@ with strict page-limit enforcement and no fabricated claims.
    posting with its paragraphs and lines, as text only, and a checklist of
    what it asks for (skills, years, degree), each marked as in your profile,
    missing, or unknown by the same rules the score uses. A job you have
-   generated for shows its newest package's state on its row.
+   generated for shows its newest package's state on its row. A role
+   LinkedIn lists more than once — a repost, or the same role found again
+   by a later search — is one row: same company, title and location, and
+   the same or nearly the same text. The row lists its other listings, and
+   a package one of them already has is shown on it, so a role you have
+   generated for doesn't get a second package by accident. Each listing
+   keeps its own id, score and packages.
 4. **Select the jobs you want.** For each one, the app autonomously writes a
    tailored resume and cover letter, validates every claim against facts
    extracted from *your* resume, enforces your page limit (default 1 page —

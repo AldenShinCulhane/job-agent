@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from backend.tests.ui_harness import (
-    API_FIXTURES, ENGINE, SIGNED_IN, Response, _job, _package, engines_view,
+    API_FIXTURES, ENGINE, SIGNED_IN, Response, _job, _member, _package, engines_view,
     profile_payload, route_fixtures,
 )
 
@@ -158,6 +158,29 @@ DETAILS = {
 }
 
 
+# One role listed three times: once in an earlier search, where it got a
+# package, and twice in this one — beside two roles listed once.
+EARLIER, SEEN_B, SEEN_C = ("2026-08-01T12:00:00Z", "2026-09-14T12:00:00Z",
+                           "2026-09-15T12:00:00Z")
+ROLE = {"id": "old", "members": [_member("old", EARLIER, False),
+                                 _member("b", SEEN_B, True), _member("c", SEEN_C, True)]}
+GROUPS = {
+    "/api/jobs": dict(API_FIXTURES["/api/jobs"], jobs=[
+        _job("a", 80),
+        _job("b", 70, title="Platform Engineer", first_seen_at=SEEN_B, easy=True,
+             group=ROLE),
+        _job("c", 70, title="Platform Engineer", first_seen_at=SEEN_C, group=ROLE),
+        _job("d", 60)]),
+    "/api/packages": {"page_limit": 1, "packages": [
+        _package(5, "done", job="old", title="Platform Engineer")]},
+}
+
+
+def _listings_open(page):
+    page.get_by_text("Also listed 2 more times").click()
+    page.wait_for_selector("text=from an earlier search")
+
+
 def _details_open(page):
     page.get_by_role("button", name="Details").first.click()
     page.wait_for_selector("text=Own services end to end.")
@@ -219,6 +242,8 @@ STATES: list[State] = [
           allow_failed_requests=("/api/packages/12/retry",)),
     State("search-job-details", tab="Search", fixtures=DETAILS,
           ready=("text=Backend Engineer a", "text=Package ready"), setup=_details_open),
+    State("search-job-groups", tab="Search", fixtures=GROUPS,
+          ready=("text=Platform Engineer",), setup=_listings_open),
     State("packages-truth-check", tab="Search", fixtures=DETAILS,
           ready=("text=Stopped at the truth check",)),
     State("packages-truth-check-why", tab="Search", fixtures=DETAILS,

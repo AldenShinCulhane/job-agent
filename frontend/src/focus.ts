@@ -28,3 +28,32 @@ export function useFocusLanding(): (ref: RefObject<HTMLElement | null>) => void 
     rerender((n) => n + 1)
   }, [])
 }
+
+/** The element holding the focus while `holds` claims it, for a caller
+ * that puts the focus back when the page takes that element away. Only
+ * the user lets it go: by focusing any other element, or by pressing the
+ * pointer anywhere outside it (a press on nothing sends the focus to the
+ * body). A blur the user did not cause keeps it held: the element
+ * removed, or moved and given the focus back — the browser blurs a row a
+ * keyed list re-inserts, and React refocuses it — and so does another
+ * window taking the focus for a while. `holds` must be stable. */
+export function useHeldFocus(holds: (el: HTMLElement) => boolean): RefObject<HTMLElement | null> {
+  const held = useRef<HTMLElement | null>(null)
+  useEffect(() => {
+    const onFocusIn = (e: FocusEvent) => {
+      const el = e.target
+      held.current = el instanceof HTMLElement && holds(el) ? el : null
+    }
+    const onPointerDown = (e: PointerEvent) => {
+      const el = e.target
+      if (!(el instanceof Node && held.current?.contains(el))) held.current = null
+    }
+    document.addEventListener('focusin', onFocusIn)
+    document.addEventListener('pointerdown', onPointerDown, true)
+    return () => {
+      document.removeEventListener('focusin', onFocusIn)
+      document.removeEventListener('pointerdown', onPointerDown, true)
+    }
+  }, [holds])
+  return held
+}

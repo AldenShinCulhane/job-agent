@@ -1168,6 +1168,11 @@ async def jobs_list(run_id: int | None = None):
             None if found is None or not job["score_breakdown"]
             else score.requirement_checklist(
                 found, profile, job["score_breakdown"].get("user_years")))
+    # Every posting stays its own entry, under its own id: the list says
+    # which ones repeat a role, and the UI shows them as one row.
+    groups = db.posting_groups((j["job_id"] for j in jobs), run_id)
+    for job in jobs:
+        job["group"] = groups.get(job["job_id"])
     # A stall only describes THIS run under the CURRENT profile —
     # anything else is stale ownership and must not label new results.
     stall = _get_scoring_stall()

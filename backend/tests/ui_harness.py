@@ -37,7 +37,9 @@ DIST = REPO / "frontend" / "dist"
 def _job(job_id: str, score: float | None, rerank: float | None = None,
          easy: bool = False, title: str | None = None,
          description: str | None = None,
-         requirements: list[dict] | None = None) -> dict:
+         requirements: list[dict] | None = None,
+         first_seen_at: str = "2026-09-15T12:00:00Z",
+         group: dict | None = None) -> dict:
     return {
         "job_id": job_id,
         "title": title or f"Backend Engineer {job_id}",
@@ -47,7 +49,7 @@ def _job(job_id: str, score: float | None, rerank: float | None = None,
         "workplace": "hybrid",
         "easy_apply": easy,
         "url": f"https://example.invalid/jobs/{job_id}",
-        "first_seen_at": "2026-09-15T12:00:00Z",
+        "first_seen_at": first_seen_at,
         "last_seen_at": "2026-09-15T12:00:00Z",
         "description": description,
         "description_hash": None,
@@ -62,7 +64,14 @@ def _job(job_id: str, score: float | None, rerank: float | None = None,
             "exceeds_experience": False, "user_years": 1,
         },
         "requirements": requirements,
+        "group": group,
     }
+
+
+def _member(job_id: str, first_seen_at: str, in_run: bool) -> dict:
+    """One posting of a group, as /api/jobs lists it."""
+    return {"job_id": job_id, "url": f"https://example.invalid/jobs/{job_id}",
+            "first_seen_at": first_seen_at, "in_run": in_run}
 
 
 def _package(pid: int, status: str, error: str | None = None, *,

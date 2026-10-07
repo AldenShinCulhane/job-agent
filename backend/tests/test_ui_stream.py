@@ -26,6 +26,7 @@ FANOUT_SEARCH = {
     "scoring": ["/api/jobs"],
     "packages": ["/api/packages"],
     "profile": ["/api/jobs", "/api/profile"],
+    "jobs": ["/api/jobs"],
 }
 FANOUT_PROFILE = {
     "engine": ["/api/engines"],
@@ -34,6 +35,7 @@ FANOUT_PROFILE = {
     "scoring": [],
     "packages": [],
     "profile": ["/api/profile"],
+    "jobs": [],
 }
 
 # Nothing to poll for while the stream is up: session ready, run done,

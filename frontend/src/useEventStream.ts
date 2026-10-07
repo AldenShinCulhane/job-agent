@@ -9,6 +9,7 @@ export const TOPICS = [
   'scoring',
   'packages',
   'profile',
+  'jobs',
 ] as const
 
 export type Topic = (typeof TOPICS)[number]
@@ -33,6 +34,7 @@ const ZERO: Epochs = {
   scoring: 0,
   packages: 0,
   profile: 0,
+  jobs: 0,
 }
 
 // A scoring run publishes once per job and a generation batch once per

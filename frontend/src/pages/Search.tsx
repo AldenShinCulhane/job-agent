@@ -7,7 +7,9 @@ import { useEpochEffect } from '../useEventStream'
 import type { Epochs } from '../useEventStream'
 import { useLatestOnly } from '../useLatestOnly'
 import { badgeFor, btnPrimary, btnSecondary, chip, inputCls, labelCls } from '../styles'
-import { useFocusLanding } from '../focus'
+import { useFocusLanding, useHeldFocus } from '../focus'
+import { listedOn, roleRows, selectableIds } from '../jobGroups'
+import type { Listing } from '../jobGroups'
 import {
   attemptLabel,
   failedFirst,
@@ -128,6 +130,11 @@ const acceptPlaceholderOnTab =
     }
   }
 
+// What the two focus slots below hold: a retry button, and a control in
+// a row of the job list, which says what posting it acts for.
+const isRetryButton = (el: HTMLElement) => 'retry' in el.dataset
+const inJobRow = (el: HTMLElement) => el.closest('[data-posting]') !== null
+
 export default function Search({
   epochs,
   connected,
@@ -152,6 +159,10 @@ export default function Search({
   const [busyRerank, setBusyRerank] = useState(false)
   const [explanations, setExplanations] = useState<Record<string, Explanation>>({})
   const [selected, setSelected] = useState<Set<string>>(new Set())
+  // Roles whose other listings are shown, by every posting of the role:
+  // its row can be rebuilt to stand for another of them, and what was
+  // shown stays shown.
+  const [openListings, setOpenListings] = useState<Set<string>>(new Set())
   const [packages, setPackages] = useState<Package[]>([])
   const [busyGenerate, setBusyGenerate] = useState(false)
   // Try again / Regenerate clicks still out, and what each last said
@@ -197,6 +208,7 @@ export default function Search({
   const editButtonRef = useRef<HTMLButtonElement | null>(null)
   const keywordsRef = useRef<HTMLInputElement | null>(null)
   const jobsHeadingRef = useRef<HTMLHeadingElement | null>(null)
+  const jobListRef = useRef<HTMLUListElement | null>(null)
   const packagesHeadingRef = useRef<HTMLHeadingElement | null>(null)
   const land = useFocusLanding()
   // Which run the rows ON SCREEN came from. Two copies on purpose: the
@@ -340,6 +352,8 @@ export default function Search({
     void refreshJobs() // a run collects jobs as it goes
   })
   useEpochEffect(epochs.scoring, refreshJobs)
+  // A saved description can join or split postings that repeat a role.
+  useEpochEffect(epochs.jobs, refreshJobs)
   useEpochEffect(epochs.packages, refreshPackages)
   // A confirm or discard changes which scores /api/jobs can show — score
   // rows are keyed to a profile version — and the location suggestion
@@ -544,38 +558,14 @@ export default function Search({
   // Packages heading instead. One slot is right however many clicks are
   // out, because only one element holds the focus. A refusal that leaves
   // the button leaves the focus on it.
-  const focusedRetry = useRef<HTMLElement | null>(null)
-  useEffect(() => {
-    const onFocusIn = (e: FocusEvent) => {
-      const el = e.target
-      focusedRetry.current = el instanceof HTMLElement && 'retry' in el.dataset ? el : null
-    }
-    // Leaving on purpose — a click on nothing, another window — lets it
-    // go; being removed from the page does not. Which of the two it was
-    // is known once the removal, if that is what it was, is done.
-    const onFocusOut = (e: FocusEvent) => {
-      const el = e.target
-      if (e.relatedTarget !== null || el !== focusedRetry.current) return
-      queueMicrotask(() => {
-        if (focusedRetry.current === el && el instanceof Node && el.isConnected) {
-          focusedRetry.current = null
-        }
-      })
-    }
-    document.addEventListener('focusin', onFocusIn)
-    document.addEventListener('focusout', onFocusOut)
-    return () => {
-      document.removeEventListener('focusin', onFocusIn)
-      document.removeEventListener('focusout', onFocusOut)
-    }
-  }, [])
-  // Still in the slot but gone from the page: the focus went with it.
+  const focusedRetry = useHeldFocus(isRetryButton)
+  // Still held but gone from the page: the focus went with it.
   useEffect(() => {
     const el = focusedRetry.current
     if (el === null || el.isConnected) return
     focusedRetry.current = null
     land(packagesHeadingRef)
-  }, [packages, land])
+  }, [packages, land, focusedRetry])
 
   // Try again on a failed package, Regenerate on a done one: a fresh
   // package row, only ever on this click. The key names the click, so the
@@ -655,16 +645,71 @@ export default function Search({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobs, hideExceeds, easyOnly, sortBy])
 
-  // What is BOTH selected and currently on screen — the filtered list,
-  // not the full one. The list can be replaced under an existing
-  // selection, and a job id that is no longer rendered must never be
-  // submitted, whichever response won the race; a filter hides a row the
-  // same way, and a hidden row is not something the user can see they
-  // are about to generate for.
-  const selectedVisible = useMemo(
-    () => visibleJobs.filter((j) => selected.has(j.job_id)).map((j) => j.job_id),
-    [visibleJobs, selected],
+  // Each job's newest package: its row's badge, and which posting a
+  // role's row stands for.
+  const jobPackage = useMemo(() => newestByJob(packages), [packages])
+
+  // Filters judge postings; the list shows roles. Postings that repeat
+  // one role fold into one row, which stands for one of them.
+  const rows = useMemo(
+    () => roleRows(visibleJobs, (id) => jobPackage.has(id)),
+    [visibleJobs, jobPackage],
   )
+  const roleCount = useMemo(
+    () => new Set(jobs.map((j) => j.group?.id ?? `posting:${j.job_id}`)).size,
+    [jobs],
+  )
+
+  // What is BOTH selected and currently on screen — a row, or a listing
+  // a row shows — not the full list. The list can be replaced under an
+  // existing selection, and a job id that is no longer rendered must
+  // never be submitted, whichever response won the race; a filter hides
+  // a posting the same way, and a hidden posting is not something the
+  // user can see they are about to generate for.
+  const selectedVisible = useMemo(
+    () => selectableIds(rows).filter((id) => selected.has(id)),
+    [rows, selected],
+  )
+
+  // The job-list control that holds the focus, if one does. A row stands
+  // for one posting of its role, and which one can change under the
+  // focus — a refresh folds the posting into another row's listings, a
+  // listing gets a package and becomes the row — so the row is rebuilt,
+  // and the focus would fall to the top of the page. It follows the
+  // posting instead: to the same control wherever the posting is now,
+  // shown if it is folded away; else to the posting's checkbox or link;
+  // else, the posting gone from the list, to the Jobs heading. After
+  // every commit, since any update can take the control away.
+  const focusedJobControl = useHeldFocus(inJobRow)
+  useEffect(() => {
+    const el = focusedJobControl.current
+    if (el === null || el.isConnected) return
+    const posting = el.closest<HTMLElement>('[data-posting]')?.dataset.posting?.split(' ')[0]
+    const at = (control: string | undefined) => control && posting
+      ? jobListRef.current?.querySelector<HTMLElement>(
+        `[data-control="${control}"][data-posting~="${CSS.escape(posting)}"]`)
+      : null
+    const target = at(el.dataset.control) ?? at('select') ?? at('link')
+    if (!target) {
+      focusedJobControl.current = null
+      land(jobsHeadingRef)
+      return
+    }
+    // Shown, if folded away; a toggle is never folded away.
+    const fold = target.closest('details')
+    if (fold && !fold.open && !target.matches('summary')) fold.open = true
+    target.focus()
+  })
+  const showListings = (role: string[], open: boolean) =>
+    setOpenListings((prev) => {
+      if (role.every((id) => prev.has(id) === open)) return prev
+      const next = new Set(prev)
+      for (const id of role) {
+        if (open) next.add(id)
+        else next.delete(id)
+      }
+      return next
+    })
 
   const hasSelection = selectedVisible.length > 0
   useEffect(() => {
@@ -745,7 +790,6 @@ export default function Search({
   const shown = failedFirst(packages, newest)
   const recentPackages = shown.slice(0, RECENT_PACKAGES)
   const earlierPackages = shown.slice(RECENT_PACKAGES)
-  const jobPackage = newestByJob(packages)
   const counts = (
     [
       [packages.filter((p) => PACKAGE_ACTIVE.has(p.status)).length, 'in progress'],
@@ -1112,9 +1156,12 @@ export default function Search({
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <div className="flex flex-wrap items-center gap-3">
             <h2 ref={jobsHeadingRef} tabIndex={-1} className="text-lg font-semibold">
-              Jobs ({visibleJobs.length}
-              {visibleJobs.length !== jobs.length ? ` of ${jobs.length}` : ''})
+              Jobs ({rows.length}
+              {rows.length !== roleCount ? ` of ${roleCount}` : ''})
             </h2>
+            {roleCount !== jobs.length && (
+              <span className="text-sm text-ink-3">{jobs.length} listings</span>
+            )}
             {scoringPending > 0 && !scoringStall && (
               <span className={`rounded-full px-3 py-1 text-xs font-medium ${chip.info}`}>
                 Scoring… {jobs.length - scoringPending}/{jobs.length}
@@ -1190,18 +1237,30 @@ export default function Search({
         {jobs.length === 0 ? (
           <p className="text-sm text-ink-3">No jobs collected yet.</p>
         ) : (
-          <ul className="divide-y divide-line">
-            {visibleJobs.map((job) => {
+          <ul ref={jobListRef} className="divide-y divide-line">
+            {rows.map(({ job, listings }) => {
               const score = displayScore(job)
               const breakdown = job.score_breakdown
               const explanation = explanations[job.job_id]
               const meta = [job.company, job.location, job.posted_text]
                 .filter(Boolean)
                 .join(' · ')
-              const newestPackage = jobPackage.get(job.job_id)
+              // The role's newest package: this posting's own, or else
+              // another listing's — shown here, and named by its listing.
+              const ownPackage = jobPackage.get(job.job_id)
+              const listed = listings
+                .map((listing) => ({ listing, pkg: jobPackage.get(listing.member.job_id) }))
+                .filter((x): x is { listing: Listing; pkg: Package } => x.pkg !== undefined)
+                .sort((a, b) => b.pkg.id - a.pkg.id)[0]
+              const newestPackage = ownPackage ?? listed?.pkg
               const packageBadge = newestPackage
                 ? badgeFor(JOB_PACKAGE_STATES, newestPackage.status)
                 : null
+              const packageListing = ownPackage ? null : (listed?.listing.member ?? null)
+              const hiddenSelected = listings.filter(
+                (l) => l.job !== null && selected.has(l.member.job_id),
+              ).length
+              const role = [job.job_id, ...listings.map((l) => l.member.job_id)]
               return (
                 // Four columns from md: tick, score, title, actions — so
                 // the eye runs down aligned scores and titles. Below md
@@ -1217,6 +1276,8 @@ export default function Search({
                     disabled={listStale}
                     title={listStale ? 'New search results are loading…' : undefined}
                     aria-label={`Select ${job.title}`}
+                    data-posting={job.job_id}
+                    data-control="select"
                     onChange={() => toggleSelected(job.job_id)}
                   />
                   {score !== null ? (
@@ -1241,12 +1302,81 @@ export default function Search({
                       target="_blank"
                       rel="noreferrer"
                       className="font-medium leading-tight text-ink hover:underline"
+                      data-posting={job.job_id}
+                      data-control="link"
                     >
                       {job.title}
                     </a>
                     <p className="truncate text-sm text-ink-3" title={meta}>
                       {meta}
                     </p>
+                    {listings.length > 0 && (
+                      <details
+                        className="text-sm"
+                        open={role.some((id) => openListings.has(id))}
+                        onToggle={(e) => showListings(role, e.currentTarget.open)}
+                      >
+                        <summary
+                          className="cursor-pointer text-ink-3"
+                          data-posting={role.join(' ')}
+                          data-control="listings"
+                        >
+                          {listings.length === 1
+                            ? 'Also listed once more'
+                            : `Also listed ${listings.length} more times`}
+                          {hiddenSelected > 0 && (
+                            <span className="text-ink-2">
+                              {' '}
+                              · {hiddenSelected === 1 ? 'one' : hiddenSelected} of them selected
+                            </span>
+                          )}
+                        </summary>
+                        <ul className="mt-1 space-y-1">
+                          {listings.map(({ member, job: listedJob }) => {
+                            const memberPackage = jobPackage.get(member.job_id)
+                            const memberBadge = memberPackage
+                              ? badgeFor(JOB_PACKAGE_STATES, memberPackage.status)
+                              : null
+                            const seen = listedOn(member.first_seen_at)
+                            return (
+                              <li key={member.job_id} className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                                {listedJob && (
+                                  <input
+                                    type="checkbox"
+                                    checked={selected.has(member.job_id)}
+                                    disabled={listStale}
+                                    aria-label={`Select the listing first seen ${seen}`}
+                                    data-posting={member.job_id}
+                                    data-control="select"
+                                    onChange={() => toggleSelected(member.job_id)}
+                                  />
+                                )}
+                                <a
+                                  href={member.url}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="text-ink-2 underline hover:text-ink"
+                                  data-posting={member.job_id}
+                                  data-control="link"
+                                >
+                                  Listing first seen {seen}
+                                </a>
+                                <span className="text-ink-3">
+                                  {member.in_run ? 'in this search' : 'from an earlier search'}
+                                </span>
+                                {memberBadge && (
+                                  <span
+                                    className={`rounded-full px-2 py-0.5 text-xs font-medium ${chip[memberBadge.tone]}`}
+                                  >
+                                    {memberBadge.label}
+                                  </span>
+                                )}
+                              </li>
+                            )
+                          })}
+                        </ul>
+                      </details>
+                    )}
                   </div>
                   <div className="col-start-3 flex flex-wrap items-center gap-2 md:col-start-4 md:row-start-1">
                     {breakdown?.exceeds_experience && (
@@ -1269,10 +1399,17 @@ export default function Search({
                         {packageBadge.label}
                       </span>
                     )}
+                    {packageListing && (
+                      <span className="text-xs text-ink-3">
+                        for the listing first seen {listedOn(packageListing.first_seen_at)}
+                      </span>
+                    )}
                     <button
                       className={`${btnSecondary} rounded-md px-2 py-1 text-xs`}
                       disabled={busyDetail === job.job_id}
                       aria-expanded={expanded === job.job_id}
+                      data-posting={job.job_id}
+                      data-control="details"
                       onClick={() =>
                         job.description && expanded !== job.job_id
                           ? setExpanded(job.job_id)
@@ -1289,7 +1426,7 @@ export default function Search({
                     </button>
                   </div>
                   {expanded === job.job_id && (
-                    <div className="col-span-full mt-1 space-y-2">
+                    <div className="col-span-full mt-1 space-y-2" data-posting={job.job_id}>
                       {breakdown && (
                         <div className="rounded-lg bg-surface-2 p-3 text-sm text-ink-2">
                           <p className="text-xs uppercase tracking-wide text-ink-3">

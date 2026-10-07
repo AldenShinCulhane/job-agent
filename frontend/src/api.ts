@@ -164,6 +164,25 @@ export interface Job {
   /** What the posting asks for and whether the profile has it, by the
    * rules the score used. Null while the job has no current score. */
   requirements?: Requirement[] | null
+  /** The other postings of this role, when it has any: a repost, or the
+   * same posting found again under a new id. Null for a role of one. */
+  group?: JobGroup | null
+}
+
+/** Postings that repeat one role. `id` names the group for one response
+ * only — it can change as postings are described — so nothing keeps it. */
+export interface JobGroup {
+  id: string
+  /** Every posting of the role, oldest first, this one included. */
+  members: GroupMember[]
+}
+
+export interface GroupMember {
+  job_id: string
+  url: string
+  first_seen_at: string
+  /** In the search results this list was read for. */
+  in_run: boolean
 }
 
 export interface Requirement {

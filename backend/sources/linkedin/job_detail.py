@@ -162,7 +162,11 @@ async def fetch_detail(supervisor, job_id: str, force: bool = False) -> dict:
         # Hash moved -> normalized requirements/score/explanation are all
         # stale; drop them so the pipeline recomputes (PLAN.md §4.4).
         db.invalidate_derived(job_id)
-    superseded = db.save_job_detail(job_id, description, new_hash)
-    if superseded:
-        broker.publish("packages", {"event": "superseded", "ids": superseded})
+    saved = db.save_job_detail(job_id, description, new_hash)
+    if saved.superseded:
+        broker.publish("packages", {"event": "superseded", "ids": saved.superseded})
+    if saved.regrouped:
+        # The text decides which postings repeat a role: the job list's
+        # rows changed even where no score did.
+        broker.publish("jobs", {"event": "regrouped", "job_id": job_id})
     return {**db.get_job(job_id), "refetched": True, "changed": changed}
