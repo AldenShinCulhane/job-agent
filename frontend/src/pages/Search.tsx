@@ -1,15 +1,23 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { api, packageFileUrl, RetryUnconfirmed } from '../api'
-import type { Explanation, Job, LinkedInStatus, Package, Requirement, SearchRun } from '../api'
+import type {
+  Application, ApplicationStatus, Explanation, Job, LinkedInStatus, Package, Requirement,
+  SearchRun,
+} from '../api'
 import { paragraphs } from '../description'
 import { useEpochEffect } from '../useEventStream'
 import type { Epochs } from '../useEventStream'
 import { useLatestOnly } from '../useLatestOnly'
 import { badgeFor, btnPrimary, btnSecondary, chip, inputCls, labelCls } from '../styles'
-import { useFocusLanding, useHeldFocus } from '../focus'
+import { reveal, useFocusLanding, useHeldFocus } from '../focus'
 import { listedOn, roleRows, selectableIds } from '../jobGroups'
 import type { Listing } from '../jobGroups'
+import {
+  APPLICATION_STATES, APPLICATION_STATUSES, changes, dayLabel, formValues, roleApplication, today,
+  settled, unsaved,
+} from '../tracker'
+import type { TrackerDraft } from '../tracker'
 import {
   attemptLabel,
   failedFirst,
@@ -31,14 +39,15 @@ const LINKEDIN_STATES: Record<string, Badge> = {
   error: { label: 'Browser error', tone: 'danger' },
 }
 
-/** The four endpoints an event can invalidate on this page. */
-type Slice = 'linkedin' | 'run' | 'jobs' | 'packages' | 'profile'
+/** The endpoints an event can invalidate on this page. */
+type Slice = 'linkedin' | 'run' | 'jobs' | 'packages' | 'applications' | 'profile'
 
 const NOTHING_OWED: Record<Slice, boolean> = {
   linkedin: false,
   run: false,
   jobs: false,
   packages: false,
+  applications: false,
   profile: false,
 }
 
@@ -130,10 +139,12 @@ const acceptPlaceholderOnTab =
     }
   }
 
-// What the two focus slots below hold: a retry button, and a control in
-// a row of the job list, which says what posting it acts for.
+// What the focus slots below hold: a retry button; a control in a row
+// of the job list, which says what posting it acts for; and a package's
+// tracker control, which says what package it is on.
 const isRetryButton = (el: HTMLElement) => 'retry' in el.dataset
 const inJobRow = (el: HTMLElement) => el.closest('[data-posting]') !== null
+const isTrackerControl = (el: HTMLElement) => 'tracker' in el.dataset
 
 export default function Search({
   epochs,
@@ -169,9 +180,26 @@ export default function Search({
   // when it failed, by the package it was pressed on.
   const [retrying, setRetrying] = useState<Set<number>>(new Set())
   const [retryErrors, setRetryErrors] = useState<Record<number, string>>({})
+  // The application tracker: each tracked posting's status, by posting,
+  // or null until it is first read — an empty tracker and one not read
+  // yet are different things, and only the first can offer Mark applied.
+  // Then by package: the rows whose tracker click is out, or last failed,
+  // and what the user changed in each status form.
+  const [applications, setApplications] = useState<ReadonlyMap<string, Application> | null>(null)
+  const [tracking, setTracking] = useState<Set<number>>(new Set())
+  const [trackErrors, setTrackErrors] = useState<Record<number, string>>({})
+  const [drafts, setDrafts] = useState<Record<number, TrackerDraft>>({})
+  // How many times the user has edited each package's form, a change
+  // back included: a save answered after another edit is not the form's.
+  // And each posting with a save not yet settled, sent or answered and
+  // not read back since: how many are out, whether a read has followed
+  // the last answer, and which of its forms the user edited meanwhile.
+  const formEdits = useRef<Record<number, number>>({})
+  const unsettled = useRef(new Map<string, { out: number; read: boolean; edited: Set<number> }>())
   const [sortBy, setSortBy] = useState<'score' | 'date'>('score')
   const [hideExceeds, setHideExceeds] = useState(false)
   const [easyOnly, setEasyOnly] = useState(false)
+  const [hideApplied, setHideApplied] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [profileLocation, setProfileLocation] = useState<string | null>(null)
 
@@ -187,10 +215,12 @@ export default function Search({
   // so no response arriving later can fold an editor that is in use.
   // With no run there is nothing to summarise and the fields simply show.
   const [editing, setEditing] = useState(false)
-  // Typed search fields, or an answer of theirs still on its way.
+  // Typed search fields, a status form changed and not saved, or an
+  // answer still on its way.
+  const editingTracker = Object.values(drafts).some((draft) => !draft.saved)
   const held =
-    editing || busyGenerate || busyRerank || busyExplain !== null || busyDetail !== null ||
-    retrying.size > 0
+    editing || editingTracker || busyGenerate || busyRerank || busyExplain !== null ||
+    busyDetail !== null || retrying.size > 0 || tracking.size > 0
   useEffect(() => onHold(held), [held, onHold])
   useEffect(() => () => onHold(false), [onHold])
   // Bumped by every edit. Start captures it and folds the fields on
@@ -210,6 +240,7 @@ export default function Search({
   const jobsHeadingRef = useRef<HTMLHeadingElement | null>(null)
   const jobListRef = useRef<HTMLUListElement | null>(null)
   const packagesHeadingRef = useRef<HTMLHeadingElement | null>(null)
+  const packageListRef = useRef<HTMLDivElement | null>(null)
   const land = useFocusLanding()
   // Which run the rows ON SCREEN came from. Two copies on purpose: the
   // ref is read synchronously inside the response handler (a useCallback
@@ -229,6 +260,7 @@ export default function Search({
   const readRun = useLatestOnly()
   const readJobs = useLatestOnly()
   const readPackages = useLatestOnly()
+  const readApplications = useLatestOnly()
   const readProfile = useLatestOnly()
 
   // Which slices are known stale and have not been successfully re-read.
@@ -314,6 +346,26 @@ export default function Search({
     }
   }, [readPackages, settle])
 
+  const refreshApplications = useCallback(async (options?: ReadOptions) => {
+    try {
+      if (await readApplications(() => api.applications(), (list) => {
+        setApplications(new Map(list.applications.map((a) => [a.job_id, a])))
+        // A saved form has done its work once the tracker is read back:
+        // from here it shows the status the server has. A save answered
+        // before this read is settled by it.
+        for (const saving of unsettled.current.values()) {
+          if (saving.out === 0) saving.read = true
+        }
+        setDrafts(unsaved)
+      }, options)) {
+        settle('applications', true)
+      }
+    } catch (e) {
+      setError(String(e))
+      settle('applications', false)
+    }
+  }, [readApplications, settle])
+
   const loadProfileLocation = useCallback(async (options?: ReadOptions) => {
     try {
       const applied = await readProfile(
@@ -337,8 +389,9 @@ export default function Search({
         refreshRun(options),
         refreshJobs(options),
         refreshPackages(options),
+        refreshApplications(options),
       ]),
-    [refreshLinkedin, refreshRun, refreshJobs, refreshPackages],
+    [refreshLinkedin, refreshRun, refreshJobs, refreshPackages, refreshApplications],
   )
 
   useEffect(() => {
@@ -355,6 +408,7 @@ export default function Search({
   // A saved description can join or split postings that repeat a role.
   useEpochEffect(epochs.jobs, refreshJobs)
   useEpochEffect(epochs.packages, refreshPackages)
+  useEpochEffect(epochs.applications, refreshApplications)
   // A confirm or discard changes which scores /api/jobs can show — score
   // rows are keyed to a profile version — and the location suggestion
   // comes from the same profile.
@@ -417,7 +471,8 @@ export default function Search({
   // EVENT for the slice still supersedes, through `useEpochEffect` above:
   // that caller knows the pending answer is already behind.
   const owedAny =
-    owed.linkedin || owed.run || owed.jobs || owed.packages || owed.profile
+    owed.linkedin || owed.run || owed.jobs || owed.packages || owed.applications ||
+    owed.profile
   useEffect(() => {
     if (!owedAny) return
     const paced: ReadOptions = { ifIdle: true }
@@ -426,11 +481,12 @@ export default function Search({
       if (owed.run) void refreshRun(paced)
       if (owed.jobs) void refreshJobs(paced)
       if (owed.packages) void refreshPackages(paced)
+      if (owed.applications) void refreshApplications(paced)
       if (owed.profile) void loadProfileLocation(paced)
     }, OWED_RETRY_MS)
     return () => clearInterval(timer)
   }, [owedAny, owed, refreshLinkedin, refreshRun, refreshJobs, refreshPackages,
-      loadProfileLocation])
+      refreshApplications, loadProfileLocation])
 
   const connect = async () => {
     setError(null)
@@ -608,6 +664,124 @@ export default function Search({
     }
   }
 
+  // Mark applied, or a status saved from a package row's form — `sent`
+  // is the form's draft as it was saved. A failure is said beside the
+  // row, the draft stays the user's, and the tracker is read again: the
+  // event may have landed anyway. The ref, not the state, stops a second
+  // click while one is out.
+  const trackInFlight = useRef<Set<number>>(new Set())
+  const track = async (
+    pkg: Package,
+    status: ApplicationStatus | 'cleared',
+    day: string,
+    sent?: TrackerDraft,
+  ) => {
+    if (trackInFlight.current.has(pkg.id)) return
+    trackInFlight.current.add(pkg.id)
+    const saving = unsettled.current.get(pkg.job_id) ?? { out: 0, read: false, edited: new Set() }
+    saving.out += 1
+    saving.read = false
+    unsettled.current.set(pkg.job_id, saving)
+    const edits = formEdits.current[pkg.id] ?? 0
+    setTracking((prev) => new Set(prev).add(pkg.id))
+    setTrackErrors((prev) => {
+      const next = { ...prev }
+      delete next[pkg.id]
+      return next
+    })
+    try {
+      await api.recordApplication(pkg.job_id, status, day, pkg.id)
+      saving.out -= 1
+      // Saved, unless the user changed the form again while it was out:
+      // then the newer edit is theirs, and stays — even one back to what
+      // the form showed before the save.
+      if (sent && (formEdits.current[pkg.id] ?? 0) === edits) {
+        setDrafts((prev) => ({ ...prev, [pkg.id]: { ...sent, saved: true } }))
+      }
+      await refreshApplications()
+    } catch (e) {
+      saving.out -= 1
+      setTrackErrors((prev) => ({ ...prev, [pkg.id]: String(e) }))
+      void refreshApplications()
+    } finally {
+      trackInFlight.current.delete(pkg.id)
+      setTracking((prev) => {
+        const next = new Set(prev)
+        next.delete(pkg.id)
+        return next
+      })
+    }
+  }
+
+  const editDraft = (pkg: Package, change: TrackerDraft) => {
+    formEdits.current[pkg.id] = (formEdits.current[pkg.id] ?? 0) + 1
+    const saving = unsettled.current.get(pkg.job_id)
+    saving?.edited.add(pkg.id)
+    const current = applications?.get(pkg.job_id)
+    const todayIs = today()
+    setDrafts((prev) => {
+      const draft = { ...prev[pkg.id], ...change, saved: false }
+      // A save of the posting is unsettled: the status the form shows is
+      // about to change under it. The edit is kept, even back to that
+      // status, and remembers it: the fields the user left still follow
+      // what the form showed, not what the save brings.
+      if (saving) {
+        return { ...prev, [pkg.id]: { ...draft, basis: draft.basis !== undefined ? draft.basis : (current ?? null) } }
+      }
+      if (changes(draft, current, todayIs)) return { ...prev, [pkg.id]: draft }
+      const next = { ...prev }
+      delete next[pkg.id]
+      return next
+    })
+  }
+
+  // A save settles at the first read of the tracker after its answer,
+  // once that read is on screen. A form edited while it was out is then
+  // judged as any other. Not in the read itself: an edit made before the
+  // read is on screen is made against what the form still shows.
+  useEffect(() => {
+    if (applications === null) return
+    const forms: [number, string][] = []
+    for (const [job, saving] of unsettled.current) {
+      if (!saving.read) continue
+      unsettled.current.delete(job)
+      for (const id of saving.edited) forms.push([id, job])
+    }
+    if (forms.length > 0) {
+      const todayIs = today()
+      setDrafts((prev) => settled(prev, forms, applications, todayIs))
+    }
+  }, [applications])
+
+  // The tracker control that holds the focus, if one does. What a
+  // package's tracker offers follows what is read back — Mark applied
+  // becomes the status and its Update status, Clear status brings Mark
+  // applied back — whether the read answers this page's click or finds
+  // another tab's, or an event whose answer was lost; and a newer package
+  // can push the row into Earlier packages. Either way the control goes,
+  // and the focus would fall to the top of the page. It follows the
+  // package instead: to the same control, shown if folded away; else to
+  // what the tracker offers now; else to the Packages heading. Only while
+  // held, so focus the user moved elsewhere stays where they put it.
+  const focusedTracker = useHeldFocus(isTrackerControl)
+  useEffect(() => {
+    const el = focusedTracker.current
+    if (el === null || el.isConnected) return
+    const id = el.dataset.tracker ?? ''
+    const at = (control: string | undefined) => control
+      ? packageListRef.current?.querySelector<HTMLElement>(
+        `[data-tracker="${CSS.escape(id)}"][data-control="${control}"]`)
+      : null
+    const target = at(el.dataset.control) ?? at('update') ?? at('mark')
+    if (!target) {
+      focusedTracker.current = null
+      land(packagesHeadingRef)
+      return
+    }
+    reveal(target)
+    target.focus()
+  })
+
   const toggleSelected = (jobId: string) =>
     setSelected((prev) => {
       const next = new Set(prev)
@@ -651,10 +825,14 @@ export default function Search({
 
   // Filters judge postings; the list shows roles. Postings that repeat
   // one role fold into one row, which stands for one of them.
-  const rows = useMemo(
-    () => roleRows(visibleJobs, (id) => jobPackage.has(id)),
-    [visibleJobs, jobPackage],
-  )
+  // Hide applied judges roles: a role the user applied to through any
+  // of its listings goes whole. Every tracked status means they applied.
+  const rows = useMemo(() => {
+    const all = roleRows(visibleJobs, (id) => jobPackage.has(id))
+    return hideApplied && applications !== null
+      ? all.filter((row) => roleApplication(row, applications) === null)
+      : all
+  }, [visibleJobs, jobPackage, hideApplied, applications])
   const roleCount = useMemo(
     () => new Set(jobs.map((j) => j.group?.id ?? `posting:${j.job_id}`)).size,
     [jobs],
@@ -695,9 +873,7 @@ export default function Search({
       land(jobsHeadingRef)
       return
     }
-    // Shown, if folded away; a toggle is never folded away.
-    const fold = target.closest('details')
-    if (fold && !fold.open && !target.matches('summary')) fold.open = true
+    reveal(target)
     target.focus()
   })
   const showListings = (role: string[], open: boolean) =>
@@ -902,7 +1078,117 @@ export default function Search({
         {retryErrors[pkg.id] && (
           <p className="mt-1 text-xs text-danger-fg">{retryErrors[pkg.id]}</p>
         )}
+        {pkg.status === 'done' && trackerControls(pkg)}
+        {trackErrors[pkg.id] && (
+          <p className="mt-1 text-xs text-danger-fg">{trackErrors[pkg.id]}</p>
+        )}
       </li>
+    )
+  }
+
+  // The tracker on a finished package's row: its posting's own status —
+  // the package was made for that posting. Nothing until the tracker has
+  // been read: whether the posting is tracked is not known, and Mark
+  // applied could replace a status the page has not seen. aria-disabled,
+  // not disabled, while a click is out, so the focus stays on the control.
+  // Every control says which package it is on and which control it is,
+  // for the focus to follow when the tracker changes under it.
+  const trackerControls = (pkg: Package) => {
+    if (applications === null) return null
+    const current = applications.get(pkg.job_id)
+    const draft = drafts[pkg.id]
+    const busy = tracking.has(pkg.id)
+    const small = 'rounded-md border border-line-strong bg-surface px-1.5 py-0.5 text-xs text-ink'
+    // Untracked, Mark applied — unless the user is changing the status:
+    // cleared elsewhere meanwhile, their change is still theirs to save.
+    if (!current && !draft) {
+      return (
+        <div className="mt-1.5">
+          <button
+            className={`rounded-md px-2 py-0.5 text-xs ${btnSecondary} aria-disabled:opacity-40`}
+            aria-disabled={busy}
+            aria-label={`Mark applied for ${pkg.title}`}
+            data-tracker={pkg.id}
+            data-control="mark"
+            onClick={() => void track(pkg, 'applied', today())}
+          >
+            Mark applied
+          </button>
+        </div>
+      )
+    }
+    const badge = current ? APPLICATION_STATES[current.status] : null
+    const shown = formValues(draft, current, today())
+    return (
+      <div className="mt-1.5 flex flex-wrap items-start gap-x-3 gap-y-1 text-xs">
+        {current && badge && (
+          <span className={`rounded-full px-2 py-0.5 font-medium ${chip[badge.tone]}`}>
+            {badge.label} {dayLabel(current.occurred_on)}
+          </span>
+        )}
+        <details>
+          <summary
+            className="cursor-pointer text-ink-2"
+            aria-label={`Update status for ${pkg.title}`}
+            data-tracker={pkg.id}
+            data-control="update"
+          >
+            Update status
+          </summary>
+          <form
+            className="mt-1 flex flex-wrap items-end gap-2"
+            onSubmit={(e) => {
+              e.preventDefault()
+              void track(pkg, shown.status, shown.day, draft)
+            }}
+          >
+            <label className="flex flex-col gap-0.5 text-ink-3">
+              Status
+              <select
+                name="status"
+                className={small}
+                value={shown.status}
+                aria-label={`Status for ${pkg.title}`}
+                data-tracker={pkg.id}
+                data-control="status"
+                onChange={(e) =>
+                  editDraft(pkg, { status: e.target.value as ApplicationStatus | 'cleared' })}
+              >
+                {APPLICATION_STATUSES.map((s) => (
+                  <option key={s} value={s}>
+                    {APPLICATION_STATES[s].label}
+                  </option>
+                ))}
+                <option value="cleared">Clear status</option>
+              </select>
+            </label>
+            <label className="flex flex-col gap-0.5 text-ink-3">
+              Date
+              <input
+                type="date"
+                name="occurred_on"
+                required
+                className={small}
+                value={shown.day}
+                aria-label={`Date for ${pkg.title}`}
+                data-tracker={pkg.id}
+                data-control="date"
+                onChange={(e) => editDraft(pkg, { day: e.target.value })}
+              />
+            </label>
+            <button
+              type="submit"
+              className={`rounded-md px-2 py-0.5 text-xs ${btnSecondary} aria-disabled:opacity-40`}
+              aria-disabled={busy}
+              aria-label={`Save status for ${pkg.title}`}
+              data-tracker={pkg.id}
+              data-control="save"
+            >
+              Save
+            </button>
+          </form>
+        </details>
+      </div>
     )
   }
 
@@ -1133,6 +1419,7 @@ export default function Search({
           // on its own; the tab stop is what makes that reachable without
           // a pointer.
           <div
+            ref={packageListRef}
             className="xl:max-h-[calc(100vh-7rem)] xl:overflow-y-auto"
             tabIndex={0}
             role="region"
@@ -1222,6 +1509,16 @@ export default function Search({
               />
               Easy Apply only
             </label>
+            <label className="flex items-center gap-1">
+              <input
+                type="checkbox"
+                checked={hideApplied}
+                // Nothing to judge by until the tracker has been read.
+                disabled={applications === null}
+                onChange={(e) => setHideApplied(e.target.checked)}
+              />
+              Hide applied
+            </label>
             {scoredCount >= 2 && scoringPending === 0 && (
               <button
                 className={`${btnSecondary} rounded-md px-2 py-1 text-xs`}
@@ -1238,7 +1535,8 @@ export default function Search({
           <p className="text-sm text-ink-3">No jobs collected yet.</p>
         ) : (
           <ul ref={jobListRef} className="divide-y divide-line">
-            {rows.map(({ job, listings }) => {
+            {rows.map((row) => {
+              const { job, listings } = row
               const score = displayScore(job)
               const breakdown = job.score_breakdown
               const explanation = explanations[job.job_id]
@@ -1261,6 +1559,10 @@ export default function Search({
                 (l) => l.job !== null && selected.has(l.member.job_id),
               ).length
               const role = [job.job_id, ...listings.map((l) => l.member.job_id)]
+              // The role's application: this posting's own, or another
+              // listing's, named by its listing like the package.
+              const applied = applications && roleApplication(row, applications)
+              const appliedBadge = applied ? APPLICATION_STATES[applied.application.status] : null
               return (
                 // Four columns from md: tick, score, title, actions — so
                 // the eye runs down aligned scores and titles. Below md
@@ -1402,6 +1704,18 @@ export default function Search({
                     {packageListing && (
                       <span className="text-xs text-ink-3">
                         for the listing first seen {listedOn(packageListing.first_seen_at)}
+                      </span>
+                    )}
+                    {applied && appliedBadge && (
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-xs font-medium ${chip[appliedBadge.tone]}`}
+                      >
+                        {appliedBadge.label} {dayLabel(applied.application.occurred_on)}
+                      </span>
+                    )}
+                    {applied?.listing && (
+                      <span className="text-xs text-ink-3">
+                        for the listing first seen {listedOn(applied.listing.first_seen_at)}
                       </span>
                     )}
                     <button

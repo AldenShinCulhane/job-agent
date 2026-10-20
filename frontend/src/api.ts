@@ -246,6 +246,20 @@ export interface UnsupportedClaim {
   reason: string
 }
 
+/** A status the user set on a posting (PLAN.md P8b). */
+export type ApplicationStatus = 'applied' | 'interviewing' | 'offer' | 'rejected' | 'withdrawn'
+
+/** A tracked posting: its latest event, which is never a clear. */
+export interface Application {
+  event_id: number
+  job_id: string
+  /** The package the event was recorded from, if one was. */
+  package_id: number | null
+  status: ApplicationStatus
+  /** The day the user gave, YYYY-MM-DD — reported, never the order. */
+  occurred_on: string
+}
+
 export interface SearchConfig {
   keywords: string
   location?: string | null
@@ -394,6 +408,25 @@ export const api = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ job_ids: jobIds, run_id: runId }),
     }).then(toJson<{ package_ids: number[]; created: number }>),
+  /** Every tracked posting. A posting with no status, or one cleared,
+   * is not listed. */
+  applications: () =>
+    fetch('/api/applications').then(toJson<{ applications: Application[] }>),
+  /** One status on a posting, or 'cleared' to untrack it. The posting's
+   * current status, day and package again appends nothing. */
+  recordApplication: (
+    jobId: string,
+    status: ApplicationStatus | 'cleared',
+    occurredOn: string,
+    packageId: number | null,
+  ) =>
+    fetch('/api/applications', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        job_id: jobId, status, occurred_on: occurredOn, package_id: packageId,
+      }),
+    }).then(toJson<{ created: boolean; application: Application | null }>),
   /** Try again (failed) or Regenerate (done). `requestKey` is one per
    * click: sending it again returns the package that click already got.
    * Rejects with `RetryUnconfirmed` when no answer says what happened. */

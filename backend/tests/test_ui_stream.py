@@ -27,6 +27,7 @@ FANOUT_SEARCH = {
     "packages": ["/api/packages"],
     "profile": ["/api/jobs", "/api/profile"],
     "jobs": ["/api/jobs"],
+    "applications": ["/api/applications"],
 }
 FANOUT_PROFILE = {
     "engine": ["/api/engines"],
@@ -36,6 +37,7 @@ FANOUT_PROFILE = {
     "packages": [],
     "profile": ["/api/profile"],
     "jobs": [],
+    "applications": [],
 }
 
 # Nothing to poll for while the stream is up: session ready, run done,
@@ -209,8 +211,9 @@ def test_disconnected_polling_reconciles_on_its_own_intervals(live, events):
     assert p.paths() == ["/api/engines", "/api/linkedin/status"]
     p.page.clock.run_for(10_000)  # 31 s: Search's own reconciliation
     p.drain()
-    assert p.paths() == ["/api/engines", "/api/jobs", "/api/linkedin/status",
-                         "/api/linkedin/status", "/api/packages", "/api/search/latest"]
+    assert p.paths() == ["/api/applications", "/api/engines", "/api/jobs",
+                         "/api/linkedin/status", "/api/linkedin/status", "/api/packages",
+                         "/api/search/latest"]
 
 
 def test_the_usage_countdown_polls_even_while_connected(live, events):
@@ -240,6 +243,22 @@ def test_a_failed_event_read_retries_without_another_event(live, events):
     assert p.paths() == ["/api/packages"]
     p.page.get_by_role("listitem").filter(has_text="Role 2").get_by_text("Ready").wait_for()
 
+
+
+def test_a_tracker_never_read_offers_nothing_until_a_retry_reads_it(live, events):
+    """The tracker's reads fail from the start, and no event is coming:
+    a finished package offers nothing, not even Mark applied, until the
+    owed retry has read the tracker."""
+    failing = {**IDLE, "/api/applications": Response(503, {"detail": "db locked"})}
+    p = live(tab="Search", fixtures=failing, ready=SEARCH_READY)
+    packages = p.page.get_by_role("region", name="Package list")
+    assert packages.get_by_role("button", name="Mark applied for Role 1").count() == 0
+    p.table["/api/applications"] = {"applications": []}
+    p.reset()
+    p.page.clock.run_for(5_100)  # the owed-retry interval, no event
+    p.drain()
+    assert p.paths() == ["/api/applications"]
+    packages.get_by_role("button", name="Mark applied for Role 1").wait_for()
 
 def _hold(page, path):
     held = []

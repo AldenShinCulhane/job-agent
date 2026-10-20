@@ -7,6 +7,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from datetime import date
 from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, UploadFile
@@ -1371,6 +1372,64 @@ def _retry_answer(source_id: int, package_id: int, *, created: bool) -> dict:
     return {"package_id": package_id, "created": created,
             "attempt": package["attempt"],
             "new_inputs": any(package[c] != source[c] for c in db.PACKAGE_IDENTITY)}
+
+
+# The user's application tracker (PLAN.md P8b): their own record, never
+# a gate — nothing waits on it.
+
+_DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _is_day(value) -> bool:
+    if not isinstance(value, str) or not _DAY.fullmatch(value):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
+
+
+@router.get("/applications")
+async def applications_list():
+    """Every posting the user has a status on, by its latest event."""
+    return {"applications": db.current_applications()}
+
+
+@router.post("/applications")
+async def applications_record(body: dict):
+    """One status the user set on a posting: applied, interviewing,
+    offer, rejected or withdrawn, or "cleared" — Clear status, which
+    returns the posting to untracked and is not an undo. The latest
+    event decides; `occurred_on` is the day to report, today when left
+    out, and never the order."""
+    job_id = body.get("job_id")
+    if not isinstance(job_id, str) or not job_id:
+        raise HTTPException(status_code=422, detail="job_id must be a posting id.")
+    status = body.get("status")
+    if status not in (*db.APPLICATION_STATUSES, db.CLEARED):
+        raise HTTPException(
+            status_code=422,
+            detail="status must be applied, interviewing, offer, rejected, "
+                   "withdrawn or cleared.")
+    occurred_on = body.get("occurred_on")
+    if occurred_on is None:
+        occurred_on = date.today().isoformat()
+    elif not _is_day(occurred_on):
+        raise HTTPException(status_code=422, detail="occurred_on must be a date, YYYY-MM-DD.")
+    package_id = body.get("package_id")
+    if package_id is not None and (not isinstance(package_id, int)
+                                   or isinstance(package_id, bool)):
+        raise HTTPException(status_code=422, detail="package_id must be an integer.")
+    try:
+        created = db.record_application(job_id, status, occurred_on, package_id)
+    except db.ApplicationRefused as exc:
+        raise HTTPException(status_code=404 if exc.reason == "unknown_job" else 422,
+                            detail=str(exc)) from exc
+    if created:
+        broker.publish("applications", {"event": "recorded", "job_id": job_id})
+    current = next((a for a in db.current_applications() if a["job_id"] == job_id), None)
+    return {"created": created, "application": current}
 
 
 @router.get("/packages")

@@ -133,6 +133,22 @@ CREATE TABLE IF NOT EXISTS package_requests (
     package_id  INTEGER NOT NULL,
     created_at  TEXT NOT NULL
 );
+-- The user's application record (PLAN.md P8b): append-only, one row per
+-- status the user set on a posting, never edited or deleted. A posting's
+-- state is its event with the highest id; occurred_on is the day the
+-- user gives, reported but never the order. Keyed by the posting itself,
+-- so a change of groups around it loses nothing.
+CREATE TABLE IF NOT EXISTS application_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id      TEXT NOT NULL,
+    package_id  INTEGER,
+    status      TEXT NOT NULL CHECK (status IN ('applied', 'interviewing',
+                    'offer', 'rejected', 'withdrawn', 'cleared')),
+    occurred_on TEXT NOT NULL,
+    recorded_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS application_events_by_job
+    ON application_events (job_id, id);
 """ + _PACKAGES_TABLE
 
 # One-shot schema fixes for databases created by earlier revisions of
@@ -1448,3 +1464,84 @@ def packages_to_resume() -> list[dict]:
             "WHERE status NOT IN ('done', 'failed') ORDER BY id"
         ).fetchall()
     return [_package_row_to_dict(row) for row in rows]
+
+
+# --- Application tracker (PLAN.md P8b) ---------------------------------------
+# The user's own record of what they did with a posting. Never a gate:
+# nothing waits on it, and nothing in the pipeline reads it.
+
+APPLICATION_STATUSES = ("applied", "interviewing", "offer", "rejected", "withdrawn")
+# Appended by "Clear status": the posting is untracked again from this
+# event on. Not an undo — what came before stays in the history.
+CLEARED = "cleared"
+
+
+class ApplicationRefused(Exception):
+    """An event the posting can't take. `reason` is unknown_job or
+    foreign_package."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
+
+
+def record_application(job_id: str, status: str, occurred_on: str,
+                       package_id: int | None = None) -> bool:
+    """Append one status the user set on a posting; True when appended.
+
+    A package, when given, must be one of the posting's own. An event
+    that would change nothing is not appended — the posting's current
+    status, day and package again, or a clear of a posting that isn't
+    tracked — so a click sent twice is one event. Check and append are
+    one BEGIN IMMEDIATE transaction.
+    """
+    now = datetime.now(timezone.utc).isoformat()
+    conn = _connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM jobs WHERE job_id = ?", (job_id,)).fetchone() is None:
+            raise ApplicationRefused("unknown_job", f"Unknown job {job_id}")
+        if package_id is not None:
+            owner = conn.execute("SELECT job_id FROM packages WHERE id = ?",
+                                 (package_id,)).fetchone()
+            if owner is None or owner[0] != job_id:
+                raise ApplicationRefused(
+                    "foreign_package", f"Package {package_id} is not one of this posting's.")
+        current = conn.execute(
+            "SELECT status, occurred_on, package_id FROM application_events "
+            "WHERE job_id = ? ORDER BY id DESC LIMIT 1", (job_id,),
+        ).fetchone()
+        if status == CLEARED:
+            unchanged = current is None or current[0] == CLEARED
+        else:
+            unchanged = current == (status, occurred_on, package_id)
+        if unchanged:
+            conn.rollback()
+            return False
+        conn.execute(
+            "INSERT INTO application_events (job_id, package_id, status, "
+            "occurred_on, recorded_at) VALUES (?, ?, ?, ?, ?)",
+            (job_id, package_id, status, occurred_on, now),
+        )
+        conn.commit()
+        return True
+    except BaseException:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+_APPLICATION_COLUMNS = ("event_id", "job_id", "package_id", "status", "occurred_on")
+
+
+def current_applications() -> list[dict]:
+    """Every tracked posting, by its event with the highest id. A posting
+    with no events, or whose latest is a clear, is untracked and absent."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, job_id, package_id, status, occurred_on FROM application_events "
+            "WHERE id IN (SELECT max(id) FROM application_events GROUP BY job_id) "
+            "AND status != 'cleared' ORDER BY id"
+        ).fetchall()
+    return [dict(zip(_APPLICATION_COLUMNS, row)) for row in rows]

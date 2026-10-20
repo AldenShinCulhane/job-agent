@@ -33,7 +33,14 @@ with strict page-limit enforcement and no fabricated claims.
    extracted from *your* resume, enforces your page limit (default 1 page —
    never one line over), and drops finished PDFs in `output/`.
 
-The app stops at PDFs. You click Apply yourself.
+The app stops at PDFs. You click Apply yourself. Afterwards, **Mark
+applied** on a finished package records it, and the package's row can
+then say how it went: interviewing, offer, rejected or withdrawn, each on
+a day you pick (today unless you change it). Clear status stops tracking
+the posting; every status you set is kept, never edited. The job list
+shows each role's latest status, and **Hide applied** hides the roles
+you have a status on through any of their listings. The tracker is your
+own record: nothing in the app waits on it.
 
 ## Screenshots
 

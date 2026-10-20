@@ -176,6 +176,28 @@ GROUPS = {
 }
 
 
+# The application tracker over the roles above: the repeated role applied
+# to through its earlier listing, A interviewing through its own package,
+# and D's package not tracked yet.
+TRACKER = {
+    "/api/jobs": GROUPS["/api/jobs"],
+    "/api/packages": {"page_limit": 1, "packages": [
+        _package(9, "done", job="d", title="Backend Engineer d"),
+        _package(8, "done", job="a", title="Backend Engineer a"),
+        _package(5, "done", job="old", title="Platform Engineer")]},
+    "/api/applications": {"applications": [
+        {"event_id": 1, "job_id": "old", "package_id": 5, "status": "applied",
+         "occurred_on": "2026-09-20"},
+        {"event_id": 2, "job_id": "a", "package_id": 8, "status": "interviewing",
+         "occurred_on": "2026-10-02"}]},
+}
+
+
+def _tracker_open(page):
+    page.locator("summary[aria-label='Update status for Backend Engineer a']").click()
+    page.get_by_role("button", name="Save status for Backend Engineer a").wait_for()
+
+
 def _listings_open(page):
     page.get_by_text("Also listed 2 more times").click()
     page.wait_for_selector("text=from an earlier search")
@@ -244,6 +266,8 @@ STATES: list[State] = [
           ready=("text=Backend Engineer a", "text=Package ready"), setup=_details_open),
     State("search-job-groups", tab="Search", fixtures=GROUPS,
           ready=("text=Platform Engineer",), setup=_listings_open),
+    State("packages-tracker", tab="Search", fixtures=TRACKER,
+          ready=("text=Update status",), setup=_tracker_open),
     State("packages-truth-check", tab="Search", fixtures=DETAILS,
           ready=("text=Stopped at the truth check",)),
     State("packages-truth-check-why", tab="Search", fixtures=DETAILS,

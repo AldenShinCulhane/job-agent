@@ -29,6 +29,14 @@ export function useFocusLanding(): (ref: RefObject<HTMLElement | null>) => void 
   }, [])
 }
 
+/** Opens each fold that hides `el`, so it can take the focus. A fold's
+ * own summary shows while the fold is closed, and leaves it closed. */
+export function reveal(el: HTMLElement) {
+  for (let fold = el.closest('details'); fold; fold = fold.parentElement?.closest('details') ?? null) {
+    if (!fold.open && !(el.matches('summary') && el.parentElement === fold)) fold.open = true
+  }
+}
+
 /** The element holding the focus while `holds` claims it, for a caller
  * that puts the focus back when the page takes that element away. Only
  * the user lets it go: by focusing any other element, or by pressing the

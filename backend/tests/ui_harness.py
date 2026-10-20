@@ -202,6 +202,7 @@ API_FIXTURES: dict[str, dict] = {
         # neutral tone, under its raw name.
         _package(6, "archived"),
     ]},
+    "/api/applications": {"applications": []},
     "/api/profile": profile_payload(),
     "/api/settings": {"resume_page_limit": 1, "engine": ENGINE,
                       "latex_engines": []},
@@ -222,6 +223,7 @@ API_POSTS: dict[tuple[str, str], dict] = {
     ("POST", "/api/search/rerank"): {"reranked": 2},
     ("POST", "/api/search/retry-scoring"): {"resumed": True},
     ("POST", "/api/packages/generate"): {"package_ids": [9], "created": 1},
+    ("POST", "/api/applications"): {"created": False, "application": None},
     ("POST", "/api/engine/reprobe"): {"ok": False, "verified": True,
                                       "error": "auth_required",
                                       "detail": "not logged in"},
