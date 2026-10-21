@@ -31,7 +31,12 @@ with strict page-limit enforcement and no fabricated claims.
 4. **Select the jobs you want.** For each one, the app autonomously writes a
    tailored resume and cover letter, validates every claim against facts
    extracted from *your* resume, enforces your page limit (default 1 page —
-   never one line over), and drops finished PDFs in `output/`.
+   never one line over), and drops finished PDFs in `output/`. Each finished
+   package says which of the posting's skills its documents mention, and
+   where: the skills section and project technologies, the resume's
+   headline and bullets, or the cover letter. A mention is the posting's
+   word in your documents, not proof of experience, and a short name like
+   Go, C or R is only looked for in the skills.
 
 The app stops at PDFs. You click Apply yourself. Afterwards, **Mark
 applied** on a finished package records it, and the package's row can

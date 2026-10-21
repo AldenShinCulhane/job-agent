@@ -77,7 +77,8 @@ def _member(job_id: str, first_seen_at: str, in_run: bool) -> dict:
 def _package(pid: int, status: str, error: str | None = None, *,
              job: str | None = None, attempt: int = 1, retry_of: int | None = None,
              inputs_changed: tuple[str, ...] = (), title: str | None = None,
-             unsupported: list[dict] | None = None) -> dict:
+             unsupported: list[dict] | None = None,
+             coverage: list[dict] | None = None) -> dict:
     return {
         "id": pid, "job_id": job or f"j{pid}", "profile_version": 4, "jd_hash": "h",
         "page_limit": 1, "attempt": attempt, "retry_of": retry_of,
@@ -88,6 +89,7 @@ def _package(pid: int, status: str, error: str | None = None, *,
         "title": title or f"Role {pid}", "company": "Example Co",
         "url": f"https://example.invalid/jobs/{job or f'j{pid}'}", "provenance": {},
         "unsupported": unsupported or [],
+        "coverage": coverage,
     }
 
 

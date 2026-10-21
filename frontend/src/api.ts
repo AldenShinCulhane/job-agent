@@ -233,6 +233,23 @@ export interface Package {
   /** What stopped a package at the truth check, one entry per claim;
    * empty for anything else. */
   unsupported?: UnsupportedClaim[]
+  /** Where a finished package's documents mention each skill the posting
+   * states (PLAN.md P8c); null when the package isn't finished or its
+   * inputs are gone. */
+  coverage?: SkillMention[] | null
+}
+
+/** One skill the posting states, in its words, and where the package's
+ * documents mention it: `listed` in the resume's skill groups or project
+ * technologies, `resume` in its headline or a bullet, `letter` in the
+ * cover letter. The last two are null for a skill looked for in the lists
+ * only: a short name like Go reads as another word in prose. */
+export interface SkillMention {
+  kind: 'required' | 'preferred'
+  label: string
+  listed: boolean
+  resume: boolean | null
+  letter: boolean | null
 }
 
 export interface UnsupportedClaim {

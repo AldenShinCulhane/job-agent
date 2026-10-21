@@ -18,6 +18,7 @@ import {
   settled, unsaved,
 } from '../tracker'
 import type { TrackerDraft } from '../tracker'
+import { coverageSummary, isMentioned, mentionPlaces } from '../coverage'
 import {
   attemptLabel,
   failedFirst,
@@ -140,11 +141,13 @@ const acceptPlaceholderOnTab =
   }
 
 // What the focus slots below hold: a retry button; a control in a row
-// of the job list, which says what posting it acts for; and a package's
-// tracker control, which says what package it is on.
+// of the job list, which says what posting it acts for; a package's
+// tracker control, which says what package it is on; and a package's
+// keyword summary, which says the same.
 const isRetryButton = (el: HTMLElement) => 'retry' in el.dataset
 const inJobRow = (el: HTMLElement) => el.closest('[data-posting]') !== null
 const isTrackerControl = (el: HTMLElement) => 'tracker' in el.dataset
+const isMentionsSummary = (el: HTMLElement) => 'mentions' in el.dataset
 
 export default function Search({
   epochs,
@@ -180,6 +183,10 @@ export default function Search({
   // when it failed, by the package it was pressed on.
   const [retrying, setRetrying] = useState<Set<number>>(new Set())
   const [retryErrors, setRetryErrors] = useState<Record<number, string>>({})
+  // Packages whose keyword list is open, by package: a newer package can
+  // push the row into Earlier packages, or take it back out, and the row
+  // is built again there. What was open stays open.
+  const [openMentions, setOpenMentions] = useState<Set<number>>(new Set())
   // The application tracker: each tracked posting's status, by posting,
   // or null until it is first read — an empty tracker and one not read
   // yet are different things, and only the first can offer Mark applied.
@@ -782,6 +789,35 @@ export default function Search({
     target.focus()
   })
 
+  // The keyword summary that holds the focus, if one does. Its row is
+  // built again when a newer package pushes it into Earlier packages, or
+  // takes it back out, and the focus would fall to the top of the page.
+  // It follows the package instead: to its summary, the fold it moved
+  // into opened; else to the Packages heading. Only while held, so focus
+  // the user moved elsewhere stays where they put it.
+  const focusedMentions = useHeldFocus(isMentionsSummary)
+  useEffect(() => {
+    const el = focusedMentions.current
+    if (el === null || el.isConnected) return
+    const target = packageListRef.current?.querySelector<HTMLElement>(
+      `[data-mentions="${CSS.escape(el.dataset.mentions ?? '')}"]`)
+    if (!target) {
+      focusedMentions.current = null
+      land(packagesHeadingRef)
+      return
+    }
+    reveal(target)
+    target.focus()
+  })
+  const showMentions = (id: number, open: boolean) =>
+    setOpenMentions((prev) => {
+      if (prev.has(id) === open) return prev
+      const next = new Set(prev)
+      if (open) next.add(id)
+      else next.delete(id)
+      return next
+    })
+
   const toggleSelected = (jobId: string) =>
     setSelected((prev) => {
       const next = new Set(prev)
@@ -1077,6 +1113,13 @@ export default function Search({
         </div>
         {retryErrors[pkg.id] && (
           <p className="mt-1 text-xs text-danger-fg">{retryErrors[pkg.id]}</p>
+        )}
+        {pkg.status === 'done' && (
+          <KeywordMentions
+            pkg={pkg}
+            open={openMentions.has(pkg.id)}
+            onToggle={(open) => showMentions(pkg.id, open)}
+          />
         )}
         {pkg.status === 'done' && trackerControls(pkg)}
         {trackErrors[pkg.id] && (
@@ -1852,6 +1895,81 @@ export default function Search({
         )}
       </section>
     </div>
+  )
+}
+
+/** Which of the posting's skills a finished package's documents
+ * mention, and where. A mention is a keyword, not proof of experience,
+ * and a package with no coverage says so rather than showing none.
+ * Whether the list is open is the page's, by package, so it survives the
+ * row being built again elsewhere. */
+function KeywordMentions({
+  pkg,
+  open,
+  onToggle,
+}: {
+  pkg: Package
+  open: boolean
+  onToggle: (open: boolean) => void
+}) {
+  const summary = coverageSummary(pkg.coverage)
+  const coverage = pkg.coverage
+  if (!coverage || coverage.length === 0) {
+    return <p className="mt-1 text-xs text-ink-3">{summary}</p>
+  }
+  return (
+    <details className="mt-1 text-xs" open={open} onToggle={(e) => onToggle(e.currentTarget.open)}>
+      <summary
+        className="cursor-pointer text-ink-2"
+        aria-label={`${summary} for ${pkg.title}`}
+        data-mentions={pkg.id}
+      >
+        {summary}
+      </summary>
+      <div className="mt-1 space-y-1.5 rounded-lg bg-surface-2 p-2">
+        <p className="text-ink-3">
+          A mention is the posting's word in your documents, not proof of experience.
+          Skills are the resume's skills section and project technologies; resume text is
+          its headline and bullets.
+        </p>
+        {(['required', 'preferred'] as const).map((kind) => {
+          const group = coverage.filter((skill) => skill.kind === kind)
+          if (group.length === 0) return null
+          return (
+            <div key={kind}>
+              <p className="font-medium text-ink-2">
+                {kind === 'required' ? 'Required' : 'Nice to have'}
+              </p>
+              <ul className="mt-0.5 space-y-0.5">
+                {group.map((skill) => {
+                  const found = isMentioned(skill)
+                  const unsearched = skill.resume === null
+                  return (
+                    <li
+                      key={skill.label}
+                      className={
+                        found
+                          ? 'text-ok-fg'
+                          : !unsearched && kind === 'required'
+                            ? 'text-warn-fg'
+                            : 'text-ink-2'
+                      }
+                    >
+                      <span aria-hidden="true">{found ? '✓' : unsearched ? '?' : '✗'}</span>{' '}
+                      <span className="sr-only">
+                        {found ? 'Mentioned:' : unsearched ? 'Unknown:' : 'Not mentioned:'}
+                      </span>{' '}
+                      {skill.label}{' '}
+                      <span className="text-ink-3">({mentionPlaces(skill)})</span>
+                    </li>
+                  )
+                })}
+              </ul>
+            </div>
+          )
+        })}
+      </div>
+    </details>
   )
 }
 

@@ -23,6 +23,7 @@ from backend.resume.schema import PROFILE_SCHEMA
 from backend.scoring import llm_layer, score
 from backend.scoring import pipeline as scoring_pipeline
 from backend.tailor import compile as latex
+from backend.tailor import coverage
 from backend.tailor import pipeline as tailor_pipeline
 
 log = logging.getLogger(__name__)
@@ -1435,8 +1436,15 @@ async def applications_record(body: dict):
 @router.get("/packages")
 async def packages_list():
     packages = db.list_packages()
+    # Coverage reads each finished package's pinned profile version; a
+    # list of attempts mostly shares a few.
+    profiles: dict[int, dict | None] = {}
     for package in packages:
         package["unsupported"] = tailor_pipeline.unsupported_claims(package)
+        version = package["profile_version"]
+        if package["status"] == "done" and version not in profiles:
+            profiles[version] = db.get_profile(version)
+        package["coverage"] = coverage.package_coverage(package, profiles.get(version))
     return {"packages": packages,
             "page_limit": tailor_pipeline.resume_page_limit()}
 

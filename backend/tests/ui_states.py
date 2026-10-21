@@ -193,6 +193,35 @@ TRACKER = {
 }
 
 
+# Where a finished package's documents mention the posting's skills: in
+# each place, nowhere, and a short name the text isn't searched for.
+MENTIONS = [
+    {"kind": "required", "label": "Python", "listed": True, "resume": True, "letter": True},
+    {"kind": "required", "label": "Kafka", "listed": False, "resume": True, "letter": False},
+    {"kind": "required", "label": "Go", "listed": True, "resume": None, "letter": None},
+    {"kind": "required", "label": "Terraform", "listed": False, "resume": False,
+     "letter": False},
+    {"kind": "preferred", "label": "Docker", "listed": False, "resume": False,
+     "letter": True},
+    {"kind": "preferred", "label": "R", "listed": False, "resume": None, "letter": None},
+    {"kind": "preferred", "label": "Rust", "listed": False, "resume": False, "letter": False},
+]
+MENTIONS_SUMMARY = "Mentions 3 of 4 required and 1 of 3 preferred skills"
+
+COVERAGE = {
+    "/api/packages": {"page_limit": 1, "packages": [
+        _package(9, "done", job="a", title="Backend Engineer a", coverage=MENTIONS),
+        _package(8, "done", job="b", title="Backend Engineer b", coverage=[]),
+        _package(7, "done", job="c", title="Backend Engineer c"),
+        _package(6, "failed", "compile failed", job="d", title="Backend Engineer d")]},
+}
+
+
+def _mentions_open(page):
+    page.get_by_text(MENTIONS_SUMMARY).click()
+    page.wait_for_selector("text=not proof of experience")
+
+
 def _tracker_open(page):
     page.locator("summary[aria-label='Update status for Backend Engineer a']").click()
     page.get_by_role("button", name="Save status for Backend Engineer a").wait_for()
@@ -268,6 +297,8 @@ STATES: list[State] = [
           ready=("text=Platform Engineer",), setup=_listings_open),
     State("packages-tracker", tab="Search", fixtures=TRACKER,
           ready=("text=Update status",), setup=_tracker_open),
+    State("packages-coverage", tab="Search", fixtures=COVERAGE,
+          ready=(f"text={MENTIONS_SUMMARY}",), setup=_mentions_open),
     State("packages-truth-check", tab="Search", fixtures=DETAILS,
           ready=("text=Stopped at the truth check",)),
     State("packages-truth-check-why", tab="Search", fixtures=DETAILS,

@@ -75,7 +75,7 @@ def canonical_skill(skill: str) -> str:
     return SKILL_ALIASES.get(s, s)
 
 
-def _skill_matches(required: str, user_skills: set[str]) -> bool:
+def skill_matches(required: str, user_skills: set[str]) -> bool:
     """Alias-aware exact match with a tight fuzzy fallback for typos and
     plural drift. Deliberately no substring rule (Java != JavaScript)."""
     req = canonical_skill(required)
@@ -173,14 +173,14 @@ def skill_score(requirements: dict, user_skills: set[str]) -> tuple[float, list,
     total = earned = 0
     for skill in required:
         total += 2
-        if _skill_matches(skill, user_skills):
+        if skill_matches(skill, user_skills):
             earned += 2
             matched.append(skill)
         else:
             missing.append(skill)
     for skill in preferred:
         total += 1
-        if _skill_matches(skill, user_skills):
+        if skill_matches(skill, user_skills):
             earned += 1
             matched.append(skill)
     return (earned / total) * 100, matched, missing
@@ -283,6 +283,23 @@ _DEGREE_NAMES = {1: "Associate degree", 2: "Bachelor's degree",
                  3: "Master's degree", 4: "Doctorate"}
 
 
+def stated_skills(requirements: dict) -> list[tuple[str, str, str]]:
+    """The skills a posting states, as (kind, label, canonical name):
+    required, then preferred, each in the posting's own words. A skill
+    stated twice under one kind is listed once."""
+    stated: list[tuple[str, str, str]] = []
+    for kind, key in (("required", "required_skills"),
+                      ("preferred", "preferred_skills")):
+        seen: set[str] = set()
+        for skill in requirements.get(key) or []:
+            canonical = canonical_skill(skill)
+            if not canonical or canonical in seen:
+                continue
+            seen.add(canonical)
+            stated.append((kind, skill.strip(), canonical))
+    return stated
+
+
 def requirement_checklist(requirements: dict, profile: dict,
                           user_years: float | None) -> list[dict]:
     """Each requirement the posting states, in the posting's own words,
@@ -295,17 +312,10 @@ def requirement_checklist(requirements: dict, profile: dict,
     computed with (its breakdown keeps them), not a fresh count.
     """
     user_skills = flatten_profile_skills(profile)
-    items: list[dict] = []
-    for kind, key in (("required", "required_skills"),
-                      ("preferred", "preferred_skills")):
-        seen: set[str] = set()
-        for skill in requirements.get(key, []):
-            canonical = canonical_skill(skill)
-            if not canonical or canonical in seen:
-                continue
-            seen.add(canonical)
-            items.append({"kind": kind, "label": skill.strip(),
-                          "met": _skill_matches(canonical, user_skills)})
+    items: list[dict] = [
+        {"kind": kind, "label": label, "met": skill_matches(canonical, user_skills)}
+        for kind, label, canonical in stated_skills(requirements)
+    ]
     years = requirements.get("min_years_experience")
     if years is not None:
         items.append({
