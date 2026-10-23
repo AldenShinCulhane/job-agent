@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import type { MouseEvent } from 'react'
 import { api } from './api'
-import type { EnginesView, LinkedInStatus } from './api'
+import type { EnginesView, LinkedInStatus, Package } from './api'
 import { engineBadge, modelLabel, selectedEngine } from './engineStatus'
 import { useFocusLanding } from './focus'
 import { episodeShown, markEpisodeShown } from './shownEpisodes'
@@ -9,8 +9,10 @@ import { chip, column } from './styles'
 import { TABS, tabFrom, tabHref } from './tabs'
 import type { TabId } from './tabs'
 import { usePreference } from './theme'
+import { baselineOf, finishedSince, titleFor } from './titleCount'
+import type { Baseline } from './titleCount'
 import { useEpochEffect, useEventStream } from './useEventStream'
-import { useLatestOnly } from './useLatestOnly'
+import { OWED_RETRY_MS, useLatestOnly } from './useLatestOnly'
 import type { ReadOptions } from './useLatestOnly'
 import RecoveryBanners from './RecoveryBanners'
 import Onboarding from './pages/Onboarding'
@@ -18,6 +20,19 @@ import Search from './pages/Search'
 import Settings from './pages/Settings'
 
 const STATUS_POLL_MS = 20_000
+
+const NO_PACKAGES: Package[] = []
+
+/** While the page is hidden: the packages it last showed, to count what
+ * finishes against. With nothing shown yet the baseline is null until
+ * the first read made while hidden stands in for it, and the count is
+ * then at least what it says. */
+interface HiddenSpell {
+  baseline: Baseline | null
+  atLeast: boolean
+}
+
+const isHidden = () => document.visibilityState === 'hidden'
 
 export default function App() {
   // All engine state — the selection, both engines, their model lists —
@@ -82,6 +97,104 @@ export default function App() {
   useEpochEffect(epochs.engine, loadEngine)
   useEpochEffect(epochs.linkedin, loadLinkedin)
 
+  // The package list. Search shows it, but it is App's: the tab title
+  // counts the packages that finish while the page is hidden, whatever
+  // page is open, and one list has one owner. Null until a read lands.
+  const [packages, setPackages] = useState<Package[] | null>(null)
+  // The list last applied: the baseline the moment the page hides, taken
+  // from what is held, with no read.
+  const heldPackages = useRef<Package[] | null>(null)
+  const readPackages = useLatestOnly()
+  // A read failed, or was dropped below, and none has landed since.
+  const [packagesOwed, setPackagesOwed] = useState(false)
+  const [hidden, setHidden] = useState<HiddenSpell | null>(
+    () => (isHidden() ? { baseline: null, atLeast: true } : null),
+  )
+  // How many times the page has shown again after being hidden. A read
+  // started before the latest of them is dropped when it lands: the count
+  // it was for has been cleared, and it must neither bring that back nor
+  // become the next one's baseline.
+  const shownAgain = useRef(0)
+
+  const loadPackages = useCallback(async (options?: ReadOptions) => {
+    const spell = shownAgain.current
+    let dropped = false
+    try {
+      const applied = await readPackages(() => api.packages(), (list) => {
+        if (spell !== shownAgain.current) {
+          dropped = true
+          return
+        }
+        heldPackages.current = list.packages
+        setPackages(list.packages)
+        setHidden((h) => (h !== null && h.baseline === null
+          ? { baseline: baselineOf(list.packages), atLeast: true }
+          : h))
+      }, options)
+      if (applied) setPackagesOwed(dropped)
+    } catch (e) {
+      setPackagesOwed(true)
+      throw e
+    }
+  }, [readPackages])
+
+  // Hiding takes the baseline; showing again clears the count. Only a
+  // change counts: "visible" while visible is not a return.
+  const wasHidden = useRef(isHidden())
+  useEffect(() => {
+    const follow = () => {
+      if (isHidden() === wasHidden.current) return
+      wasHidden.current = isHidden()
+      if (wasHidden.current) {
+        const held = heldPackages.current
+        setHidden({ baseline: held && baselineOf(held), atLeast: held === null })
+      } else {
+        shownAgain.current += 1
+        setHidden(null)
+      }
+    }
+    document.addEventListener('visibilitychange', follow)
+    return () => document.removeEventListener('visibilitychange', follow)
+  }, [])
+
+  // While hidden, a packages event reads the list again for the count.
+  // Search reads on that event itself while it is open, so App reads only
+  // when it is not. A reconnect and the stream's first open bump every
+  // topic, this one included. Failures are silent here: no page is open
+  // to say them, and Search says its own.
+  const appReads = hidden !== null && tab !== 'search'
+  useEpochEffect(epochs.packages, () => {
+    if (appReads) void loadPackages().catch(() => {})
+  })
+  // And when App becomes the reader, it reads the list at once, as Search
+  // does when it mounts. Shown on another page, nothing reads it: an
+  // event there was nobody's to read, or no list was ever read, and no
+  // further event need come. This read supersedes one still out, which
+  // may have gone out before that event. The baseline was taken from
+  // what is held before this read went out; its answer is the starting
+  // point only when nothing was held.
+  useEffect(() => {
+    if (!appReads) return
+    void loadPackages().catch(() => {})
+  }, [appReads, loadPackages])
+  // A read that failed is retried, paced, until one lands, while anything
+  // needs the list: Search, or the count.
+  const packagesNeeded = hidden !== null || tab === 'search'
+  useEffect(() => {
+    if (!packagesOwed || !packagesNeeded) return
+    const timer = setInterval(
+      () => void loadPackages({ ifIdle: true }).catch(() => {}),
+      OWED_RETRY_MS,
+    )
+    return () => clearInterval(timer)
+  }, [packagesOwed, packagesNeeded, loadPackages])
+
+  const finished = hidden?.baseline ? finishedSince(hidden.baseline, packages ?? NO_PACKAGES) : 0
+  const title = titleFor(finished, hidden?.atLeast ?? false)
+  useEffect(() => {
+    document.title = title
+  }, [title])
+
   // Reconciliation, not the primary path. Three things the stream cannot
   // cover: a disconnect (nothing is replayed on reconnect, and the gap is
   // invisible until then); the usage-limit countdown, which moves with the
@@ -93,14 +206,17 @@ export default function App() {
   // before it landed. Events and the mount fetch supersede as before.
   const counting = engine?.status === 'waiting_usage_exhausted'
   const unknown = engine === null || linkedin === null
+  // With the stream down no packages event is coming, so the hidden count
+  // reads the list on this tick. Search polls on its own while it is open.
   useEffect(() => {
     if (connected && !counting && !unknown) return
     const timer = setInterval(() => {
       void loadEngine({ ifIdle: true })
       void loadLinkedin({ ifIdle: true })
+      if (appReads && !connected) void loadPackages({ ifIdle: true }).catch(() => {})
     }, STATUS_POLL_MS)
     return () => clearInterval(timer)
-  }, [connected, counting, unknown, loadEngine, loadLinkedin])
+  }, [connected, counting, unknown, appReads, loadEngine, loadLinkedin, loadPackages])
 
   // A usage limit opens the engine picker, once per limit: the way to
   // keep working now is another provider's model, while queued work still
@@ -185,7 +301,13 @@ export default function App() {
             onHold={setHold}
           />
         ) : tab === 'search' ? (
-          <Search epochs={epochs} connected={connected} onHold={setHold} />
+          <Search
+            epochs={epochs}
+            connected={connected}
+            packages={packages ?? NO_PACKAGES}
+            loadPackages={loadPackages}
+            onHold={setHold}
+          />
         ) : (
           <Settings
             engines={engines}

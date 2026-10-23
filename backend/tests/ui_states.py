@@ -176,6 +176,21 @@ GROUPS = {
 }
 
 
+# The same roles against earlier searches: A and a fifth role new, the
+# repeated role reposted (its first listing was in an earlier search),
+# and D found again.
+NEW_ROLES = {
+    "/api/jobs": dict(API_FIXTURES["/api/jobs"], jobs=[
+        _job("a", 80, novelty="new"),
+        _job("b", 70, title="Platform Engineer", first_seen_at=SEEN_B, easy=True,
+             group=ROLE, novelty="reposted"),
+        _job("c", 70, title="Platform Engineer", first_seen_at=SEEN_C, group=ROLE,
+             novelty="reposted"),
+        _job("d", 60),
+        _job("e", 50, novelty="new")]),
+}
+
+
 # The application tracker over the roles above: the repeated role applied
 # to through its earlier listing, A interviewing through its own package,
 # and D's package not tracked yet.
@@ -295,6 +310,8 @@ STATES: list[State] = [
           ready=("text=Backend Engineer a", "text=Package ready"), setup=_details_open),
     State("search-job-groups", tab="Search", fixtures=GROUPS,
           ready=("text=Platform Engineer",), setup=_listings_open),
+    State("search-new-roles", tab="Search", fixtures=NEW_ROLES,
+          ready=("text=2 new roles", "text=Reposted")),
     State("packages-tracker", tab="Search", fixtures=TRACKER,
           ready=("text=Update status",), setup=_tracker_open),
     State("packages-coverage", tab="Search", fixtures=COVERAGE,

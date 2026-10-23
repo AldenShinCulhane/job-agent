@@ -727,6 +727,21 @@ def job_ids_in_run(run_id: int, job_ids: list[str]) -> set[str]:
     return {row[0] for row in rows}
 
 
+def in_earlier_runs(run_id: int, job_ids) -> set[str]:
+    """Which of `job_ids` were in a search run older than `run_id`. Run
+    ids are AUTOINCREMENT, so a lower id is a run that started earlier."""
+    wanted = sorted(set(job_ids))
+    found: set[str] = set()
+    with _connect() as conn:
+        for i in range(0, len(wanted), 500):
+            chunk = wanted[i:i + 500]
+            found.update(row[0] for row in conn.execute(
+                "SELECT DISTINCT job_id FROM search_run_jobs "
+                f"WHERE run_id < ? AND job_id IN ({', '.join('?' * len(chunk))})",
+                (run_id, *chunk)))
+    return found
+
+
 def list_jobs(run_id: int | None = None,
               profile_version: int | None = None) -> list[dict]:
     """All cached jobs, or — with `run_id` — only the jobs that belong to

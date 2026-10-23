@@ -1,6 +1,6 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { roleRows, selectableIds } from './jobGroups.ts'
+import { newRoleCount, roleCount, roleRows, selectableIds } from './jobGroups.ts'
 import type { GroupMember, Job } from './api.ts'
 
 function job(id: string, over: Partial<Job> = {}): Job {
@@ -55,4 +55,23 @@ test('filters judge postings: a filtered-out posting is listed but cannot be sel
   assert.equal(rows[0]!.job.job_id, 'b')
   assert.deepEqual(rows[0]!.listings.map((l) => [l.member.job_id, l.job]), [['a', null], ['c', null]])
   assert.deepEqual(selectableIds(roleRows([B, C], none)), ['c', 'b'])
+})
+
+test('counts are roles: the listings of one role count once', () => {
+  assert.equal(roleCount([B, SOLO, C]), 2)
+  assert.equal(roleCount([]), 0)
+})
+
+test('a role is new when its listings are, and counts once', () => {
+  const fresh = { id: 'b', members: MEMBERS.slice(1) }
+  const jobs = [
+    job('b', { group: fresh, novelty: 'new' }),
+    job('c', { group: fresh, novelty: 'new' }),
+    job('solo', { novelty: 'new' }),
+    job('again', { novelty: null }),
+    job('repost', { novelty: 'reposted' }),
+    job('unread'),
+  ]
+  assert.equal(newRoleCount(jobs), 2)
+  assert.equal(newRoleCount([B, C]), 0)
 })

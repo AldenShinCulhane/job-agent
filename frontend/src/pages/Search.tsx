@@ -8,10 +8,10 @@ import type {
 import { paragraphs } from '../description'
 import { useEpochEffect } from '../useEventStream'
 import type { Epochs } from '../useEventStream'
-import { useLatestOnly } from '../useLatestOnly'
+import { OWED_RETRY_MS, useLatestOnly } from '../useLatestOnly'
 import { badgeFor, btnPrimary, btnSecondary, chip, inputCls, labelCls } from '../styles'
 import { reveal, useFocusLanding, useHeldFocus } from '../focus'
-import { listedOn, roleRows, selectableIds } from '../jobGroups'
+import { listedOn, newRoleCount, roleCount, roleRows, selectableIds } from '../jobGroups'
 import type { Listing } from '../jobGroups'
 import {
   APPLICATION_STATES, APPLICATION_STATUSES, changes, dayLabel, formValues, roleApplication, today,
@@ -40,21 +40,17 @@ const LINKEDIN_STATES: Record<string, Badge> = {
   error: { label: 'Browser error', tone: 'danger' },
 }
 
-/** The endpoints an event can invalidate on this page. */
-type Slice = 'linkedin' | 'run' | 'jobs' | 'packages' | 'applications' | 'profile'
+/** The endpoints an event can invalidate on this page. The package list
+ * is App's, which keeps what it owes itself. */
+type Slice = 'linkedin' | 'run' | 'jobs' | 'applications' | 'profile'
 
 const NOTHING_OWED: Record<Slice, boolean> = {
   linkedin: false,
   run: false,
   jobs: false,
-  packages: false,
   applications: false,
   profile: false,
 }
-
-// How often a slice that is owed a refresh, but whose last read failed,
-// tries again. Only ever fires while something is actually owed.
-const OWED_RETRY_MS = 5_000
 
 const RUN_LABELS: Record<string, string> = {
   running: 'Searching…',
@@ -152,10 +148,17 @@ const isMentionsSummary = (el: HTMLElement) => 'mentions' in el.dataset
 export default function Search({
   epochs,
   connected,
+  packages,
+  loadPackages,
   onHold,
 }: {
   epochs: Epochs
   connected: boolean
+  /** Every package, as App last read it. */
+  packages: Package[]
+  /** Reads the package list again, into App. Rejects when the read
+   * fails; App keeps the retry it then owes. */
+  loadPackages: (options?: ReadOptions) => Promise<void>
   /** Told whether this page has work the user would lose if it went away. */
   onHold: (hold: boolean) => void
 }) {
@@ -177,7 +180,6 @@ export default function Search({
   // its row can be rebuilt to stand for another of them, and what was
   // shown stays shown.
   const [openListings, setOpenListings] = useState<Set<string>>(new Set())
-  const [packages, setPackages] = useState<Package[]>([])
   const [busyGenerate, setBusyGenerate] = useState(false)
   // Try again / Regenerate clicks still out, and what each last said
   // when it failed, by the package it was pressed on.
@@ -211,6 +213,7 @@ export default function Search({
   const [sortBy, setSortBy] = useState<'score' | 'date'>('score')
   const [hideExceeds, setHideExceeds] = useState(false)
   const [easyOnly, setEasyOnly] = useState(false)
+  const [newOnly, setNewOnly] = useState(false)
   const [hideApplied, setHideApplied] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [profileLocation, setProfileLocation] = useState<string | null>(null)
@@ -271,7 +274,6 @@ export default function Search({
   const readLinkedin = useLatestOnly()
   const readRun = useLatestOnly()
   const readJobs = useLatestOnly()
-  const readPackages = useLatestOnly()
   const readApplications = useLatestOnly()
   const readProfile = useLatestOnly()
 
@@ -345,18 +347,15 @@ export default function Search({
     }
   }, [readJobs, settle])
 
+  // The list is App's, and so is the retry a failed read owes. What
+  // failed is still said here, beside the rest of this page's reads.
   const refreshPackages = useCallback(async (options?: ReadOptions) => {
     try {
-      if (await readPackages(() => api.packages(), (list) =>
-        setPackages(list.packages), options,
-      )) {
-        settle('packages', true)
-      }
+      await loadPackages(options)
     } catch (e) {
       setError(String(e))
-      settle('packages', false)
     }
-  }, [readPackages, settle])
+  }, [loadPackages])
 
   const refreshApplications = useCallback(async (options?: ReadOptions) => {
     try {
@@ -483,8 +482,7 @@ export default function Search({
   // EVENT for the slice still supersedes, through `useEpochEffect` above:
   // that caller knows the pending answer is already behind.
   const owedAny =
-    owed.linkedin || owed.run || owed.jobs || owed.packages || owed.applications ||
-    owed.profile
+    owed.linkedin || owed.run || owed.jobs || owed.applications || owed.profile
   useEffect(() => {
     if (!owedAny) return
     const paced: ReadOptions = { ifIdle: true }
@@ -492,13 +490,12 @@ export default function Search({
       if (owed.linkedin) void refreshLinkedin(paced)
       if (owed.run) void refreshRun(paced)
       if (owed.jobs) void refreshJobs(paced)
-      if (owed.packages) void refreshPackages(paced)
       if (owed.applications) void refreshApplications(paced)
       if (owed.profile) void loadProfileLocation(paced)
     }, OWED_RETRY_MS)
     return () => clearInterval(timer)
-  }, [owedAny, owed, refreshLinkedin, refreshRun, refreshJobs, refreshPackages,
-      refreshApplications, loadProfileLocation])
+  }, [owedAny, owed, refreshLinkedin, refreshRun, refreshJobs, refreshApplications,
+      loadProfileLocation])
 
   const connect = async () => {
     setError(null)
@@ -873,6 +870,7 @@ export default function Search({
     if (hideExceeds)
       list = list.filter((j) => !j.score_breakdown?.exceeds_experience)
     if (easyOnly) list = list.filter((j) => j.easy_apply)
+    if (newOnly) list = list.filter((j) => j.novelty === 'new')
     if (sortBy === 'score')
       list = [...list].sort((a, b) => {
         const byScore = (displayScore(b) ?? -1) - (displayScore(a) ?? -1)
@@ -884,7 +882,7 @@ export default function Search({
     else list = [...list].sort((a, b) => postedTime(b) - postedTime(a))
     return list
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobs, hideExceeds, easyOnly, sortBy])
+  }, [jobs, hideExceeds, easyOnly, newOnly, sortBy])
 
   // Each job's newest package: its row's badge, and which posting a
   // role's row stands for.
@@ -900,10 +898,9 @@ export default function Search({
       ? all.filter((row) => roleApplication(row, applications) === null)
       : all
   }, [visibleJobs, jobPackage, hideApplied, applications])
-  const roleCount = useMemo(
-    () => new Set(jobs.map((j) => j.group?.id ?? `posting:${j.job_id}`)).size,
-    [jobs],
-  )
+  const roles = useMemo(() => roleCount(jobs), [jobs])
+  // The search's roles that no earlier search listed, under any listing.
+  const newRoles = useMemo(() => newRoleCount(jobs), [jobs])
 
   // What is BOTH selected and currently on screen — a row, or a listing
   // a row shows — not the full list. The list can be replaced under an
@@ -1518,10 +1515,15 @@ export default function Search({
           <div className="flex flex-wrap items-center gap-3">
             <h2 ref={jobsHeadingRef} tabIndex={-1} className="text-lg font-semibold">
               Jobs ({rows.length}
-              {rows.length !== roleCount ? ` of ${roleCount}` : ''})
+              {rows.length !== roles ? ` of ${roles}` : ''})
             </h2>
-            {roleCount !== jobs.length && (
+            {roles !== jobs.length && (
               <span className="text-sm text-ink-3">{jobs.length} listings</span>
+            )}
+            {newRoles > 0 && (
+              <span className="text-sm text-ink-3">
+                {newRoles} new {newRoles === 1 ? 'role' : 'roles'}
+              </span>
             )}
             {scoringPending > 0 && !scoringStall && (
               <span className={`rounded-full px-3 py-1 text-xs font-medium ${chip.info}`}>
@@ -1582,6 +1584,14 @@ export default function Search({
                 onChange={(e) => setEasyOnly(e.target.checked)}
               />
               Easy Apply only
+            </label>
+            <label className="flex items-center gap-1">
+              <input
+                type="checkbox"
+                checked={newOnly}
+                onChange={(e) => setNewOnly(e.target.checked)}
+              />
+              New only
             </label>
             <label className="flex items-center gap-1">
               <input
@@ -1755,6 +1765,22 @@ export default function Search({
                     )}
                   </div>
                   <div className="col-start-3 flex flex-wrap items-center gap-2 md:col-start-4 md:row-start-1">
+                    {job.novelty === 'new' && (
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-xs font-medium ${chip.info}`}
+                        title="No earlier search listed this role"
+                      >
+                        New
+                      </span>
+                    )}
+                    {job.novelty === 'reposted' && (
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-xs font-medium ${chip.neutral}`}
+                        title="A new listing of a role an earlier search listed"
+                      >
+                        Reposted
+                      </span>
+                    )}
                     {breakdown?.exceeds_experience && (
                       <span
                         className={`rounded-full px-2 py-0.5 text-xs font-medium ${chip.warn}`}

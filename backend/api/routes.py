@@ -1175,6 +1175,19 @@ async def jobs_list(run_id: int | None = None):
     groups = db.posting_groups((j["job_id"] for j in jobs), run_id)
     for job in jobs:
         job["group"] = groups.get(job["job_id"])
+    # New and reposted are relative to this run. A posting is new when
+    # neither it nor any listing of its role was in an earlier run, and
+    # reposted when it wasn't but another listing was. One that was in an
+    # earlier run itself is neither.
+    roles = {j["job_id"]: [m["job_id"] for m in (j["group"] or {}).get("members", [])]
+             for j in jobs}
+    earlier = db.in_earlier_runs(
+        run_id, set(roles) | {m for members in roles.values() for m in members})
+    for job in jobs:
+        job["novelty"] = (
+            None if job["job_id"] in earlier
+            else "reposted" if earlier.intersection(roles[job["job_id"]])
+            else "new")
     # A stall only describes THIS run under the CURRENT profile —
     # anything else is stale ownership and must not label new results.
     stall = _get_scoring_stall()

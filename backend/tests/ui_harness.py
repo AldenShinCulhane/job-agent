@@ -39,7 +39,7 @@ def _job(job_id: str, score: float | None, rerank: float | None = None,
          description: str | None = None,
          requirements: list[dict] | None = None,
          first_seen_at: str = "2026-09-15T12:00:00Z",
-         group: dict | None = None) -> dict:
+         group: dict | None = None, novelty: str | None = None) -> dict:
     return {
         "job_id": job_id,
         "title": title or f"Backend Engineer {job_id}",
@@ -65,6 +65,7 @@ def _job(job_id: str, score: float | None, rerank: float | None = None,
         },
         "requirements": requirements,
         "group": group,
+        "novelty": novelty,
     }
 
 

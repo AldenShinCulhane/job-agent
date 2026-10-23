@@ -244,6 +244,14 @@ def test_a_failed_event_read_retries_without_another_event(live, events):
     p.page.get_by_role("listitem").filter(has_text="Role 2").get_by_text("Ready").wait_for()
 
 
+def test_a_failed_package_read_is_said_on_search(live, events):
+    """The package list is App's, and App owes the retry, but the page
+    showing the list still says that reading it failed."""
+    p = live(tab="Search", ready=SEARCH_READY)
+    p.table["/api/packages"] = Response(503, {"detail": "db locked"})
+    assert p.after_event("packages") == ["/api/packages"]
+    assert p.page.get_by_text("db locked").is_visible()
+
 
 def test_a_tracker_never_read_offers_nothing_until_a_retry_reads_it(live, events):
     """The tracker's reads fail from the start, and no event is coming:

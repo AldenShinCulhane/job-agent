@@ -72,6 +72,20 @@ export function selectableIds(rows: RoleRow[]): string[] {
   ])
 }
 
+/** The role a posting is a listing of: its group, or itself alone. */
+const roleOf = (job: Job) => job.group?.id ?? `posting:${job.job_id}`
+
+/** How many roles these postings are. */
+export function roleCount(jobs: Job[]): number {
+  return new Set(jobs.map(roleOf)).size
+}
+
+/** How many of those roles are new. Every listing of a role in the
+ * results is new or none is, since being new looks at all of them. */
+export function newRoleCount(jobs: Job[]): number {
+  return new Set(jobs.filter((j) => j.novelty === 'new').map(roleOf)).size
+}
+
 /** A listing's first-seen day, the way the list names a listing. */
 export function listedOn(iso: string): string {
   const at = Date.parse(iso)

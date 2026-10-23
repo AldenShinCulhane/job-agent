@@ -167,6 +167,11 @@ export interface Job {
   /** The other postings of this role, when it has any: a repost, or the
    * same posting found again under a new id. Null for a role of one. */
   group?: JobGroup | null
+  /** Against earlier searches than the one this list was read for: 'new'
+   * when neither this posting nor any listing of its role was in one,
+   * 'reposted' when only another listing was. Null when this posting
+   * itself was. */
+  novelty?: 'new' | 'reposted' | null
 }
 
 /** Postings that repeat one role. `id` names the group for one response

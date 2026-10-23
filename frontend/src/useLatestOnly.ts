@@ -1,5 +1,9 @@
 import { useState } from 'react'
 
+// How often a slice that is owed a refresh, but whose last read failed,
+// tries again. Only ever fires while something is actually owed.
+export const OWED_RETRY_MS = 5_000
+
 export interface ReadOptions {
   /** Issue this read only if the newest read of this state has already
    * resolved. For TIMER callers — a tick proves that time passed, not

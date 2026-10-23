@@ -27,7 +27,10 @@ with strict page-limit enforcement and no fabricated claims.
    the same or nearly the same text. The row lists its other listings, and
    a package one of them already has is shown on it, so a role you have
    generated for doesn't get a second package by accident. Each listing
-   keeps its own id, score and packages.
+   keeps its own id, score and packages. A role no earlier search listed is
+   marked **New**, and a new listing of a role an earlier search found is
+   marked **Reposted**. The list says how many of its roles are new, and
+   **New only** shows just those.
 4. **Select the jobs you want.** For each one, the app autonomously writes a
    tailored resume and cover letter, validates every claim against facts
    extracted from *your* resume, enforces your page limit (default 1 page —
@@ -36,7 +39,9 @@ with strict page-limit enforcement and no fabricated claims.
    where: the skills section and project technologies, the resume's
    headline and bullets, or the cover letter. A mention is the posting's
    word in your documents, not proof of experience, and a short name like
-   Go, C or R is only looked for in the skills.
+   Go, C or R is only looked for in the skills. While the app's tab is in
+   the background, its title counts the packages that finish, as in
+   "(2) Job Agent", until you come back to it.
 
 The app stops at PDFs. You click Apply yourself. Afterwards, **Mark
 applied** on a finished package records it, and the package's row can
