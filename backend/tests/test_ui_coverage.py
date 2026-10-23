@@ -46,6 +46,16 @@ def _focused(page):
     return page.evaluate("() => document.activeElement.getAttribute('aria-label')")
 
 
+def _toggle(summary):
+    """Opens or closes the summary's fold from the keyboard, and waits for
+    the browser's toggle event, which is what the page keeps. It comes up
+    to a frame later, and two toggles within one frame are one event."""
+    summary.evaluate("""el => { window.toggled = new Promise((r) =>
+        el.parentElement.addEventListener('toggle', r, { once: true })) }""")
+    summary.press("Enter")
+    summary.page.evaluate("() => window.toggled")
+
+
 def test_a_finished_package_says_where_its_documents_mention_each_skill(browser, dist_url):
     context, page, errors, _ = _open(browser, dist_url)
     entry = _entry(page, "Backend Engineer a")
@@ -127,8 +137,7 @@ def test_an_open_list_moved_between_the_package_lists_keeps_open_and_focused(bro
     into opened."""
     context, page, errors, table = _open(browser, dist_url)
     label = f"{MENTIONS_SUMMARY} for Backend Engineer a"
-    page.locator(f"summary[aria-label='{label}']").focus()
-    page.keyboard.press("Enter")
+    _toggle(page.locator(f"summary[aria-label='{label}']"))
     caveat = page.get_by_text("not proof of experience")
     caveat.wait_for()
     packages = table["/api/packages"]["packages"]
@@ -151,7 +160,7 @@ def test_a_list_moved_after_the_focus_left_it_takes_nothing(browser, dist_url):
     packages leaves it where they put it, and leaves the fold closed.
     The list is still open inside."""
     context, page, errors, table = _open(browser, dist_url)
-    _entry(page, "Backend Engineer a").get_by_text(MENTIONS_SUMMARY).click()
+    _toggle(page.locator(f"summary[aria-label='{MENTIONS_SUMMARY} for Backend Engineer a']"))
     caveat = page.get_by_text("not proof of experience")
     caveat.wait_for()
     rail = page.get_by_role("region", name="Package list")
@@ -175,11 +184,10 @@ def test_a_closed_list_moved_into_earlier_packages_stays_closed_and_focused(brow
     context, page, errors, table = _open(browser, dist_url)
     label = f"{MENTIONS_SUMMARY} for Backend Engineer a"
     summary = page.locator(f"summary[aria-label='{label}']")
-    summary.focus()
     caveat = page.get_by_text("not proof of experience")
-    page.keyboard.press("Enter")
+    _toggle(summary)
     caveat.wait_for()
-    page.keyboard.press("Enter")
+    _toggle(summary)
     caveat.wait_for(state="hidden")
     table["/api/packages"]["packages"][:0] = copy.deepcopy(NEWER)
     _reread(page)

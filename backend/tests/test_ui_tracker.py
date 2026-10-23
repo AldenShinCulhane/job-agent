@@ -118,6 +118,16 @@ def _update(page, title):
     page.locator(f"summary[aria-label='Update status for {title}']").click()
 
 
+def _toggle(summary):
+    """Opens or closes the summary's fold from the keyboard, and waits for
+    the browser's toggle event, which is what the page keeps. It comes up
+    to a frame later, and two toggles within one frame are one event."""
+    summary.evaluate("""el => { window.toggled = new Promise((r) =>
+        el.parentElement.addEventListener('toggle', r, { once: true })) }""")
+    summary.press("Enter")
+    summary.page.evaluate("() => window.toggled")
+
+
 def test_mark_applied_records_today_from_that_package(browser, dist_url):
     context, page, errors, _, bodies, _ = _open(browser, dist_url, NONE_YET)
     day, label = _today(page)
@@ -532,6 +542,89 @@ def test_a_form_pushed_into_earlier_packages_keeps_its_edit_and_the_focus(browse
     assert errors == []
     context.close()
 
+
+
+def test_an_open_form_moved_between_the_package_lists_stays_open(browser, dist_url):
+    """Newer packages push the row into Earlier packages, where it is
+    built again, and taking them away brings it back. Each way the form
+    stays open and the focus stays on its summary."""
+    context, page, errors, table, _, _ = _open(browser, dist_url, TRACKER)
+    _toggle(page.locator("summary[aria-label='Update status for Backend Engineer a']"))
+    status, _ = _form(page, 8, "Backend Engineer a")
+    status.wait_for()
+    packages = table["/api/packages"]["packages"]
+    packages[:0] = copy.deepcopy(NEWER)
+    _reread(page)
+    page.get_by_text("Earlier packages (2)").wait_for()
+    assert _focused(page) == "Update status for Backend Engineer a"
+    assert status.is_visible()
+    del packages[:len(NEWER)]
+    _reread(page)
+    page.get_by_text("Earlier packages").wait_for(state="detached")
+    assert _focused(page) == "Update status for Backend Engineer a"
+    assert status.is_visible()
+    assert errors == []
+    context.close()
+
+
+def test_a_form_closed_again_moves_closed(browser, dist_url):
+    context, page, errors, table, _, _ = _open(browser, dist_url, TRACKER)
+    summary = page.locator("summary[aria-label='Update status for Backend Engineer a']")
+    status, _ = _form(page, 8, "Backend Engineer a")
+    _toggle(summary)
+    status.wait_for()
+    _toggle(summary)
+    status.wait_for(state="hidden")
+    table["/api/packages"]["packages"][:0] = copy.deepcopy(NEWER)
+    _reread(page)
+    page.get_by_text("Earlier packages (2)").wait_for()
+    assert _focused(page) == "Update status for Backend Engineer a"
+    assert summary.is_visible()
+    assert not status.is_visible()
+    assert errors == []
+    context.close()
+
+
+def test_a_status_cleared_and_marked_again_starts_with_its_form_closed(browser, dist_url):
+    """Clear status takes the form away and Mark applied takes its place.
+    Marked again, the posting has a new form, and it starts closed: the
+    old form being open went with the old form."""
+    context, page, errors, _, bodies, _ = _open(browser, dist_url, TRACKER)
+    _toggle(page.locator("summary[aria-label='Update status for Backend Engineer a']"))
+    status, _ = _form(page, 8, "Backend Engineer a")
+    status.select_option("cleared")
+    page.get_by_role("button", name="Save status for Backend Engineer a").click()
+    page.get_by_role("button", name="Mark applied for Backend Engineer a").click()
+    page.locator("summary[aria-label='Update status for Backend Engineer a']").wait_for()
+    assert [b["status"] for b in bodies] == ["cleared", "applied"]
+    assert not status.is_visible()
+    assert errors == []
+    context.close()
+
+
+def test_a_form_cleared_elsewhere_stays_open_only_with_an_edit(browser, dist_url):
+    """Another tab clears two postings with their forms open. The form
+    the user is changing stays, open. The other goes, and when that tab
+    marks its posting again, it comes back closed."""
+    context, page, errors, table, _, _ = _open(browser, dist_url, TRACKER)
+    _toggle(page.locator("summary[aria-label='Update status for Backend Engineer a']"))
+    _toggle(page.locator("summary[aria-label='Update status for Platform Engineer']"))
+    edited, _ = _form(page, 8, "Backend Engineer a")
+    untouched, _ = _form(page, 5, "Platform Engineer")
+    edited.select_option("offer")
+    untouched.wait_for()
+    _elsewhere(table, "a", None)
+    _elsewhere(table, "old", None)
+    _reread(page)
+    page.get_by_role("button", name="Mark applied for Platform Engineer").wait_for()
+    assert edited.is_visible()
+    _elsewhere(table, "old", "applied", "2026-10-08")
+    _reread(page)
+    page.locator("summary[aria-label='Update status for Platform Engineer']").wait_for()
+    assert not untouched.is_visible()
+    assert edited.is_visible()
+    assert errors == []
+    context.close()
 
 def _usage_limit(page, table, episode):
     """A usage limit starts. Unless something unsaved holds the page, it

@@ -196,6 +196,11 @@ export default function Search({
   const [tracking, setTracking] = useState<Set<number>>(new Set())
   const [trackErrors, setTrackErrors] = useState<Record<number, string>>({})
   const [drafts, setDrafts] = useState<Record<number, TrackerDraft>>({})
+  // And which status forms are open, by package: a newer package can
+  // push the row into Earlier packages, or take it back out, and the row
+  // is built again there. What was open stays open, while the form is
+  // there to be open.
+  const [openForms, setOpenForms] = useState<Set<number>>(new Set())
   // How many times the user has edited each package's form, a change
   // back included: a save answered after another edit is not the form's.
   // And each posting with a save not yet settled, sent or answered and
@@ -760,6 +765,32 @@ export default function Search({
     }
   }, [applications])
 
+  // A status form goes when its posting is untracked and the user has
+  // nothing in it: Mark applied takes its place. Whether it was open goes
+  // with it, so a status marked again starts with its form closed.
+  useEffect(() => {
+    if (applications === null) return
+    setOpenForms((prev) => {
+      const jobs = new Map(packages.map((p) => [p.id, p.job_id]))
+      const gone = [...prev].filter((id) => {
+        const job = jobs.get(id)
+        return job === undefined || (!applications.has(job) && !drafts[id])
+      })
+      if (gone.length === 0) return prev
+      const next = new Set(prev)
+      for (const id of gone) next.delete(id)
+      return next
+    })
+  }, [applications, drafts, packages])
+  const showForm = (id: number, open: boolean) =>
+    setOpenForms((prev) => {
+      if (prev.has(id) === open) return prev
+      const next = new Set(prev)
+      if (open) next.add(id)
+      else next.delete(id)
+      return next
+    })
+
   // The tracker control that holds the focus, if one does. What a
   // package's tracker offers follows what is read back — Mark applied
   // becomes the status and its Update status, Clear status brings Mark
@@ -1169,7 +1200,7 @@ export default function Search({
             {badge.label} {dayLabel(current.occurred_on)}
           </span>
         )}
-        <details>
+        <details open={openForms.has(pkg.id)} onToggle={(e) => showForm(pkg.id, e.currentTarget.open)}>
           <summary
             className="cursor-pointer text-ink-2"
             aria-label={`Update status for ${pkg.title}`}
